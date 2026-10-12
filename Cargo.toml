@@ -1,0 +1,28 @@
+[package]
+name = "delicium"
+version = "0.1.0"
+edition = "2024"
+description = "A Windows desktop character runtime with native 2D and 3D models"
+
+[dependencies]
+bevy_ecs = { version = "0.20", default-features = false, features = ["std", "multi_threaded"] }
+bevy_tasks = { version = "0.20", features = ["multi_threaded"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+egui = "0.36"
+egui-wgpu = "0.36"
+egui-winit = "0.36"
+env_logger = "0.11"
+glam = "0.34"
+log = "0.4"
+pollster = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+wgpu = "30.0"
+winit = "0.30"
+
+[dev-dependencies]
+png = "0.18"
+
+[profile.release]
+lto = "thin"
