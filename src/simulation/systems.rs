@@ -1,0 +1,257 @@
+//! Schedule and systems that advance the simulation world one fixed step.
+//!
+//! One tick runs two systems, in this order:
+//!
+//! 1. [`interaction_snapshot`]: an exclusive system that snapshots every
+//!    position in instance-id order, resolves the nearest neighbour inside
+//!    [`INTERACTION_RADIUS`](super::INTERACTION_RADIUS) for each instance and
+//!    eases the reaction weights;
+//! 2. [`advance_poses`]: a parallel-query system that samples animation
+//!    parameters or joint locals for every instance and advances the pose
+//!    ring (`prev <- curr <- sampled`).
+//!
+//! Both systems are deterministic: the snapshot works on a sorted copy of the
+//! positions, and every instance owns its time and pose, so parallel pose
+//! evaluation cannot change the observable result of a tick.
+
+use std::sync::{Arc, Mutex};
+
+use bevy_ecs::{
+    schedule::{IntoScheduleConfigs, Schedule},
+    system::{Query, ResMut},
+    world::World,
+};
+use bevy_tasks::{ComputeTaskPool, TaskPoolBuilder};
+use glam::Vec3;
+
+use super::components::{
+    InstanceTag, InteractionState, InteractionsRes, ModelHandle, PoseState, Position, TickStatus,
+    TimeState,
+};
+use super::pose::{DriveInput, sample_pose};
+use super::{
+    FIXED_DT_SECONDS, INTERACTION_EASE_PER_SECOND, INTERACTION_RADIUS, InstanceId, InteractionEdge,
+    MAX_SIM_THREADS, SimError,
+};
+
+/// Weight fraction gained per fixed step while a neighbour is in range.
+const EASE_STEP: f32 = INTERACTION_EASE_PER_SECOND / 60.0;
+
+/// Initialises the bounded `ComputeTaskPool` the parallel pose pass runs on.
+///
+/// `bevy_tasks` keeps a process-global pool; the first caller wins, later
+/// calls are no-ops. The pool is capped at
+/// `min(available_parallelism, MAX_SIM_THREADS)` worker threads so the
+/// simulation cannot flood the machine. Safe to call repeatedly.
+pub fn initialize_task_pool() {
+    ComputeTaskPool::get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .min(MAX_SIM_THREADS);
+        TaskPoolBuilder::new().num_threads(threads).build()
+    });
+}
+
+/// Builds the fixed-step schedule: interaction snapshot first, poses second.
+pub fn build_schedule() -> Schedule {
+    let mut schedule = Schedule::default();
+    schedule.add_systems((interaction_snapshot, advance_poses).chain());
+    schedule
+}
+
+/// Resolves the nearest neighbour of every instance and eases reactions.
+///
+/// Exclusive on purpose: the pass borrows the whole world so the position
+/// snapshot is taken before any state is written, exactly matching the
+/// documented tick order.
+pub fn interaction_snapshot(world: &mut World) {
+    // 1. Snapshot positions, sorted by instance id so thread or archetype
+    //    order can never change the resolved links.
+    let mut points: Vec<(InstanceId, Vec3)> = {
+        let mut query = world.query::<(&InstanceTag, &Position)>();
+        query
+            .iter(world)
+            .map(|(tag, position)| (tag.0, position.0))
+            .collect()
+    };
+    points.sort_by_key(|(id, _)| *id);
+
+    // 2. O(N^2) nearest-neighbour resolution (N <= 64). Ties break toward the
+    //    smaller instance id, so the result is deterministic.
+    struct Link {
+        to: InstanceId,
+        distance: f32,
+        direction: Vec3,
+    }
+    let mut links: Vec<Option<Link>> = Vec::with_capacity(points.len());
+    for (index, (_, position)) in points.iter().enumerate() {
+        let mut best: Option<Link> = None;
+        for (other_index, (other_id, other_position)) in points.iter().enumerate() {
+            if index == other_index {
+                continue;
+            }
+            let delta = *other_position - *position;
+            let distance = delta.length();
+            if distance > INTERACTION_RADIUS {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some(link) => (distance, *other_id) < (link.distance, link.to),
+            };
+            if better {
+                best = Some(Link {
+                    to: *other_id,
+                    distance,
+                    direction: delta.normalize_or_zero(),
+                });
+            }
+        }
+        links.push(best);
+    }
+
+    // 3. Write the reaction state of every instance.
+    {
+        let mut states = world.query::<(&InstanceTag, &mut InteractionState)>();
+        for (tag, mut state) in states.iter_mut(world) {
+            let link = points
+                .iter()
+                .position(|(id, _)| *id == tag.0)
+                .and_then(|index| links[index].as_ref());
+            match link {
+                Some(link) => {
+                    state.neighbor = Some(link.to);
+                    state.offset = link.direction;
+                    state.weight = advanced_weight(state.weight, 1.0);
+                }
+                None => {
+                    state.neighbor = None;
+                    state.offset = Vec3::ZERO;
+                    state.weight = advanced_weight(state.weight, 0.0);
+                }
+            }
+        }
+    }
+
+    // 4. Publish the directed edge list, ordered by (from, to).
+    let edges: Vec<InteractionEdge> = points
+        .iter()
+        .zip(links.iter())
+        .filter_map(|((from, _), link)| {
+            link.as_ref().map(|link| InteractionEdge {
+                from: *from,
+                to: link.to,
+                distance: link.distance,
+            })
+        })
+        .collect();
+    if let Some(mut interactions) = world.get_resource_mut::<InteractionsRes>() {
+        interactions.0 = edges;
+    }
+}
+
+/// Eases a reaction weight one step toward `target`.
+fn advanced_weight(weight: f32, target: f32) -> f32 {
+    let step = EASE_STEP.clamp(0.0, 1.0);
+    (weight + (target - weight) * step).clamp(0.0, 1.0)
+}
+
+/// Advances the animation time and pose of every instance by one fixed step.
+///
+/// The per-instance evaluation runs through `Query::par_iter_mut` on the
+/// bounded [`ComputeTaskPool`]; each instance only writes its own components,
+/// so the parallel pass is deterministic. A pose that cannot be evaluated
+/// leaves the instance's time, pose and model untouched and is recorded for
+/// [`Simulation::advance`](super::Simulation::advance) to surface as a
+/// visible error; the deterministic failure repeats on the next tick instead
+/// of silently degrading.
+pub fn advance_poses(
+    mut query: Query<(
+        &InstanceTag,
+        &ModelHandle,
+        &InteractionState,
+        &mut TimeState,
+        &mut PoseState,
+    )>,
+    mut status: ResMut<TickStatus>,
+) {
+    let slot = Arc::new(Mutex::new(None::<(InstanceId, SimError)>));
+    let worker_slot = Arc::clone(&slot);
+
+    query
+        .par_iter_mut()
+        .for_each(move |(tag, handle, interaction, mut time, mut pose)| {
+            let id = tag.0;
+            let next_time = time.time + FIXED_DT_SECONDS;
+            let drive = DriveInput::from_state(interaction);
+            match sample_pose(&handle.model, next_time, &drive, id) {
+                Ok(next) => {
+                    time.time = next_time;
+                    pose.prev = std::mem::replace(&mut pose.curr, next);
+                }
+                Err(error) => {
+                    let mut slot = match worker_slot.lock() {
+                        Ok(slot) => slot,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    let dominated = slot.as_ref().is_some_and(|(existing, _)| *existing <= id);
+                    if !dominated {
+                        *slot = Some((id, error));
+                    }
+                }
+            }
+        });
+
+    let recorded = match slot.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some((_, error)) = recorded {
+        status.error = Some(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{FIXED_DT, Simulation, pose::Pose};
+    use super::*;
+    use crate::model::{LoadLimits, ModelData, load_model_bytes, try_sample_parameters};
+    use bevy_ecs::entity::Entity;
+
+    #[test]
+    fn long_running_ticks_keep_full_precision_until_clip_sampling() {
+        let model = load_model_bytes(
+            include_bytes!("../../assets/examples/puppet2d.dmodel.json"),
+            &LoadLimits::default(),
+        )
+        .unwrap();
+        let ModelData::Sprite2d(sprite) = &model.data else {
+            panic!("expected 2D model")
+        };
+        let mut simulation = Simulation::new();
+        let asset = simulation.insert_asset(model.clone()).unwrap();
+        let id = simulation.spawn(asset, Vec3::ZERO).unwrap();
+        let mut query = simulation.world.query::<(Entity, &InstanceTag)>();
+        let entity = query
+            .iter(&simulation.world)
+            .find(|(_, tag)| tag.0 == id)
+            .unwrap()
+            .0;
+        let mut previous_time = 262_144.125;
+        simulation.world.get_mut::<TimeState>(entity).unwrap().time = previous_time;
+        for _ in 0..12 {
+            simulation.advance(FIXED_DT).unwrap();
+            let time = simulation.instance(id).unwrap().animation_time;
+            assert!(time > previous_time);
+            assert!((time - previous_time - FIXED_DT_SECONDS).abs() < 1e-8);
+            let expected = try_sample_parameters(sprite, time).unwrap();
+            let state = simulation.world.get::<PoseState>(entity).unwrap();
+            let Pose::Sprite2d(actual) = &state.curr else {
+                panic!("expected 2D pose")
+            };
+            assert_eq!(actual, &expected);
+            previous_time = time;
+        }
+    }
+}

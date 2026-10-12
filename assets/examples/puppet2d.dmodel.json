@@ -1,0 +1,531 @@
+{
+  "format": "delicium.model",
+  "format_version": "0.1",
+  "name": "puppet2d",
+  "kind": "sprite2d",
+  "interaction": {
+    "gaze_parameter": "gaze_x"
+  },
+  "sprite2d": {
+    "parameters": [
+      {
+        "name": "breath",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 0.25
+      },
+      {
+        "name": "gaze_x",
+        "min": -1.0,
+        "max": 1.0,
+        "default": 0.0
+      },
+      {
+        "name": "ear_sway",
+        "min": -1.0,
+        "max": 1.0,
+        "default": 0.0
+      }
+    ],
+    "deformers": [
+      {
+        "name": "eyes_look",
+        "type": "warp",
+        "parent": "head_tilt",
+        "parameter": "gaze_x",
+        "bounds": [
+          -0.3,
+          0.26,
+          0.6,
+          0.16
+        ],
+        "grid": [
+          2,
+          2
+        ],
+        "offsets": [
+          [
+            0.045,
+            0.0
+          ],
+          [
+            0.045,
+            0.0
+          ],
+          [
+            0.045,
+            0.0
+          ],
+          [
+            0.045,
+            0.0
+          ]
+        ]
+      },
+      {
+        "name": "ear_r",
+        "type": "rotation",
+        "parent": "head_tilt",
+        "parameter": "ear_sway",
+        "pivot": [
+          0.4,
+          0.46
+        ],
+        "max_angle_radians": -0.45
+      },
+      {
+        "name": "torso_breathe",
+        "type": "warp",
+        "parent": null,
+        "parameter": "breath",
+        "bounds": [
+          -0.38,
+          -0.9,
+          0.76,
+          0.95
+        ],
+        "grid": [
+          3,
+          3
+        ],
+        "offsets": [
+          [
+            -0.014,
+            -0.016
+          ],
+          [
+            0.0,
+            -0.018
+          ],
+          [
+            0.014,
+            -0.016
+          ],
+          [
+            -0.02,
+            -0.004
+          ],
+          [
+            0.0,
+            0.02
+          ],
+          [
+            0.02,
+            -0.004
+          ],
+          [
+            -0.012,
+            0.014
+          ],
+          [
+            0.0,
+            0.018
+          ],
+          [
+            0.012,
+            0.014
+          ]
+        ]
+      },
+      {
+        "name": "head_tilt",
+        "type": "rotation",
+        "parent": null,
+        "parameter": "gaze_x",
+        "pivot": [
+          0.0,
+          0.06
+        ],
+        "max_angle_radians": 0.14
+      },
+      {
+        "name": "ear_l",
+        "type": "rotation",
+        "parent": "head_tilt",
+        "parameter": "ear_sway",
+        "pivot": [
+          -0.4,
+          0.46
+        ],
+        "max_angle_radians": 0.45
+      }
+    ],
+    "layers": [
+      {
+        "name": "body",
+        "color": [
+          0.3,
+          0.62,
+          0.85,
+          1.0
+        ],
+        "grid": {
+          "bounds": [
+            -0.38,
+            -0.9,
+            0.76,
+            0.95
+          ],
+          "columns": 6,
+          "rows": 8
+        },
+        "deformer": "torso_breathe"
+      },
+      {
+        "name": "head",
+        "color": [
+          0.98,
+          0.86,
+          0.7,
+          1.0
+        ],
+        "grid": {
+          "bounds": [
+            -0.4,
+            0.02,
+            0.8,
+            0.62
+          ],
+          "columns": 7,
+          "rows": 7
+        },
+        "deformer": "head_tilt"
+      },
+      {
+        "name": "ear_left",
+        "color": [
+          0.95,
+          0.55,
+          0.65,
+          1.0
+        ],
+        "grid": {
+          "bounds": [
+            -0.62,
+            0.44,
+            0.24,
+            0.4
+          ],
+          "columns": 3,
+          "rows": 5
+        },
+        "deformer": "ear_l"
+      },
+      {
+        "name": "ear_right",
+        "color": [
+          0.95,
+          0.55,
+          0.65,
+          1.0
+        ],
+        "grid": {
+          "bounds": [
+            0.38,
+            0.44,
+            0.24,
+            0.4
+          ],
+          "columns": 3,
+          "rows": 5
+        },
+        "deformer": "ear_r"
+      },
+      {
+        "name": "eye_white_left",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "vertices": [
+          [
+            -0.245,
+            0.275
+          ],
+          [
+            -0.065,
+            0.275
+          ],
+          [
+            -0.065,
+            0.405
+          ],
+          [
+            -0.245,
+            0.405
+          ]
+        ],
+        "indices": [
+          0,
+          1,
+          2,
+          0,
+          2,
+          3
+        ],
+        "deformer": "eyes_look",
+        "mask": {
+          "points": [
+            [
+              -0.062612,
+              0.378268
+            ],
+            [
+              -0.116732,
+              0.432388
+            ],
+            [
+              -0.193268,
+              0.432388
+            ],
+            [
+              -0.247388,
+              0.378268
+            ],
+            [
+              -0.247388,
+              0.301732
+            ],
+            [
+              -0.193268,
+              0.247612
+            ],
+            [
+              -0.116732,
+              0.247612
+            ],
+            [
+              -0.062612,
+              0.301732
+            ]
+          ]
+        }
+      },
+      {
+        "name": "eye_white_right",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "vertices": [
+          [
+            0.065,
+            0.275
+          ],
+          [
+            0.245,
+            0.275
+          ],
+          [
+            0.245,
+            0.405
+          ],
+          [
+            0.065,
+            0.405
+          ]
+        ],
+        "indices": [
+          0,
+          1,
+          2,
+          0,
+          2,
+          3
+        ],
+        "deformer": "eyes_look",
+        "mask": {
+          "points": [
+            [
+              0.247388,
+              0.378268
+            ],
+            [
+              0.193268,
+              0.432388
+            ],
+            [
+              0.116732,
+              0.432388
+            ],
+            [
+              0.062612,
+              0.378268
+            ],
+            [
+              0.062612,
+              0.301732
+            ],
+            [
+              0.116732,
+              0.247612
+            ],
+            [
+              0.193268,
+              0.247612
+            ],
+            [
+              0.247388,
+              0.301732
+            ]
+          ]
+        }
+      },
+      {
+        "name": "pupil_left",
+        "color": [
+          0.12,
+          0.12,
+          0.16,
+          1.0
+        ],
+        "vertices": [
+          [
+            -0.185,
+            0.3
+          ],
+          [
+            -0.125,
+            0.3
+          ],
+          [
+            -0.125,
+            0.38
+          ],
+          [
+            -0.185,
+            0.38
+          ]
+        ],
+        "indices": [
+          0,
+          1,
+          2,
+          0,
+          2,
+          3
+        ],
+        "deformer": "eyes_look"
+      },
+      {
+        "name": "pupil_right",
+        "color": [
+          0.12,
+          0.12,
+          0.16,
+          1.0
+        ],
+        "vertices": [
+          [
+            0.125,
+            0.3
+          ],
+          [
+            0.185,
+            0.3
+          ],
+          [
+            0.185,
+            0.38
+          ],
+          [
+            0.125,
+            0.38
+          ]
+        ],
+        "indices": [
+          0,
+          1,
+          2,
+          0,
+          2,
+          3
+        ],
+        "deformer": "eyes_look"
+      }
+    ],
+    "animations": [
+      {
+        "name": "idle",
+        "duration": 4.0,
+        "channels": [
+          {
+            "parameter": "breath",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.25
+              },
+              {
+                "time": 1.0,
+                "value": 0.8
+              },
+              {
+                "time": 2.0,
+                "value": 0.25
+              },
+              {
+                "time": 3.0,
+                "value": 0.05
+              },
+              {
+                "time": 4.0,
+                "value": 0.25
+              }
+            ]
+          },
+          {
+            "parameter": "ear_sway",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 1.0,
+                "value": 0.5
+              },
+              {
+                "time": 2.0,
+                "value": 0.0
+              },
+              {
+                "time": 3.0,
+                "value": -0.5
+              },
+              {
+                "time": 4.0,
+                "value": 0.0
+              }
+            ]
+          },
+          {
+            "parameter": "gaze_x",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 1.5,
+                "value": 0.6
+              },
+              {
+                "time": 2.5,
+                "value": -0.6
+              },
+              {
+                "time": 4.0,
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
