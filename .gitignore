@@ -1,0 +1,9 @@
+/target/
+/.artifacts/
+/.playwright-mcp/
+/.vs/
+/.idea/
+/.vscode/
+/.env
+/.env.*
+*.log
