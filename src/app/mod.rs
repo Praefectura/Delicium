@@ -435,6 +435,7 @@ impl Application {
                     self.sources.insert(instance, source);
                     self.ui.selected = Some(instance);
                     self.ui.status = format!("Added {kind}");
+                    log::info!("spawn instance={instance} asset={asset} kind={kind}");
                 } else {
                     self.submit_load(
                         source,
@@ -455,6 +456,7 @@ impl Application {
                     self.ui.selected = None;
                 }
                 self.collect_assets();
+                log::info!("remove instance={instance}");
             }
             UiCommand::Load { source, replace } => {
                 let operation = replace.map_or_else(
@@ -843,6 +845,16 @@ impl ApplicationHandler for Application {
                 ..
             } if is_overlay && !self.ui.click_through => {
                 if state == ElementState::Released {
+                    if let Some((instance, _)) = self.dragging
+                        && let Some(info) = self.simulation.instance(instance)
+                    {
+                        log::info!(
+                            "drag release instance={} x={:.3} y={:.3}",
+                            instance,
+                            info.position.x,
+                            info.position.y
+                        );
+                    }
                     self.dragging = None;
                 } else if let Some(instance) = self.pick_character()
                     && let Some(info) = self.simulation.instance(instance)
@@ -853,6 +865,12 @@ impl ApplicationHandler for Application {
                     self.dragging =
                         Some((instance, info.position - Vec3::new(point[0], point[1], 0.0)));
                     self.ui.selected = Some(instance);
+                    log::info!(
+                        "drag start instance={} x={:.3} y={:.3}",
+                        instance,
+                        info.position.x,
+                        info.position.y
+                    );
                 }
             }
             WindowEvent::CursorLeft { .. } if is_overlay => self.dragging = None,
