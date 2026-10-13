@@ -118,7 +118,7 @@ pwsh -NoProfile -File tests/windows_smoke.ps1
 
 ## 当前状态与范围外内容
 
-- 本地验收已通过：单元与集成测试、真实 GPU 离屏渲染测试（`tests/gpu_render.rs`）、以及 `tests/windows_smoke.ps1`（真实透明合成、点击穿透双向切换、重叠窗口恢复、冒烟交互序列）。本 README 不包含帧率或性能结论。
+- 本地验收已通过：单元与集成测试、真实 GPU 离屏渲染测试（`tests/gpu_render.rs`）、以及 `tests/windows_smoke.ps1`（真实透明合成、点击穿透双向切换、重叠窗口恢复，以及物理输入驱动的增删、拖拽、加载、重载与失败保留覆盖）。本 README 不包含帧率或性能结论。
 - 无 GLB 或其他外部格式导入。
 - 无联网、商店、账号、支付、SQLite；联网需求属于后续工作。
 - 无可视化编辑器。
