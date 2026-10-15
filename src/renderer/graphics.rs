@@ -17,6 +17,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Instant;
 
 use winit::{
     dpi::PhysicalSize,
@@ -25,7 +26,10 @@ use winit::{
 
 use super::error::RenderError;
 use super::scene::SceneRenderer;
-use super::types::{BackendChoice, RenderAsset, RenderFrame};
+use super::types::{
+    BackendChoice, GraphicsDiagnostics, MeasuredSceneFrame, RenderAsset, RenderFrame,
+    SceneFrameOutcome, SceneFrameTimings, SceneResourceDiagnostics, SceneSkipReason, SceneView,
+};
 
 /// The windowed graphics front end.
 pub struct Graphics {
@@ -253,32 +257,103 @@ impl Graphics {
         self.scene.remove_asset(id);
     }
 
+    /// Logical resource sizes the scene renderer tracks (not VRAM usage).
+    pub fn scene_resource_diagnostics(&self) -> SceneResourceDiagnostics {
+        self.scene.resource_diagnostics()
+    }
+
+    /// Adapter and overlay surface facts of this instance.
+    pub fn diagnostics(&self) -> GraphicsDiagnostics {
+        let info = self.adapter.get_info();
+        GraphicsDiagnostics {
+            adapter: info.name,
+            backend: info.backend.to_str().to_owned(),
+            device_type: format!("{:?}", info.device_type),
+            physical_size: [self.overlay_config.width, self.overlay_config.height],
+            control_physical_size: [self.control_config.width, self.control_config.height],
+            present_mode: format!("{:?}", self.overlay_config.present_mode),
+            alpha_mode: format!("{:?}", self.transparency),
+            format: format!("{:?}", self.overlay_config.format),
+        }
+    }
+
     /// Draws one scene frame on the transparent overlay window.
     ///
     /// Frames the surface cannot provide right now (timeout, occluded) are
     /// skipped quietly; lost or outdated surfaces are reconfigured and the
     /// frame is skipped. Only conditions the caller must know about (device
     /// loss, out of memory, invalid frame data) are returned as errors.
-    pub fn render_scene(&mut self, frame: &RenderFrame) -> Result<(), RenderError> {
+    pub fn render_scene(
+        &mut self,
+        frame: &RenderFrame,
+        view: SceneView,
+    ) -> Result<(), RenderError> {
+        self.render_scene_internal(frame, view, false).map(|_| ())
+    }
+
+    /// [`Graphics::render_scene`] with CPU wall-clock stage timings.
+    ///
+    /// Timing collection is confined to this entry point: the normal
+    /// [`Graphics::render_scene`] path takes no additional clock readings. The
+    /// timings measure host-side calls (`Instant` deltas), not GPU execution
+    /// time, and stages that did not run stay `None`.
+    pub fn render_scene_measured(
+        &mut self,
+        frame: &RenderFrame,
+        view: SceneView,
+    ) -> Result<MeasuredSceneFrame, RenderError> {
+        self.render_scene_internal(frame, view, true)
+    }
+
+    /// Shared implementation of both scene entry points.
+    ///
+    /// `measured` is the only difference between them: when false, no
+    /// `Instant` is ever read and the returned outcome is ignored by the
+    /// caller. Both take the same acquire, recovery, validation and submission
+    /// paths, so the measured entry cannot diverge from the normal one.
+    fn render_scene_internal(
+        &mut self,
+        frame: &RenderFrame,
+        view: SceneView,
+        measured: bool,
+    ) -> Result<MeasuredSceneFrame, RenderError> {
+        let mut timings = SceneFrameTimings::default();
         if self.overlay_config.width == 0 || self.overlay_config.height == 0 {
-            return Ok(());
+            return Ok(MeasuredSceneFrame {
+                outcome: SceneFrameOutcome::Skipped(SceneSkipReason::ZeroSize),
+                timings,
+            });
         }
-        let Some(texture) = self.acquire_overlay()? else {
-            return Ok(());
+
+        let acquire_start = if measured { Some(Instant::now()) } else { None };
+        let acquired = self.acquire_overlay()?;
+        if let Some(start) = acquire_start {
+            timings.acquire = Some(start.elapsed());
+        }
+        let texture = match acquired {
+            OverlayAcquire::Texture(texture) => texture,
+            OverlayAcquire::Skipped(reason) => {
+                return Ok(MeasuredSceneFrame {
+                    outcome: SceneFrameOutcome::Skipped(reason),
+                    timings,
+                });
+            }
         };
 
-        let view = texture
+        let target_view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let encode_start = if measured { Some(Instant::now()) } else { None };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Delicium scene frame"),
             });
-        match self.scene.render_to(
+        match self.scene.render_to_with_view(
             frame,
-            &view,
+            &target_view,
             [self.overlay_config.width, self.overlay_config.height],
+            view,
             &mut encoder,
         ) {
             Ok(()) => {}
@@ -287,9 +362,27 @@ impl Graphics {
                 return Err(error);
             }
         }
-        self.queue.submit([encoder.finish()]);
+        let command_buffer = encoder.finish();
+        if let Some(start) = encode_start {
+            timings.encode_upload = Some(start.elapsed());
+        }
+
+        let submit_start = if measured { Some(Instant::now()) } else { None };
+        self.queue.submit([command_buffer]);
+        if let Some(start) = submit_start {
+            timings.submit = Some(start.elapsed());
+        }
+
+        let present_start = if measured { Some(Instant::now()) } else { None };
         self.queue.present(texture);
-        Ok(())
+        if let Some(start) = present_start {
+            timings.present = Some(start.elapsed());
+        }
+
+        Ok(MeasuredSceneFrame {
+            outcome: SceneFrameOutcome::Submitted,
+            timings,
+        })
     }
 
     /// Draws the egui control layer on the opaque control window.
@@ -398,13 +491,31 @@ impl Graphics {
     // -- surface acquisition -------------------------------------------------
 
     /// Acquires the next overlay texture, transparently recovering from
-    /// skippable and recoverable surface states. Returns `Ok(None)` when the
-    /// frame should be skipped.
-    fn acquire_overlay(&mut self) -> Result<Option<wgpu::SurfaceTexture>, RenderError> {
+    /// skippable and recoverable surface states.
+    ///
+    /// The skip reason is classified from the raw surface outcome here, before
+    /// [`Graphics::handle_surface_state`] consumes it; the state handling
+    /// itself is unchanged.
+    fn acquire_overlay(&mut self) -> Result<OverlayAcquire, RenderError> {
         let outcome = self.overlay_surface.get_current_texture();
+        let reason = match &outcome {
+            wgpu::CurrentSurfaceTexture::Success(_) => None,
+            wgpu::CurrentSurfaceTexture::Suboptimal(_) => Some(SceneSkipReason::Suboptimal),
+            wgpu::CurrentSurfaceTexture::Timeout => Some(SceneSkipReason::Timeout),
+            wgpu::CurrentSurfaceTexture::Occluded => Some(SceneSkipReason::Occluded),
+            wgpu::CurrentSurfaceTexture::Outdated => Some(SceneSkipReason::Outdated),
+            wgpu::CurrentSurfaceTexture::Lost => Some(SceneSkipReason::Lost),
+            // Validation is a real error and never reaches the skip path.
+            wgpu::CurrentSurfaceTexture::Validation => None,
+        };
         match self.handle_surface_state(outcome, true)? {
-            Some(texture) => Ok(Some(texture)),
-            None => Ok(None),
+            Some(texture) => Ok(OverlayAcquire::Texture(texture)),
+            None => match reason {
+                Some(reason) => Ok(OverlayAcquire::Skipped(reason)),
+                None => Err(RenderError::Internal {
+                    details: "surface outcome produced no texture without a skip reason".into(),
+                }),
+            },
         }
     }
 
@@ -420,7 +531,7 @@ impl Graphics {
     /// Shared surface state machine for both windows.
     ///
     /// - `Success` -> use the texture.
-    /// - `Suboptimal` -> reconfigure now, then use the texture.
+    /// - `Suboptimal` -> discard the texture, reconfigure, and skip the frame.
     /// - `Timeout` / `Occluded` -> skip the frame (`Ok(None)`); not an error.
     /// - `Outdated` -> reconfigure and skip this frame.
     /// - `Lost` -> a lost device is fatal; otherwise recreate the surface,
@@ -501,6 +612,13 @@ impl Graphics {
             }),
         }
     }
+}
+
+/// Outcome of an overlay acquire: either a drawable texture or a classified
+/// reason why the frame must be skipped.
+enum OverlayAcquire {
+    Texture(wgpu::SurfaceTexture),
+    Skipped(SceneSkipReason),
 }
 
 fn pick_present_mode(modes: &[wgpu::PresentMode]) -> Result<wgpu::PresentMode, RenderError> {
