@@ -61,6 +61,46 @@ pub(crate) struct InteractionState {
 #[derive(Resource, Default)]
 pub(crate) struct InteractionsRes(pub Vec<InteractionEdge>);
 
+/// Autonomous walking state of one instance.
+///
+/// The position is only ever written by the wander system (and by external
+/// `set_position` calls, which cancel an ongoing walk); this component owns
+/// the phase machine, the deterministic random stream and the mirror facing.
+#[derive(Component)]
+pub(crate) struct WanderState {
+    /// Current phase of the idle/walk cycle.
+    pub phase: WanderPhase,
+    /// Mirror sign, always exactly `+1.0` (as authored) or `-1.0` (mirrored
+    /// horizontally around the instance's own vertical centre line).
+    pub facing: f32,
+    /// Per-instance splitmix64 stream, seeded from the instance id so the
+    /// walk is deterministic and independent of tick order or thread count.
+    pub rng: u64,
+    /// Set while a user gesture owns the instance (drag press or control
+    /// window position edit); a suspended instance never moves on its own.
+    pub suspended: bool,
+}
+
+/// The idle/walk cycle of one wandering instance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum WanderPhase {
+    /// Standing still for `remaining` seconds before choosing a target.
+    Idle { remaining: f32 },
+    /// Walking horizontally toward `target_x`.
+    Walking { target_x: f32 },
+}
+
+/// Horizontal world bounds wandering is allowed in; `None` disables walking
+/// entirely (the default, so headless tests and pinned workloads stay put).
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub(crate) struct WanderBoundsRes(pub Option<super::WorldXBounds>);
+
+/// Observable wander transitions produced by the last tick, drained by the
+/// application layer for logging. The simulation never reads them back, so
+/// dropping events cannot change any state.
+#[derive(Resource, Default)]
+pub(crate) struct WanderEventsRes(pub Vec<super::WanderEvent>);
+
 /// First error produced while simulating a tick, if any.
 #[derive(Resource, Default)]
 pub(crate) struct TickStatus {

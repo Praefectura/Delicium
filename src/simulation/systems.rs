@@ -1,24 +1,29 @@
 //! Schedule and systems that advance the simulation world one fixed step.
 //!
-//! One tick runs two systems, in this order:
+//! One tick runs three systems, in this order:
 //!
-//! 1. [`interaction_snapshot`]: an exclusive system that snapshots every
+//! 1. [`wander_step`]: every instance advances its idle/walk state machine
+//!    inside the current wander bounds and may move horizontally;
+//! 2. [`interaction_snapshot`]: an exclusive system that snapshots every
 //!    position in instance-id order, resolves the nearest neighbour inside
 //!    [`INTERACTION_RADIUS`](super::INTERACTION_RADIUS) for each instance and
-//!    eases the reaction weights;
-//! 2. [`advance_poses`]: a parallel-query system that samples animation
+//!    eases the reaction weights; it runs after the walk so the snapshot and
+//!    the same frame's render agree on where every instance is;
+//! 3. [`advance_poses`]: a parallel-query system that samples animation
 //!    parameters or joint locals for every instance and advances the pose
 //!    ring (`prev <- curr <- sampled`).
 //!
-//! Both systems are deterministic: the snapshot works on a sorted copy of the
-//! positions, and every instance owns its time and pose, so parallel pose
-//! evaluation cannot change the observable result of a tick.
+//! All systems are deterministic: the wander state machine draws exactly one
+//! random value per phase change from a per-instance stream, the snapshot
+//! works on a sorted copy of the positions, and every instance owns its time
+//! and pose, so neither thread scheduling nor query order can change the
+//! observable result of a tick.
 
 use std::sync::{Arc, Mutex};
 
 use bevy_ecs::{
     schedule::{IntoScheduleConfigs, Schedule},
-    system::{Query, ResMut},
+    system::{Query, Res, ResMut},
     world::World,
 };
 use bevy_tasks::{ComputeTaskPool, TaskPoolBuilder};
@@ -26,16 +31,80 @@ use glam::Vec3;
 
 use super::components::{
     InstanceTag, InteractionState, InteractionsRes, ModelHandle, PoseState, Position, TickStatus,
-    TimeState,
+    TimeState, WanderBoundsRes, WanderEventsRes, WanderPhase, WanderState,
 };
 use super::pose::{DriveInput, sample_pose};
 use super::{
     FIXED_DT_SECONDS, INTERACTION_EASE_PER_SECOND, INTERACTION_RADIUS, InstanceId, InteractionEdge,
-    MAX_SIM_THREADS, SimError,
+    MAX_SIM_THREADS, SimError, WANDER_ARRIVE_EPSILON, WANDER_EDGE_MARGIN, WANDER_EVENT_CAP,
+    WANDER_IDLE_MAX_SECONDS, WANDER_IDLE_MIN_SECONDS, WANDER_MIN_TARGET_DISTANCE, WANDER_SEED_STEP,
+    WANDER_SPEED, WanderEvent,
 };
 
 /// Weight fraction gained per fixed step while a neighbour is in range.
 const EASE_STEP: f32 = INTERACTION_EASE_PER_SECOND / 60.0;
+
+/// Per-step travel of a walking instance. Must stay below
+/// [`WANDER_ARRIVE_EPSILON`] for a walk to converge onto its target.
+const WANDER_STEP: f32 = WANDER_SPEED * (FIXED_DT_SECONDS as f32);
+
+/// splitmix64: no dependencies, pure integer arithmetic, identical on every
+/// platform. The state is advanced first, so two instances seeded apart can
+/// never emit correlated sequences.
+fn next_random(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Uniform `value in [0, 1)`. Uses the top 24 bits, which are exactly
+/// representable in an `f32`.
+fn random_unit(state: &mut u64) -> f32 {
+    (next_random(state) >> 40) as f32 / (1u32 << 24) as f32
+}
+
+/// Draws one idle duration from the instance's own stream.
+fn random_idle(state: &mut u64) -> f32 {
+    WANDER_IDLE_MIN_SECONDS
+        + random_unit(state) * (WANDER_IDLE_MAX_SECONDS - WANDER_IDLE_MIN_SECONDS)
+}
+
+/// The wander state a freshly spawned instance starts with.
+///
+/// The first idle duration is drawn unconditionally at spawn, whether or not
+/// bounds exist yet, so enabling wandering later cannot shift the stream and
+/// two identically created instances always agree tick for tick.
+pub(super) fn initial_wander_state(id: InstanceId) -> WanderState {
+    let mut rng = id.wrapping_mul(WANDER_SEED_STEP).wrapping_add(1);
+    let remaining = random_idle(&mut rng);
+    WanderState {
+        phase: WanderPhase::Idle { remaining },
+        facing: 1.0,
+        rng,
+        suspended: false,
+    }
+}
+
+/// Abandons an ongoing walk and starts a fresh idle countdown; the facing and
+/// the suspension flag are untouched. An instance already idling keeps its
+/// remaining time.
+pub(super) fn cancel_walk(wander: &mut WanderState) {
+    if matches!(wander.phase, WanderPhase::Idle { .. }) {
+        return;
+    }
+    let remaining = random_idle(&mut wander.rng);
+    wander.phase = WanderPhase::Idle { remaining };
+}
+
+/// Unconditionally starts a fresh idle countdown, even for an already idling
+/// instance. Used when a suspension is lifted, so a character released after
+/// a long hold pauses before walking off instead of leaving immediately.
+pub(super) fn reset_to_idle(wander: &mut WanderState) {
+    let remaining = random_idle(&mut wander.rng);
+    wander.phase = WanderPhase::Idle { remaining };
+}
 
 /// Initialises the bounded `ComputeTaskPool` the parallel pose pass runs on.
 ///
@@ -53,11 +122,135 @@ pub fn initialize_task_pool() {
     });
 }
 
-/// Builds the fixed-step schedule: interaction snapshot first, poses second.
+/// Builds the fixed-step schedule: wander first, snapshot second, poses last.
+///
+/// The walk runs before the interaction snapshot so both the snapshot and the
+/// same frame's render describe the same (already-walked) position.
 pub fn build_schedule() -> Schedule {
     let mut schedule = Schedule::default();
-    schedule.add_systems((interaction_snapshot, advance_poses).chain());
+    schedule.add_systems((wander_step, interaction_snapshot, advance_poses).chain());
     schedule
+}
+
+/// Advances the idle/walk state machine of every instance by one fixed step.
+///
+/// Deterministic by construction: every instance owns its state and its
+/// random stream, and each phase change draws exactly one value, so neither
+/// the query order nor the bounds geometry can change the sequence. A
+/// suspended instance is completely frozen; without bounds nothing moves.
+///
+/// An instance found outside the walkable range (an external placement, or
+/// bounds that shrank) walks back in immediately instead of waiting out its
+/// idle pause, so it can never sit off-screen for a whole idle period.
+pub fn wander_step(
+    mut query: Query<(&InstanceTag, &mut Position, &mut WanderState)>,
+    bounds: Res<WanderBoundsRes>,
+    mut events: ResMut<WanderEventsRes>,
+) {
+    let Some(bounds) = bounds.0 else {
+        return;
+    };
+    // Collapse a too-narrow range onto its midpoint, so the clamps below can
+    // never panic and the target arithmetic stays finite.
+    let lo = bounds.left + WANDER_EDGE_MARGIN;
+    let hi = bounds.right - WANDER_EDGE_MARGIN;
+    let (lo, hi) = if lo > hi {
+        let middle = bounds.left + (bounds.right - bounds.left) * 0.5;
+        (middle, middle)
+    } else {
+        (lo, hi)
+    };
+
+    for (tag, mut position, mut wander) in query.iter_mut() {
+        if wander.suspended {
+            continue;
+        }
+        let id = tag.0;
+        let x = position.0.x;
+        let outside = x < lo || x > hi;
+
+        let (target, started) = match wander.phase {
+            WanderPhase::Idle { remaining } => {
+                if outside {
+                    // Walk straight back from wherever the instance landed;
+                    // a recovery never waits out the idle pause.
+                    (x.clamp(lo, hi), true)
+                } else {
+                    let remaining = remaining - FIXED_DT_SECONDS as f32;
+                    if remaining > 0.0 {
+                        wander.phase = WanderPhase::Idle { remaining };
+                        continue;
+                    }
+                    (pick_target(&mut wander.rng, x, lo, hi), true)
+                }
+            }
+            WanderPhase::Walking { target_x } => {
+                // Bounds that shrank may leave the target out of range; the
+                // retarget is deterministic and draws no random value.
+                let target = target_x.clamp(lo, hi);
+                (target, target != target_x)
+            }
+        };
+
+        let delta = target - x;
+        if delta.abs() <= WANDER_ARRIVE_EPSILON {
+            position.0.x = target;
+            wander.phase = WanderPhase::Idle {
+                remaining: random_idle(&mut wander.rng),
+            };
+            push_event(
+                &mut events,
+                WanderEvent::Arrive {
+                    instance: id,
+                    x: target,
+                    y: position.0.y,
+                },
+            );
+            continue;
+        }
+
+        if started {
+            push_event(
+                &mut events,
+                WanderEvent::Start {
+                    instance: id,
+                    x,
+                    y: position.0.y,
+                    target_x: target,
+                },
+            );
+        }
+        let step = delta.clamp(-WANDER_STEP, WANDER_STEP);
+        position.0.x += step;
+        wander.facing = if step >= 0.0 { 1.0 } else { -1.0 };
+        wander.phase = WanderPhase::Walking { target_x: target };
+    }
+}
+
+/// Chooses a walk target inside `[lo, hi]`: one uniform draw, replaced by the
+/// far end when it lands too close to the current position, and by the
+/// midpoint when the range is too narrow for a full-length walk. The number
+/// of draws depends only on the (deterministic) bounds, never on the
+/// instance's previous position, so the stream cannot be perturbed by an
+/// external placement.
+fn pick_target(rng: &mut u64, x: f32, lo: f32, hi: f32) -> f32 {
+    if hi - lo < WANDER_MIN_TARGET_DISTANCE {
+        return lo + (hi - lo) * 0.5;
+    }
+    let target = lo + random_unit(rng) * (hi - lo);
+    if (target - x).abs() < WANDER_MIN_TARGET_DISTANCE {
+        if x < lo + (hi - lo) * 0.5 { hi } else { lo }
+    } else {
+        target
+    }
+}
+
+/// Appends one event, honouring [`WANDER_EVENT_CAP`].
+fn push_event(events: &mut WanderEventsRes, event: WanderEvent) {
+    debug_assert!(events.0.len() <= WANDER_EVENT_CAP);
+    if events.0.len() < WANDER_EVENT_CAP {
+        events.0.push(event);
+    }
 }
 
 /// Resolves the nearest neighbour of every instance and eases reactions.
@@ -171,6 +364,7 @@ pub fn advance_poses(
         &InstanceTag,
         &ModelHandle,
         &InteractionState,
+        &WanderState,
         &mut TimeState,
         &mut PoseState,
     )>,
@@ -179,12 +373,11 @@ pub fn advance_poses(
     let slot = Arc::new(Mutex::new(None::<(InstanceId, SimError)>));
     let worker_slot = Arc::clone(&slot);
 
-    query
-        .par_iter_mut()
-        .for_each(move |(tag, handle, interaction, mut time, mut pose)| {
+    query.par_iter_mut().for_each(
+        move |(tag, handle, interaction, wander, mut time, mut pose)| {
             let id = tag.0;
             let next_time = time.time + FIXED_DT_SECONDS;
-            let drive = DriveInput::from_state(interaction);
+            let drive = DriveInput::from_state(interaction, wander.facing);
             match sample_pose(&handle.model, next_time, &drive, id) {
                 Ok(next) => {
                     time.time = next_time;
@@ -201,7 +394,8 @@ pub fn advance_poses(
                     }
                 }
             }
-        });
+        },
+    );
 
     let recorded = match slot.lock() {
         Ok(mut slot) => slot.take(),

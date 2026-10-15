@@ -8,12 +8,17 @@
 //! # Ticks
 //!
 //! [`Simulation::advance`] consumes whole [`FIXED_DT`] steps, at most
-//! [`MAX_SUBSTEPS`] per call. One tick runs two systems in a fixed order:
+//! [`MAX_SUBSTEPS`] per call. One tick runs three systems in a fixed order:
 //!
-//! 1. an interaction snapshot: every instance finds its nearest neighbour
+//! 1. the wander step: every instance advances its idle/walk state machine
+//!    inside [`Simulation::wander_bounds`] and may write its own position;
+//! 2. an interaction snapshot: every instance finds its nearest neighbour
 //!    inside [`INTERACTION_RADIUS`] and eases its reaction weight;
-//! 2. the pose evaluation: animation sampling (2D parameters or 3D joint
+//! 3. the pose evaluation: animation sampling (2D parameters or 3D joint
 //!    locals) plus the interaction drive.
+//!
+//! The walk runs first so the snapshot and the same frame's render agree on
+//! where every instance is.
 //!
 //! Backlog beyond the step budget is dropped and counted in
 //! [`TickReport::dropped_steps`]; the sub-step residual stays available
@@ -52,7 +57,7 @@ use crate::{
 
 use components::{
     InstanceTag, InteractionState, InteractionsRes, ModelHandle, PoseState, Position, TickStatus,
-    TimeState,
+    TimeState, WanderBoundsRes, WanderEventsRes, WanderState,
 };
 use pose::{DriveInput, Pose, clamp, interpolated_locals, interpolated_parameters, sample_pose};
 
@@ -92,6 +97,36 @@ const HEAD_YAW_LIMIT: f32 = std::f32::consts::FRAC_PI_3;
 /// asset never start out in exactly the same pose.
 const CLONE_PHASE_STEP_SECONDS: f64 = 0.23;
 
+/// Walking speed of an autonomous instance, in world units per second.
+pub const WANDER_SPEED: f32 = 0.25;
+
+/// Shortest idle pause between two walks, in seconds.
+pub const WANDER_IDLE_MIN_SECONDS: f32 = 1.5;
+
+/// Longest idle pause between two walks, in seconds.
+pub const WANDER_IDLE_MAX_SECONDS: f32 = 4.5;
+
+/// Targets closer than this to the current position are replaced by the far
+/// end of the walkable range, so a walk never degenerates into a nudge.
+pub const WANDER_MIN_TARGET_DISTANCE: f32 = 0.8;
+
+/// Inset from the visible world bounds the wandering centre must keep.
+/// Wide enough (wider than the widest bundled asset half-width, 0.98) that no
+/// character leaves the screen while walking.
+pub const WANDER_EDGE_MARGIN: f32 = 1.2;
+
+/// Distance below which a walk snaps onto its target. Must exceed the per
+/// step travel (`WANDER_SPEED * FIXED_DT` = 0.004167) for convergence.
+pub const WANDER_ARRIVE_EPSILON: f32 = 0.01;
+
+/// Golden-ratio increment of the per-instance splitmix64 stream.
+pub const WANDER_SEED_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Upper bound of the drainable wander-event buffer. Events beyond it are
+/// dropped; they are pure observations the simulation never reads back, so
+/// dropping cannot change any state.
+pub const WANDER_EVENT_CAP: usize = 4096;
+
 /// Largest accepted coordinate of any instance position, on any axis.
 const MAX_COORDINATE: f32 = 10_000.0;
 
@@ -125,6 +160,37 @@ pub struct InstanceInfo {
     pub neighbor: Option<InstanceId>,
     /// Current animation time in seconds.
     pub animation_time: f64,
+}
+
+/// Horizontal world range autonomous walking is confined to.
+///
+/// Callers pass the raw visible range (`x = ±span/2 * aspect`); the
+/// [`WANDER_EDGE_MARGIN`] inset is applied inside the simulation so the
+/// policy lives in exactly one place. Invariant: both values are finite and
+/// `left <= right`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldXBounds {
+    pub left: f32,
+    pub right: f32,
+}
+
+/// One observed wander transition, drained by the application layer and
+/// logged there; the simulation itself never reads events back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WanderEvent {
+    /// An idle instance picked a new target and started walking.
+    Start {
+        instance: InstanceId,
+        x: f32,
+        y: f32,
+        target_x: f32,
+    },
+    /// A walking instance reached its target and stopped.
+    Arrive {
+        instance: InstanceId,
+        x: f32,
+        y: f32,
+    },
 }
 
 /// A directed nearest-neighbour link resolved during the last tick.
@@ -174,6 +240,11 @@ pub enum SimError {
     #[error("position {position:?} is not a finite, bounded world position")]
     InvalidPosition { position: Vec3 },
 
+    /// Wander bounds are not finite or not ordered (`left <= right`).
+    /// The previous bounds stay in effect.
+    #[error("wander bounds ({left}, {right}) are not finite and ordered")]
+    InvalidWanderBounds { left: f32, right: f32 },
+
     /// Instance state does not match its model (only reachable with
     /// hand-built, unvalidated compiled data).
     #[error("instance {instance} is inconsistent with its model: {detail}")]
@@ -218,6 +289,8 @@ impl Simulation {
         let mut world = World::new();
         world.insert_resource(InteractionsRes::default());
         world.insert_resource(TickStatus::default());
+        world.insert_resource(WanderBoundsRes::default());
+        world.insert_resource(WanderEventsRes::default());
         // Register the instance components up front, so the schedule can be
         // initialised even when it runs before the first spawn.
         world.register_component::<ModelHandle>();
@@ -226,6 +299,7 @@ impl Simulation {
         world.register_component::<TimeState>();
         world.register_component::<PoseState>();
         world.register_component::<InteractionState>();
+        world.register_component::<WanderState>();
         Self {
             world,
             schedule: systems::build_schedule(),
@@ -331,6 +405,7 @@ impl Simulation {
                     curr: pose,
                 },
                 InteractionState::default(),
+                systems::initial_wander_state(id),
             ))
             .id();
         self.entities.insert(id, entity);
@@ -366,6 +441,12 @@ impl Simulation {
 
     /// Moves an instance. Non-finite or extreme positions are rejected and
     /// leave the instance untouched.
+    ///
+    /// An externally placed instance abandons any ongoing walk and starts a
+    /// fresh idle countdown (its facing is kept); a drag or control-window
+    /// edit therefore always wins over autonomous movement. The suspension
+    /// flag is orthogonal and untouched, so a drag that only moves the
+    /// pointer a little cannot accidentally resume a suspended instance.
     pub fn set_position(&mut self, id: InstanceId, position: Vec3) -> Result<(), SimError> {
         validate_position(position)?;
         let entity = *self
@@ -377,7 +458,84 @@ impl Simulation {
             .get_mut::<Position>(entity)
             .ok_or(SimError::UnknownInstance(id))?;
         slot.0 = position;
+        if let Some(mut wander) = self.world.get_mut::<WanderState>(entity) {
+            systems::cancel_walk(&mut wander);
+        }
         Ok(())
+    }
+
+    // -- wander -------------------------------------------------------------
+
+    /// Sets (or clears) the horizontal bounds autonomous walking is confined
+    /// to. `None` disables walking entirely, which is the default.
+    ///
+    /// Bounds must be finite and ordered; anything else is rejected and the
+    /// previous bounds stay in effect.
+    pub fn set_wander_bounds(&mut self, bounds: Option<WorldXBounds>) -> Result<(), SimError> {
+        if let Some(bounds) = bounds
+            && (!bounds.left.is_finite() || !bounds.right.is_finite() || bounds.left > bounds.right)
+        {
+            return Err(SimError::InvalidWanderBounds {
+                left: bounds.left,
+                right: bounds.right,
+            });
+        }
+        if let Some(mut slot) = self.world.get_resource_mut::<WanderBoundsRes>() {
+            slot.0 = bounds;
+        }
+        Ok(())
+    }
+
+    /// Reads the current wander bounds, if walking is enabled.
+    pub fn wander_bounds(&self) -> Option<WorldXBounds> {
+        self.world
+            .get_resource::<WanderBoundsRes>()
+            .and_then(|bounds| bounds.0)
+    }
+
+    /// Parks an instance: any ongoing walk is cancelled and the instance
+    /// stays put until [`resume_wander`](Self::resume_wander) is called. The
+    /// idle countdown is frozen too, so holding a character still for longer
+    /// than one idle period cannot move it away from the pointer.
+    pub fn suspend_wander(&mut self, id: InstanceId) -> Result<(), SimError> {
+        let entity = *self
+            .entities
+            .get(&id)
+            .ok_or(SimError::UnknownInstance(id))?;
+        let mut wander = self
+            .world
+            .get_mut::<WanderState>(entity)
+            .ok_or(SimError::UnknownInstance(id))?;
+        wander.suspended = true;
+        systems::cancel_walk(&mut wander);
+        Ok(())
+    }
+
+    /// Releases a parked instance and draws a fresh idle duration, so the
+    /// character pauses before setting off. Idempotent.
+    pub fn resume_wander(&mut self, id: InstanceId) -> Result<(), SimError> {
+        let entity = *self
+            .entities
+            .get(&id)
+            .ok_or(SimError::UnknownInstance(id))?;
+        let mut wander = self
+            .world
+            .get_mut::<WanderState>(entity)
+            .ok_or(SimError::UnknownInstance(id))?;
+        wander.suspended = false;
+        systems::reset_to_idle(&mut wander);
+        Ok(())
+    }
+
+    /// Takes every wander transition recorded since the last drain. The
+    /// buffer is cleared, so callers must drain once per frame right after
+    /// [`advance`](Self::advance) to avoid replaying events on zero-step
+    /// frames.
+    pub fn drain_wander_events(&mut self) -> Vec<WanderEvent> {
+        self.world
+            .get_resource_mut::<WanderEventsRes>()
+            .map(|mut events| std::mem::take(&mut events.0))
+            .unwrap_or_default()
     }
 
     /// Swaps the model of an existing instance.
@@ -425,7 +583,11 @@ impl Simulation {
                 .world
                 .get::<InteractionState>(entity)
                 .ok_or(SimError::UnknownInstance(id))?;
-            DriveInput::from_state(interaction)
+            let facing = self
+                .world
+                .get::<WanderState>(entity)
+                .map_or(1.0, |wander| wander.facing);
+            DriveInput::from_state(interaction, facing)
         };
 
         // Everything is computed before anything is written, so a failed call
@@ -571,7 +733,15 @@ impl Simulation {
                 .world
                 .get::<PoseState>(entity)
                 .ok_or(SimError::UnknownInstance(id))?;
-            let transform = Mat4::from_translation(position);
+            // Translation times a horizontal mirror around the instance's
+            // own centre line; the facing is exactly ±1.0, so the matrix is
+            // exact and needs no epsilon anywhere.
+            let facing = self
+                .world
+                .get::<WanderState>(entity)
+                .map_or(1.0, |wander| wander.facing);
+            let transform =
+                Mat4::from_translation(position) * Mat4::from_scale(Vec3::new(facing, 1.0, 1.0));
             match &handle.model.data {
                 ModelData::Sprite2d(sprite) => {
                     let parameters =

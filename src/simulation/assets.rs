@@ -76,12 +76,13 @@ impl AssetPool {
 
 /// Converts a compiled model into the renderer's CPU-side asset description.
 ///
-/// The result contains only geometry data (no GPU handles): layer masks become
-/// point lists and 3D vertices become [`SkinVertex`] lanes, copying joint
-/// indices and weights verbatim.
+/// The result contains CPU-side resources, not GPU handles. Images share their
+/// immutable pixels through `Arc`; masks become point lists and 3D vertices
+/// become [`SkinVertex`] lanes, copying UVs, joint indices and weights verbatim.
 pub fn render_asset(model: &CompiledModel) -> RenderAsset {
     match &model.data {
         ModelData::Sprite2d(sprite) => RenderAsset::Sprite2d {
+            images: model.images.clone(),
             layers: sprite
                 .layers
                 .iter()
@@ -90,6 +91,8 @@ pub fn render_asset(model: &CompiledModel) -> RenderAsset {
                     indices: layer.indices.clone(),
                     color: layer.color,
                     mask: layer.mask.as_ref().map(|mask| mask.points.clone()),
+                    uvs: layer.uvs.clone(),
+                    texture: layer.texture,
                 })
                 .collect(),
         },
@@ -103,10 +106,14 @@ pub fn render_asset(model: &CompiledModel) -> RenderAsset {
                     color: vertex.color,
                     joints: vertex.joints,
                     weights: vertex.weights,
+                    uv: vertex.uv,
                 })
                 .collect(),
             indices: skeleton.indices.clone(),
             joint_count: skeleton.joints.len(),
+            images: model.images.clone(),
+            texture: skeleton.texture,
+            material: skeleton.material,
         },
     }
 }

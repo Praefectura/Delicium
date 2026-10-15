@@ -22,13 +22,27 @@ pub(crate) enum Pose {
 }
 
 /// Interaction reaction carried into pose evaluation.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct DriveInput {
     /// Direction to the neighbour, in world space, if one is within the
     /// interaction radius.
     pub direction: Vec3,
     /// Eased reaction weight in `0.0..=1.0`.
     pub weight: f32,
+    /// Mirror sign of the instance root (`+1.0` or `-1.0`). A mirrored root
+    /// flips the world direction of every local rotation around Y and of
+    /// every horizontal gaze sign, so the drive must multiply through it.
+    pub facing: f32,
+}
+
+impl Default for DriveInput {
+    fn default() -> Self {
+        Self {
+            direction: Vec3::ZERO,
+            weight: 0.0,
+            facing: 1.0,
+        }
+    }
 }
 
 impl DriveInput {
@@ -37,14 +51,19 @@ impl DriveInput {
         Self::default()
     }
 
-    /// Reads the reaction from an instance's interaction state.
-    pub fn from_state(state: &InteractionState) -> Self {
+    /// Reads the reaction from an instance's interaction state under its
+    /// current mirror facing.
+    pub fn from_state(state: &InteractionState, facing: f32) -> Self {
         match state.neighbor {
             Some(_) if state.weight > 0.0 => Self {
                 direction: state.offset,
                 weight: state.weight.clamp(0.0, 1.0),
+                facing,
             },
-            _ => Self::none(),
+            _ => Self {
+                facing,
+                ..Self::none()
+            },
         }
     }
 }
@@ -106,7 +125,9 @@ fn apply_sprite_drive(
     let direction = drive.direction.normalize_or_zero();
     // Horizontal component decides the gaze sign: positive X (a neighbour to
     // the right of this instance) drives the parameter toward its maximum.
-    let sign = direction.x.clamp(-1.0, 1.0);
+    // Under a mirrored root the same world direction needs the opposite
+    // parameter sign, so the facing multiplies through.
+    let sign = direction.x.clamp(-1.0, 1.0) * drive.facing;
     let middle = (parameter.min + parameter.max) * 0.5;
     let half_range = (parameter.max - parameter.min) * 0.5;
     let target = clamp(middle + sign * half_range, parameter.min, parameter.max);
@@ -149,14 +170,15 @@ fn apply_skeleton_drive(
     // The model faces +Z; a positive rotation around Y turns +Z toward +X
     // (right-hand rule), so `atan2(dx, dz)` is the yaw that faces the
     // neighbour, clamped to the authored limit and scaled by the weight.
-    // The world direction is used directly: the instance root is a pure
-    // translation, so world and local orientations coincide.
+    // The instance root is a translation times a horizontal mirror, so a
+    // mirrored root flips the world direction of every yaw: multiplying by
+    // the facing keeps the same local rotation pointing at the neighbour.
     let direction = drive.direction.normalize_or_zero();
     let yaw = direction
         .x
         .atan2(direction.z)
         .clamp(-HEAD_YAW_LIMIT, HEAD_YAW_LIMIT);
-    let yaw = yaw * drive.weight;
+    let yaw = yaw * drive.weight * drive.facing;
     let local = &mut locals[joint_index];
     local.rotation = (Quat::from_rotation_y(yaw) * local.rotation).normalize();
     Ok(())
@@ -278,5 +300,128 @@ pub(crate) fn clamp(value: f32, min: f32, max: f32) -> f32 {
         max
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{LoadLimits, load_model_bytes};
+
+    /// A minimal skeleton with a steerable head joint, matching the bundled
+    /// robot's `interaction.head_joint = "head"` binding shape.
+    fn skeleton_model() -> std::sync::Arc<CompiledModel> {
+        let document = serde_json::json!({
+            "format": "delicium.model", "format_version": "0.1", "name": "drive probe",
+            "kind": "skeleton3d",
+            "interaction": {"head_joint": "head"},
+            "skeleton3d": {
+                "vertices": [
+                    {"position": [-0.5, 1.0, 0.0], "normal": [0.0, 0.0, 1.0], "color": [1.0, 1.0, 1.0, 1.0], "joints": [0, 0, 0, 0], "weights": [1.0, 0.0, 0.0, 0.0]},
+                    {"position": [0.5, 1.0, 0.0], "normal": [0.0, 0.0, 1.0], "color": [1.0, 1.0, 1.0, 1.0], "joints": [0, 0, 0, 0], "weights": [1.0, 0.0, 0.0, 0.0]},
+                    {"position": [0.0, 2.0, 0.0], "normal": [0.0, 0.0, 1.0], "color": [1.0, 1.0, 1.0, 1.0], "joints": [0, 0, 0, 0], "weights": [1.0, 0.0, 0.0, 0.0]}
+                ],
+                "indices": [0, 1, 2],
+                "joints": [
+                    {"name": "head", "parent": null, "translation": [0.0, 1.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+                    {"name": "root", "parent": null, "translation": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}
+                ],
+                "animations": []
+            }
+        });
+        load_model_bytes(
+            &serde_json::to_vec(&document).unwrap(),
+            &LoadLimits::default(),
+        )
+        .unwrap()
+    }
+
+    /// A minimal sprite with a `gaze_x` parameter and the matching binding.
+    fn sprite_model() -> std::sync::Arc<CompiledModel> {
+        let document = serde_json::json!({
+            "format": "delicium.model", "format_version": "0.1", "name": "gaze probe",
+            "kind": "sprite2d",
+            "interaction": {"gaze_parameter": "gaze_x"},
+            "sprite2d": {
+                "parameters": [{"name": "gaze_x", "min": -1.0, "max": 1.0, "default": 0.0}],
+                "layers": [{
+                    "name": "body", "color": [1.0, 1.0, 1.0, 1.0],
+                    "vertices": [[-0.5, 0.0], [0.5, 0.0], [0.0, 1.0]],
+                    "indices": [0, 1, 2]
+                }],
+                "animations": []
+            }
+        });
+        load_model_bytes(
+            &serde_json::to_vec(&document).unwrap(),
+            &LoadLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn skeleton_drive_respects_the_instance_facing() {
+        let model = skeleton_model();
+        let ModelData::Skeleton3d(skeleton) = &model.data else {
+            panic!("expected a skeleton model");
+        };
+        let locals = vec![JointTransform::default(); skeleton.joints.len()];
+        let drive_right = DriveInput {
+            direction: Vec3::new(1.0, 0.0, 0.0),
+            weight: 1.0,
+            facing: 1.0,
+        };
+        let mut positive = locals.clone();
+        apply_skeleton_drive(&model, skeleton, &mut positive, &drive_right, 1).unwrap();
+        let mut mirrored = locals.clone();
+        let drive_mirrored = DriveInput {
+            facing: -1.0,
+            ..drive_right
+        };
+        apply_skeleton_drive(&model, skeleton, &mut mirrored, &drive_mirrored, 1).unwrap();
+        // The head joint index inside the probe model.
+        let head = skeleton
+            .joints
+            .iter()
+            .position(|joint| joint.name == "head")
+            .unwrap();
+        // Unmirrored: yaw = +HEAD_YAW_LIMIT; mirrored: yaw = -HEAD_YAW_LIMIT.
+        // The relation mirrored = R_y(-2*limit) composed on the unmirrored
+        // rotation must hold; quaternion equality (up to sign) is |dot| = 1.
+        let expected = Quat::from_rotation_y(-2.0 * HEAD_YAW_LIMIT) * positive[head].rotation;
+        let dot = mirrored[head].rotation.dot(expected).abs();
+        assert!(
+            dot > 1.0 - 1e-6,
+            "mirrored head rotation is not the -2*yaw composition: {:?} vs {:?}",
+            mirrored[head].rotation,
+            expected
+        );
+    }
+
+    #[test]
+    fn sprite_drive_sign_follows_the_facing() {
+        let model = sprite_model();
+        let ModelData::Sprite2d(sprite) = &model.data else {
+            panic!("expected a sprite model");
+        };
+        let drive = |x: f32, facing: f32| DriveInput {
+            direction: Vec3::new(x, 0.0, 0.0),
+            weight: 1.0,
+            facing,
+        };
+        let probe = |drive: &DriveInput| {
+            let mut parameters = vec![0.0f32; sprite.parameters.len()];
+            apply_sprite_drive(&model, sprite, &mut parameters, drive, 1).unwrap();
+            parameters
+        };
+        // A neighbour to the right while unmirrored and a neighbour to the
+        // right while mirrored must drive the parameter to opposite ends.
+        let unmirrored = probe(&drive(1.0, 1.0));
+        let mirrored = probe(&drive(1.0, -1.0));
+        assert_eq!(unmirrored[0], 1.0);
+        assert_eq!(mirrored[0], -1.0);
+        // Mirroring the root and flipping the world direction reproduces the
+        // unmirrored result: the same neighbour seen through a mirror.
+        assert_eq!(probe(&drive(-1.0, -1.0)), unmirrored);
     }
 }
