@@ -4,6 +4,8 @@
 //! [`Arc`](std::sync::Arc). The renderer and the simulation read these
 //! structures directly; they never see the raw JSON schema.
 
+use std::sync::Arc;
+
 use glam::{Mat4, Quat, Vec3};
 
 /// Which native model family a compiled asset belongs to.
@@ -43,6 +45,76 @@ pub struct CompiledModel {
     pub data: ModelData,
     /// Declared interaction capabilities, resolved to indices at compile time.
     pub interaction: InteractionBinding,
+    /// Decoded image table, indexed by the `texture` fields of the compiled
+    /// payload; images are shared via [`Arc`](std::sync::Arc) and never
+    /// copied per instance or per frame.
+    pub images: Vec<Arc<ModelImage>>,
+}
+
+// ---------------------------------------------------------------------------
+// Images and materials (0.2)
+// ---------------------------------------------------------------------------
+
+/// One decoded model image, ready for GPU upload.
+#[derive(Debug, Clone)]
+pub struct ModelImage {
+    /// Image id as declared by the file (unique within the model).
+    pub id: String,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// RGBA8 texels: sRGB-encoded, **linear-premultiplied** RGB with the
+    /// original alpha. The decoder decodes the PNG to straight 8-bit RGBA,
+    /// premultiplies RGB in linear space by `alpha / 255`, then sRGB-encodes
+    /// the result, so transparent texels never bleed dark edges.
+    /// `rgba.len() == width * height * 4`.
+    pub rgba: Arc<[u8]>,
+    /// True when every texel has alpha `255`.
+    pub opaque: bool,
+    /// True when every texel has alpha `0` (and, by the premultiply rule,
+    /// black RGB).
+    pub fully_transparent: bool,
+}
+
+/// Alpha handling of a 3D material.
+///
+/// The first texture round supports only fully opaque output: either every
+/// effective alpha is exactly `1` ([`AlphaMode::Opaque`]), or texels below
+/// `alpha_cutoff` are discarded with no general blending
+/// ([`AlphaMode::Cutout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlphaMode {
+    /// Every effective alpha must be exactly `1`; no transparency at all.
+    Opaque,
+    /// Compare the texture alpha against `alpha_cutoff`: below the cutoff the
+    /// fragment is discarded, at or above it the fragment is opaque.
+    Cutout,
+}
+
+/// Basic per-model 3D material.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Material3d {
+    /// Surface roughness in `[0, 1]` (GGX).
+    pub roughness: f32,
+    /// Metalness in `[0, 1]`.
+    pub metallic: f32,
+    /// Alpha handling mode.
+    pub alpha_mode: AlphaMode,
+    /// Cutout threshold in `(0, 1]`; only meaningful for
+    /// [`AlphaMode::Cutout`] (default `0.5`).
+    pub alpha_cutoff: f32,
+}
+
+impl Default for Material3d {
+    fn default() -> Self {
+        Self {
+            roughness: 0.6,
+            metallic: 0.0,
+            alpha_mode: AlphaMode::Opaque,
+            alpha_cutoff: 0.5,
+        }
+    }
 }
 
 impl CompiledModel {
@@ -150,6 +222,21 @@ pub struct Layer2d {
     pub deformer: Option<usize>,
     /// Optional polygon mask in the same local space as `vertices`.
     pub mask: Option<Mask2d>,
+    /// Static artist UVs, one per vertex, origin top-left, values in `[0, 1]`.
+    ///
+    /// Empty when the layer carries no texture (the color fallback ignores
+    /// UVs). For a generated grid without explicit UVs the compiler derives
+    /// them from the rest grid: `u = column / columns`,
+    /// `v = 1 - row / rows`.
+    pub uvs: Vec<[f32; 2]>,
+    /// Index into [`CompiledModel::images`] for the base color texture, or
+    /// `None` for the untextured color path.
+    pub texture: Option<usize>,
+    /// True when the layer contributes visible fragments under the CPU-side
+    /// conservative test: always true without a texture, false when the bound
+    /// image is entirely transparent. Partial alpha holes are left to the
+    /// renderer; hit testing uses this for whole-layer rejection.
+    pub texture_visible: bool,
 }
 
 /// A closed polygon mask; geometry outside it is clipped by the renderer.
@@ -258,6 +345,18 @@ pub struct CompiledSkeleton3d {
     pub inverse_bind: Vec<Mat4>,
     /// Joint animations.
     pub animations: Vec<SkeletalAnimation>,
+    /// Index into [`CompiledModel::images`] for the base color texture, or
+    /// `None` for the untextured path (legacy `0.1` behavior).
+    pub texture: Option<usize>,
+    /// Material declared by the file, or the default material when a texture
+    /// is present without an explicit `material`; `None` for the legacy
+    /// vertex-color path.
+    pub material: Option<Material3d>,
+    /// False only when a cutout model provably contributes no visible
+    /// fragments: the image's global maximum alpha times the maximum vertex
+    /// alpha stays below `alpha_cutoff`, or both are exactly zero. Purely a
+    /// whole-model rejection hint; partial holes are the renderer's job.
+    pub visible: bool,
 }
 
 impl CompiledSkeleton3d {
@@ -285,6 +384,9 @@ pub struct Vertex3d {
     pub joints: [u32; 4],
     /// Four skinning weights summing to `1.0`.
     pub weights: [f32; 4],
+    /// Static base color texture coordinate, origin top-left, in `[0, 1]`.
+    /// `[0, 0]` for untextured / legacy vertices.
+    pub uv: [f32; 2],
 }
 
 /// A joint in the hierarchy.

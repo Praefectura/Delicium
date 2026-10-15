@@ -20,9 +20,23 @@
 //! # Format
 //!
 //! `format` must be exactly `delicium.model`, `format_version` exactly `0.1`
-//! and `kind` either `sprite2d` or `skeleton3d`. Unknown fields anywhere in the
-//! document are rejected (`deny_unknown_fields`), so a newer file cannot be
-//! half-loaded and mistaken for a supported one.
+//! or `0.2` and `kind` either `sprite2d` or `skeleton3d`. Unknown fields
+//! anywhere in the document are rejected (`deny_unknown_fields`), so a newer
+//! file cannot be half-loaded and mistaken for a supported one.
+//!
+//! `0.2` adds an embedded image table (`images`: unique `id` + standard-padded
+//! Base64 PNG), optional per-layer/per-mesh `texture` + `uvs`, and a basic 3D
+//! `material` (`roughness`, `metallic`, `alpha_mode` `opaque`/`cutout`,
+//! `alpha_cutoff`). Everything else is unchanged from `0.1`; a `0.2` document
+//! without textures falls back to the `0.1` color / vertex-color paths.
+//!
+//! UV conventions: origin top-left, values in `[0, 1]`, one entry per vertex.
+//! Generated 2D grids derive `u = column / columns`, `v = 1 - row / rows`.
+//! Images are decoded to sRGB-encoded, **linear-premultiplied** RGBA8, so
+//! filtering never bleeds hidden color; `0.2` 3D models with a texture and no
+//! material take the default opaque PBR material, and a cutout model whose
+//! best possible fragment alpha stays below its cutoff is skipped wholly
+//! (`CompiledSkeleton3d::visible == false`).
 //!
 //! # Guarantees of a compiled asset
 //!
@@ -42,8 +56,10 @@
 mod compile;
 mod error;
 mod evaluate;
+mod image;
 mod limits;
 mod schema;
+mod schema_v02;
 mod types;
 mod validate;
 
@@ -54,15 +70,27 @@ pub use evaluate::{
 };
 pub use limits::LoadLimits;
 pub use types::{
-    AnimationInterpolation, CompiledModel, CompiledSkeleton3d, CompiledSprite2d, Deformer2d,
-    InteractionBinding, Joint, JointTransform, Layer2d, Mask2d, ModelData, ModelKind, ParamChannel,
-    Parameter, ParameterAnimation, RotationKey, ScalarKey, ScaleKey, SkeletalAnimation,
-    SkeletalChannel, TranslationKey, Vertex3d,
+    AlphaMode, AnimationInterpolation, CompiledModel, CompiledSkeleton3d, CompiledSprite2d,
+    Deformer2d, InteractionBinding, Joint, JointTransform, Layer2d, Mask2d, Material3d, ModelData,
+    ModelImage, ModelKind, ParamChannel, Parameter, ParameterAnimation, RotationKey, ScalarKey,
+    ScaleKey, SkeletalAnimation, SkeletalChannel, TranslationKey, Vertex3d,
 };
 
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+
+use serde::Deserialize;
+
+/// Minimal typed header probe: only enough shape to select the strict
+/// versioned schema. Unknown fields are tolerated here and rejected by the
+/// versioned parse of the original bytes, so neither version can be
+/// half-loaded.
+#[derive(Deserialize)]
+struct VersionProbe {
+    #[serde(default)]
+    format_version: Option<String>,
+}
 
 /// Maximum length of any name in a document. Also enforced by the validator;
 /// kept here as documentation of the format contract.
@@ -83,13 +111,35 @@ pub fn load_model_bytes(
         });
     }
 
-    let raw: schema::RawEnvelope =
+    // A tiny typed probe reads only the version; both versioned parses below
+    // re-read the original bytes with full `deny_unknown_fields` strictness,
+    // so unknown fields, wrong types and duplicate fields all fail closed.
+    let probe: VersionProbe =
         serde_json::from_slice(bytes).map_err(|err| ModelError::InvalidJson {
             message: err.to_string(),
         })?;
 
-    validate::validate(&raw, limits)?;
-    Ok(Arc::new(compile::compile(&raw, limits)?))
+    match probe.format_version.as_deref() {
+        Some(schema::FORMAT_VERSION) => {
+            let raw: schema::RawEnvelope =
+                serde_json::from_slice(bytes).map_err(|err| ModelError::InvalidJson {
+                    message: err.to_string(),
+                })?;
+            validate::validate(&raw, limits)?;
+            Ok(Arc::new(compile::compile(&raw, limits)?))
+        }
+        Some(schema_v02::FORMAT_VERSION) => {
+            let raw: schema_v02::RawEnvelope =
+                serde_json::from_slice(bytes).map_err(|err| ModelError::InvalidJson {
+                    message: err.to_string(),
+                })?;
+            validate::validate_v02(&raw, limits)?;
+            Ok(Arc::new(compile::compile_v02(&raw, limits)?))
+        }
+        other => Err(ModelError::UnsupportedVersion {
+            found: other.unwrap_or_default().to_string(),
+        }),
+    }
 }
 
 /// Reads a model file and compiles it.

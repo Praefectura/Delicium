@@ -48,6 +48,19 @@ pub struct LoadLimits {
     /// Maximum accumulated warp control offsets across all warp deformers
     /// (derived budget).
     pub max_total_warp_offsets: usize,
+    /// Maximum number of embedded images per model (`0.2` documents).
+    pub max_images: usize,
+    /// Maximum width and height of one decoded image, in pixels.
+    pub max_image_dimension: u32,
+    /// Maximum decoded RGBA8 bytes of a single image.
+    pub max_image_bytes: usize,
+    /// Maximum accumulated decoded RGBA8 bytes across all images of one model
+    /// (derived budget, checked before each output allocation).
+    pub max_total_image_bytes: usize,
+    /// Internal allocation limit handed to the `png` decoder for one image;
+    /// the library limit does not cover the caller's output buffer, so image
+    /// dimensions and decoded bytes are checked explicitly as well.
+    pub max_png_decoder_bytes: usize,
 }
 
 impl Default for LoadLimits {
@@ -69,6 +82,14 @@ impl Default for LoadLimits {
             max_total_keys: 262_144,
             max_grid_dimension: 64,
             max_total_warp_offsets: 16_384,
+            max_images: 8,
+            // 2048x2048x4 == 16 MiB, so the dimension and byte budgets meet
+            // exactly; the 8 MiB payload budget may bind first for
+            // poorly-compressed images.
+            max_image_dimension: 2_048,
+            max_image_bytes: 16 * 1024 * 1024,
+            max_total_image_bytes: 32 * 1024 * 1024,
+            max_png_decoder_bytes: 16 * 1024 * 1024,
         }
     }
 }

@@ -31,8 +31,8 @@ pub enum ModelError {
     #[error("unsupported model format `{found}` (expected `delicium.model`)")]
     UnsupportedFormat { found: String },
 
-    /// `format_version` was not the exact expected string.
-    #[error("unsupported model format_version `{found}` (expected `0.1`)")]
+    /// `format_version` was not one of the exact supported strings.
+    #[error("unsupported model format_version `{found}` (expected `0.1` or `0.2`)")]
     UnsupportedVersion { found: String },
 
     /// The model name is empty.

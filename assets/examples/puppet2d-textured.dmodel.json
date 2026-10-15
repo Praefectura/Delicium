@@ -1,0 +1,549 @@
+{
+  "format": "delicium.model",
+  "format_version": "0.2",
+  "name": "puppet2d",
+  "kind": "sprite2d",
+  "interaction": {
+    "gaze_parameter": "gaze_x"
+  },
+  "sprite2d": {
+    "parameters": [
+      {
+        "name": "breath",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 0.25
+      },
+      {
+        "name": "gaze_x",
+        "min": -1.0,
+        "max": 1.0,
+        "default": 0.0
+      },
+      {
+        "name": "ear_sway",
+        "min": -1.0,
+        "max": 1.0,
+        "default": 0.0
+      }
+    ],
+    "deformers": [
+      {
+        "name": "eyes_look",
+        "type": "warp",
+        "parent": "head_tilt",
+        "parameter": "gaze_x",
+        "bounds": [
+          -0.3,
+          0.26,
+          0.6,
+          0.16
+        ],
+        "grid": [
+          2,
+          2
+        ],
+        "offsets": [
+          [
+            0.045,
+            0.0
+          ],
+          [
+            0.045,
+            0.0
+          ],
+          [
+            0.045,
+            0.0
+          ],
+          [
+            0.045,
+            0.0
+          ]
+        ]
+      },
+      {
+        "name": "ear_r",
+        "type": "rotation",
+        "parent": "head_tilt",
+        "parameter": "ear_sway",
+        "pivot": [
+          0.4,
+          0.46
+        ],
+        "max_angle_radians": -0.45
+      },
+      {
+        "name": "torso_breathe",
+        "type": "warp",
+        "parent": null,
+        "parameter": "breath",
+        "bounds": [
+          -0.38,
+          -0.9,
+          0.76,
+          0.95
+        ],
+        "grid": [
+          3,
+          3
+        ],
+        "offsets": [
+          [
+            -0.014,
+            -0.016
+          ],
+          [
+            0.0,
+            -0.018
+          ],
+          [
+            0.014,
+            -0.016
+          ],
+          [
+            -0.02,
+            -0.004
+          ],
+          [
+            0.0,
+            0.02
+          ],
+          [
+            0.02,
+            -0.004
+          ],
+          [
+            -0.012,
+            0.014
+          ],
+          [
+            0.0,
+            0.018
+          ],
+          [
+            0.012,
+            0.014
+          ]
+        ]
+      },
+      {
+        "name": "head_tilt",
+        "type": "rotation",
+        "parent": null,
+        "parameter": "gaze_x",
+        "pivot": [
+          0.0,
+          0.06
+        ],
+        "max_angle_radians": 0.14
+      },
+      {
+        "name": "ear_l",
+        "type": "rotation",
+        "parent": "head_tilt",
+        "parameter": "ear_sway",
+        "pivot": [
+          -0.4,
+          0.46
+        ],
+        "max_angle_radians": 0.45
+      }
+    ],
+    "layers": [
+      {
+        "name": "body",
+        "color": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "grid": {
+          "bounds": [
+            -0.38,
+            -0.9,
+            0.76,
+            0.95
+          ],
+          "columns": 6,
+          "rows": 8
+        },
+        "deformer": "torso_breathe",
+        "texture": "coat"
+      },
+      {
+        "name": "head",
+        "color": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "grid": {
+          "bounds": [
+            -0.4,
+            0.02,
+            0.8,
+            0.62
+          ],
+          "columns": 7,
+          "rows": 7
+        },
+        "deformer": "head_tilt",
+        "texture": "face"
+      },
+      {
+        "name": "ear_left",
+        "color": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "grid": {
+          "bounds": [
+            -0.62,
+            0.44,
+            0.24,
+            0.4
+          ],
+          "columns": 3,
+          "rows": 5
+        },
+        "deformer": "ear_l",
+        "texture": "ears"
+      },
+      {
+        "name": "ear_right",
+        "color": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "grid": {
+          "bounds": [
+            0.38,
+            0.44,
+            0.24,
+            0.4
+          ],
+          "columns": 3,
+          "rows": 5
+        },
+        "deformer": "ear_r",
+        "texture": "ears"
+      },
+      {
+        "name": "eye_white_left",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "vertices": [
+          [
+            -0.245,
+            0.275
+          ],
+          [
+            -0.065,
+            0.275
+          ],
+          [
+            -0.065,
+            0.405
+          ],
+          [
+            -0.245,
+            0.405
+          ]
+        ],
+        "indices": [
+          0,
+          1,
+          2,
+          0,
+          2,
+          3
+        ],
+        "deformer": "eyes_look",
+        "mask": {
+          "points": [
+            [
+              -0.062612,
+              0.378268
+            ],
+            [
+              -0.116732,
+              0.432388
+            ],
+            [
+              -0.193268,
+              0.432388
+            ],
+            [
+              -0.247388,
+              0.378268
+            ],
+            [
+              -0.247388,
+              0.301732
+            ],
+            [
+              -0.193268,
+              0.247612
+            ],
+            [
+              -0.116732,
+              0.247612
+            ],
+            [
+              -0.062612,
+              0.301732
+            ]
+          ]
+        }
+      },
+      {
+        "name": "eye_white_right",
+        "color": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "vertices": [
+          [
+            0.065,
+            0.275
+          ],
+          [
+            0.245,
+            0.275
+          ],
+          [
+            0.245,
+            0.405
+          ],
+          [
+            0.065,
+            0.405
+          ]
+        ],
+        "indices": [
+          0,
+          1,
+          2,
+          0,
+          2,
+          3
+        ],
+        "deformer": "eyes_look",
+        "mask": {
+          "points": [
+            [
+              0.247388,
+              0.378268
+            ],
+            [
+              0.193268,
+              0.432388
+            ],
+            [
+              0.116732,
+              0.432388
+            ],
+            [
+              0.062612,
+              0.378268
+            ],
+            [
+              0.062612,
+              0.301732
+            ],
+            [
+              0.116732,
+              0.247612
+            ],
+            [
+              0.193268,
+              0.247612
+            ],
+            [
+              0.247388,
+              0.301732
+            ]
+          ]
+        }
+      },
+      {
+        "name": "pupil_left",
+        "color": [
+          0.12,
+          0.12,
+          0.16,
+          1.0
+        ],
+        "vertices": [
+          [
+            -0.185,
+            0.3
+          ],
+          [
+            -0.125,
+            0.3
+          ],
+          [
+            -0.125,
+            0.38
+          ],
+          [
+            -0.185,
+            0.38
+          ]
+        ],
+        "indices": [
+          0,
+          1,
+          2,
+          0,
+          2,
+          3
+        ],
+        "deformer": "eyes_look"
+      },
+      {
+        "name": "pupil_right",
+        "color": [
+          0.12,
+          0.12,
+          0.16,
+          1.0
+        ],
+        "vertices": [
+          [
+            0.125,
+            0.3
+          ],
+          [
+            0.185,
+            0.3
+          ],
+          [
+            0.185,
+            0.38
+          ],
+          [
+            0.125,
+            0.38
+          ]
+        ],
+        "indices": [
+          0,
+          1,
+          2,
+          0,
+          2,
+          3
+        ],
+        "deformer": "eyes_look"
+      }
+    ],
+    "animations": [
+      {
+        "name": "idle",
+        "duration": 4.0,
+        "channels": [
+          {
+            "parameter": "breath",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.25
+              },
+              {
+                "time": 1.0,
+                "value": 0.8
+              },
+              {
+                "time": 2.0,
+                "value": 0.25
+              },
+              {
+                "time": 3.0,
+                "value": 0.05
+              },
+              {
+                "time": 4.0,
+                "value": 0.25
+              }
+            ]
+          },
+          {
+            "parameter": "ear_sway",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 1.0,
+                "value": 0.5
+              },
+              {
+                "time": 2.0,
+                "value": 0.0
+              },
+              {
+                "time": 3.0,
+                "value": -0.5
+              },
+              {
+                "time": 4.0,
+                "value": 0.0
+              }
+            ]
+          },
+          {
+            "parameter": "gaze_x",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 1.5,
+                "value": 0.6
+              },
+              {
+                "time": 2.5,
+                "value": -0.6
+              },
+              {
+                "time": 4.0,
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "images": [
+    {
+      "id": "coat",
+      "png_base64": "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAAAXNSR0IArs4c6QAAF9lJREFUeNrtnV2XFtWZhvvP5CekoTGTiA0twnicH+A/yFoaAjJiA8qnxKiMM545iJIKNA1N82EDYoMK2k7MHM5ZTnKcE093au+qemt/Vu2q96v289wHd9aKYtNdtZ/rvnSxn3fh5YtfL7z8x68XDhjZdvO+zJOGPF048Kc6r4zyjZkPqnzrz4ffOTk4yrMiH9l57uaSzPdODo3yw8Kh//xh4Z///H+W+cVvTxrh+hzkGVBnoTwXB7157j9j9jmszmd5Xn1nOXjuq7mw56WcI3221Kw1zuK2f4a1GZczL2df/U+eLP8L2YFRtv15X+ZJIE+z/Jsb5ZVRvjHzgZ5v/fnwOycHVZ7V+cjOczOXqnzv5JDKD1n+8kfJDwOr5ENvhNvPr797dRY856RIeY7s82WfP/1ses6vSui86zNhz0s5R/psqVkLzuF2eH7L+ZazrmbeAoA4YGTbzfsyTxryVOTf4CivjPKNmQ+qfOvPh985OTjKsyIf2Xnu5pLM904OjfKDyA/AKPnBYJN86I1w+tn1d67OQHkeDnrz3H+27PNXncvynPrOcPC8V/Ngz0k5P/pMqRlrnMFt/+xqsy1n3QXAxeJvNAKgFQJdAdAHAs/iIXCpDQImADiBgCMAfO+6AkBw+C91Gf5n/Yd/IgDYDs+tOfw6AB4HAMDTArhAgBsAmoafYfuXAHhsAQAWYGUHAEh+8HfC75dv+9sAeBwAAG8LKA7PDgCQ9PDvoP29AHgcAAAswAsBaiCgDAD9naH9ve3vA8BjAQtoBsChj3cAgKEP/8c77QBA+7cAABZAHgIUARA1/Gj/JgDAAmIAUAUAGNDgV0H7x7R/BABgAaQhQAUAnYYf7R8DAFhAFwAc+vhHFQBg1oP/Yxm0f4/2jwQALIAsBFIGQK/hR/t3AQAsoA8AUgJBigCwnzPav3f71wB44cRtmSyPMLNZ5+Sm+NUod/w5JXM3kHviV+/U+bdR7pt5V8+X/pzecvJrlQd1zth5aOZslUdOfqPylfjNuVAe1zmv52sjAMBkYz9f49nr7yT03uQ79bzvIuV5sM+JfY70M+Y5hyqhc6ufbfvcl/Ogz4iameA83QnPYTmncmaNGXbmW818DoDVEABuBwCw2QMAfSDQFQBb8QA40waAJgjEAWDoIEgFAKHn2gkA5fA3AuBMFwBs9QfA2MPfBIDNAABu+wGwqgCw0Q4AWEBvCLx44WsAoGfksxt7+NH+DQDYKAGwGgIALGASFiAP8osXtgGA6MHfbhh+tP8E2l+oma8BsNEOAFjAWBZQHOptACBq+LfR/tNtf6Fm3gDA6m0BC5i+BQwFBEMDgP5s0P5Tb38fADYELGA2FjAECAwJAPZzQftPvf0DAIAFzNQC5gmCIQDA9yzQ/jNp/xAAYAGztoB5QWDeAAg9B7T/TNq/AQCwgLlYQJEn5AEgf8buw4/2n3D7NwEAFjAvCyiG4wlZAFQ/H9p/7u3fAgBYwFwtYBYQmDUA+g8/2n8K7d8GAFjAvC3gxfeKpA6A6udA+w+q/SMAAAuYuwVMEwKzAMD4w4/2n1L71wB4+b2vZLI8wol7hRD7AsbYF6Dn3/9L5n8D+WuR/zaTCgDs73v08wR/3h+9zwj3/ce671/HN9vFzEsAPAoD4L3H7RDAvoBeAJg3BKYFgMkNP+77j3nfvxz+JgA8agMALGBoFlDkp8EBQH5P3u8V7T/E9rcB8CgMAFjA4CygGLafBgOA6vtB+yfT/qKY+SgAwAKGagHjgGASANC/B7R/Uu2vAeBCBYBHAhaQngX0hcC4ALB/f7R/Uu1fACCf/YWVKADAAoZuASqf/DR1AMjfo3X40f5Db38FgJURAC5UAIAFpGwBajgjIdAHANXXR/sn3/5CzvwIACtRAIAFpGIBMq9+8reJAUB+rejhR/un0P5ixQHAhUcCFkDHAl5tgUAsAOTXePWTn9D+tNrfBcBKFABgAalZQJWuAND/WbQ/ufYPAAAWQNICfBBoAoD+z6D9Sba/HwCwANoWoIPABwDfr0X7k2x/HQAPTQDAAkhbQBUbAL5fg/Yn2/4lAB4uLOx5+2aeW1keUeWF1Sob4WBfwCD2BZh5auZikb0Xv3FiA8D3a6p/3vm6vt8b9/2Hdt9fSzHP+owXM3+zAsBNEwBREMC+gKHsC2gHwNMeAHgaDwDc9x/ifX9j+F942wbAzTAAYAH0LaANAGh/0u3vA8BNAQvgYwHNAED7E2//dgDAAmhbQBMA0P7k2z8EAFgAFwsIAwDtz6D94wAAC6BrASEAoP1ZtH8TAGABHCzADwC0P5P21wBwvBkAsACaFuADANqfTfsXADgeBAAsgLoFuABA+zNqfwsAx5sBAAugZwE2AND+rNpfqJlvBgAsgLIF9AYA2p9C++sAWF8o/4+ABfCxAC8A0P5c2r8EwHobAGABVC2gFwDQ/lTavwbAyvkHMtnK+YdC5YId4woh9gUQ2RdgAwD3/cnd9y9jzXM152rmH8QAwIQA9gXQ2BfQGQC475/afX//LIcB8EDAAvhYQDMA0P7E278rAGAB1CxADv3PO6+ptAIA7U+t/UMAgAVwsIBq8O2g/dm0fx8AwAKoWEAnAKD9KbZ/EwBgAZQtIDT8NQTQ/gzavy8AYAGpW0AnAKD9qbZ/GwBgAVQtYDYAQPsPvP3HAQAsgKoFoP3ZtL8OgK0AAGABnP5bAP7dn1X7lwDY6gsAWEDqFuD+QSC0P6P21wBwTgJgKwAAWABVC5gOAND+ibS/UDN/biwAwAJStoAgAND+HNq/BsCet27IZHuO3xB7jq8HUl4hxL4AMvsCnOvAuO9P7b5/wzznsy5nPp/9MQGAfQGp7gvwAgD3/Snd9+8IgLduCFgAHwuYLADQ/om1fw2ApbEBAAtI0QIcAKD9ObW/AsCSAwBYABsLmBwA0P4Jtr8JgKWxAQALSM0C/ABA+zNpf7EUBAAsgIUFTAYAaP9E298FwNLYAIAFpGQBLgDQ/ozavwUAsADyFjA+AND+Cbe/DoC1EQBgAXwsIA4AaH+i7V8CYK0BALAA0hYwHgDQ/om3vw2AtUz7G7AABhbQDoBht//f//F/SWYg7S+KmW8DACyArAX0B8Aw2j99AMy1/X0AWBOwAD4W0AyA4f+7f9IAmH/71wDYf+5LmSyP2H9ua5QVPee3BPYF0NoX4FwHTuy+f6oAmOF9f2OG9xuRs65mPgfAWR0AAQj0AgD2BQx5X0AYAGnc908WALO77980/AUAzsYCABZAzgK6A2BY237SBcAg2t8CwFkdALAADhbgB0A6237oAWCm7S/UzHcCACyAlAV0A8Dwdv1RBcCM2t8DgLNfClgAHwtwAZDWrr+l311OMgNp/54AgAWQsYB4AAxz0y9FAMyw/QMAgAWwsQAbAKlt+qUDgLm0vw6A+90AAAsgYQFxABjunn9qAJhx+5cAuO8BACyAhQVMHAAz3vNPAwBza38bAPe7AQAWkLwFtANg2J/yQwkAc2h/Ucx8CACwAPIWMFEAzOFTftIHwFzb3weA+wIWwMcCmgEw/M/4owKAObV/BABgAaQtYGIAmNNn/KUNgLm3fwgAsAAuFhAGQBqf8EsBAHNs/xoAS/9xXSbLI4qsmXlLD/YFUNkXYAMgtV1/qQJghvf9i9jzPJpzNfM+AFzvBgBsDUpya5AfAOns+ksdAFPe9hMAwPUeAIAFkLSAsQEw502/SQNg/u3fBgBYAHULcAGQ1qbflAEwgPbXAHAsAgCwAHIW8PPOa0ZS2/OfLACG0f4FAI4pAFwLAAAWQNUC7OE3IJDInv9UATCQ9i8BcK0EwLEIAMACSFhAaPhHEEjkU35oAGBu7S/UzNcAuBYAACyAmgXEA2DYn/JDEgCza3+hZt4AwLEIAMACkreAsQAwoM/4Sx8Ac21/HwCuCVgAbwtI6TP+yAFgtu0fAAAsgLUFpPQJv2kDYO7tHwIALICLBTh/DiCxT/glBYDZt38DAGABLCygEwAG1v5pA2AQ7V8DYLcDAFgABwvwAyCN9icFgPm0vwKAnP2FfWfuLew/cy/LI+rc168NCu9VYewLSHpfgHMdeGD3/c2Uz1N7xqkCYIb3/c3ImTZm/F4mZ18BYJ8DgHsBAGBfAJV9AS4AhnXf3xl+igCY7n1/CwDmfO9rBQAsgLQFRAFgoO3PEQATbn8XAPscAMACKFtAFwAMrf1JAGC+7a8D4G4YALAAshbQCoABt7981pwAMIX2LwFw1wQALICPBcQCYIjtnzwA5t/+NgDuhgEACyBpAY0AGHj7cwLAlNpfFDMvAXDaBAAsgIcFxABgqO2fNACG0f4FAE4bALgrYAF8LCAIgATa/wATAEyx/S0AnDYBAAugbwFtABhy+6cPgLm3v1Az7wIAFsDFArwASKT9OQBgyu3vAcBpEwCwANoW0ASAobd/2gAYRPs3AQAWwMECHAAk1P7UATCD9g8AABbAxgJCAEih/ekBYObtXwNg95t/kcnyCJVjVa6pLDnBvgAK+wKc68ADu+9fp3iO+rNVz7rxXQSue2vvWL7z+rp44HzIsxM8V7eG9Ck/vvv+KrtHKef6zVHkzHsA8KYJAC8EsC8g+X0BPgAM6b5/fwDcCb8/7/A3AWCjFQAD2vPfMPzX7OGPAQAsgLIFdAIA2p9a++sAyFwAwALIW4ANALQ/q/YvAZC1AQAWQNUCogGA9qfY/jYAsszzC2ABhC2gHQBof8LtL4qZjwIALICiBUQBAO1Ptf19AMgELICPBTQDAO1PvP27AgAWQM0CWgGA9qfc/iEAwAK4WEAYAGh/Bu2vAeBoLABgAZQsoBEAaH/q7V8A4KgXALAADhbgBwDan0n7WwA4GgsAWAAVCwgCAO3Pof2FmvkwAGAB1C3ABQDan1H71wDY9+4dmSyP2Hdaz1032BdAZl+ADYCh3fdXz6zxmQaubWvvSr67+tp34D3LMxA8H+X5sa6he8/ecHb9+WdXn+13VeTMSwBsBgDQBAHsC0h9X0AcAOZ3378ZANvh9+Ad/iYAfNUKgJU2AAxn02/78BsA2LQAAAtgYwEOAND+nNrfBsBmAACwAKoW0A4AtD/h9hfFzPsAAAtgYQH9AYD2J9D+PgBsClgAHwv4eec1I2h/Vu3fAgBYAGkLsIffhQDan3j7hwAAC6BuAaHhryGA9mfQ/hEAgAWQtID+AED7E2r/GgDLDgBgAZQtoBMA0P5U218BYLkVALAAchbQDwBof2LtbwJg2QEALICjBaD92bS/WI4GACyAxX8LwL/7s2p/FwDLDgBgAZQtwP2DQGh/Ru1fA2DXkasLu47+OcsjdjvJ6mBfAKl9Ac51YNz3p3bfX4s517uKZHL2DQA0QgD7AkjtCwgCAPf9qdz3bxp+CwBHrrYDABZAygLaAYD2J9z+Qs28DwCwAB4W4AUA2p9L+3sAcOSqgAXwsYBmAKD9ibd/MwBgAfQtwAEA2p9T+wcAAAtgYwFhAKD9GbR/OwBgAbQtoAkAaH/y7d8AAFgACwvwAwDtz6T94wAAC6BrASEAoP1ZtH8LAGAB5C3ABQDan1H7xwMAFkDTAnwAQPuzaX8dAF/4AQALIG0BEwMA2j/F9i8B8EUcAGAB9CzABgDan1X71wBYfmdDJlt+57bwprw+iH0BtPYF2ADAfX9y9/2LhOZazfxGPACwL4DWvoBWAOC+f+r3/bsCYEPAAvhYwNgAQPun3P4aAE7FAwAWQMcCGgGA9qfe/gUATjkAgAVwsYCxAID2T739LQCcigcALICGBQQBgPbn0P5CzbwfALAADhbQGwBofwrt7wHAqXgAwALStwAvAND+XNq/DQCwAOoW0AsAaH8q7R8AACyAjQU4AED7c2r/GADAAihbQGcAoP0ptb8OgFsmAGABLCwgDgBof6LtXwLgVhsAYAFULaATAND+1NrfBsCtzPqbsADiFtAOALQ/4fYXxcxHAQAWQNECogGA9qfY/jUAdv3hc5ksj9j1hy/MHKlyVWBfAK19Ac4+ANz3p3bfv55fe67VrKuZjwVAOwSwNSitrUFRAMC2n1S3/ZizGw8AWAAXCwgDAO3PoP37AAAWQMkCWgGA9qfc/k0AgAVwsAA/AND+TNq/BsBiJwDAAqhYQCMA0P7U218BYFEB4LAPALAA6hbgAgDtz6j9CwAcLgGw2AkAsAAKFhAEANqfQ/uLRQMAh30AgAVQtoDpAQDtn0D7CznzJQCuKAAsdgIALCB1C/ACAO3Ppf1LAFzRAHD4cwEL4GMB0wEA2j+R9rcBcEUBABbAxwIcAKD9ObW/KGbeBgAsgI0FTB4AaP+E2t8HgCsCFsDHApoBgPYn3v41AF46eVMmyyNeOnlLZfmUL9gXQGlfgHMdGPf9qd33d1LNdzHrauZtAJQQ6AQA7AtIcV9AGAC470/kvr85/KeM4W8BACyAvAVMDgBo/wTbvwkAsAAOFuAHANqfSftHAAAWQNoCJgMAtH+i7d8GAFgAdQtwAYD2Z9T+kQCABZC1gPEBgPZPuP11AKwHAAALoGwBPgCg/dm0fwmA9QgAwAJIWsB4AED7J97+GgBOSACsBwAAC6BqATYA0P6s2l+omT8RCwBYADkL6A8AtD+B9rcAcEICYF3AAvhYQBAAaH8O7S/UzHcCACyAlAX0AwDan0j7ewBwYl3AAvhYgBcAaH8u7V8DYPH3n8lkecTi4c+qq4KeYF8ApX0BNgBw35/cff9A8hn/vYqceQsAMRDAvgAS+wIcAOC+P7X7/k3DPwYAYAEkLKAbAND+xNq/AQCwABYW4AIA7c+o/ccEACwgeQuIBwDan2D7twAAFkDeAsYHANo/4fbXAXC5HwBgAUlbQBwA0P5E278EwOUGAMACSFvAeABA+yfe/jYALvcDACwgWQtoBwDan3D7i2Lm2wAACyBrAf0BgPYn0P4+AFwWsAA+FtAMALQ/8fbvAABYAEkL6AcAtD+R9g8BABbAxQLCAED7M2h/DQBvRAAAFkDOAroDAO1PqP0LAOSzv/DS6o2Fl07cyPKIOutusC+A1L4A5zow7vtTu+/viT7j+czns7+wVwJgNQIA2BdAal9ANwDgvn+C9/2bAZDP/N4wAGAB1C3ABQDan1H7mwDYu6p0QMAC+FhAPADQ/gTbX+xtBwAsgLIFOABA+3Nqfx0Aawvl/xGwAD4WEAcAtD/R9i8BsNYGAFgAVQvoAgC0P7n2twGwlpV/ERbAxALaAYD2J9z+opj5KADAAihaQCwA0P4k298HgDUBC+BjAc0AQPsTb/+uAIAFULOAGACg/cm2fwgAsAAuFhAGANqfQfv3AQAsgJIFtAEA7U+6/ZsAAAvgYAF+AKD9mbR/DYBfvvE/MlkeUeeyyuIbl/Xrg9gXQGhfgHMdGPf9qd33L1LOchF9xtXMhwDQBAHsC6CwL8AFAO77E7vv3zT8GgBe7woAWAAFCwgBAO3Pov0LALyuAPBpAACwAMoWEAcAtD/R9i8B8GkJgNe7AgAWkLoF+ACA9mfT/kLNfA2ATwMAgAVQtYB2AKD9Cbe/UDNvAOD1rgCABaRsATYA0P6s2t8HgE8FLICPBTQDAO1PvP0DAIAFsLEABwBof07tHwIALICLBYQBgPZn0P4NAIAFsLCA7gBA+xNq/yYAwAI4WIAfAGh/Ju3fAgBYAHkL6AYAtD+x9vcCwEzxpwM9uayy+Ib6PEEtn/lzWOZKIJ9nOQGzXU6+MHNEz1V/jv5ZZbeTrM6bev7i5liVaypLTq5n+QHzZM3MW3pujLKnynGZ9UBuFnnbl1ujvCCzWmUjkNtZPsDe5ENvJPTr1NcIfv3y99e+ryKe7736uYI/d/18loxoz9J+zr53Id+R9d52j1K+X9+718+Gfmas81Sds+A51M+qfY6tcy7PvpqB4Hx8Fp4rffbKmSwSmFvfjEsA7H37eiBr1VVhKzeqTxOSnyloZd3NSZmbgdxSWT7ly4aZd6rc9ufdzVH2OblT5LSdu27OyNwbZb+ds/cD+bLOOT1bo6zoOS/zIJCHRS7YeWTk5feqfBXOxcfe5ENvJPTrGr92+fvb35fzfVc/T/DnNZ/NfiPas9Sfceg9WO9rn5G7/ndun4vqvFjnSD9jwXNYnVP7/HrOeHX+w/Ox7p8pe+7KmSzimVk5y4E5/xd7K6YKTGzP/wAAAABJRU5ErkJggg=="
+    },
+    {
+      "id": "face",
+      "png_base64": "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"
+    },
+    {
+      "id": "ears",
+      "png_base64": "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAd9JREFUeNrt3cEJQkEMRdHffwO2IFiLS+uwAUH/RsEOEu5ZDLied8gMOonH63E/Jq/n5bp6Td/f74fb5HVu5Oo1eG//ALwnr3MjV6+BewpAHMEuAKoAABAAAAEAEADgUgiAKgAABAAAAAAEALgQ1gGoAgAAAIBjIA1AFQAAAAAAAAACAAAAAAAAhA8AAAAAAAAAvgoGAADhew8AAADC9yYQAACEry9AX4DOIAAA0BuoO1h3sPkAAJgQYkAEAEbECN+UMOFHwt8DQPhhAC59YQDCB0D4VQDCDwMQfhiA8MMAXPoAEH4VgPDDAJR+AIRfBSB8AACoAhA+AABUAbj5AyB8AAAAAAAAAIgBcAEEAABHAAAAAAAAAAAAAAAEfgwCAAAAPAiBAAAAPAqFAAAINIYAoDUMAgAg0B4OgAEREBgRA4EhURAAAIFBkRAYFQuAYdEQGBcPgT+MgAAACFIAIADAUQAABAA4CgBQBQCAAABHQR6AKgCAKlAHoAoAoArUAagCAAAAAAAAAAAABAAAAAAAAAgfAAAAAMBXwQAAIHwAAPAeAAAAhO9NoPABAEBfgL4AnUEAAKA3UHew7mDzAQyIEL4RMcIHAIDylLCx69zA1Wvw3v4AjF3nBq5e0/f3A+SmHhNd8h2PAAAAAElFTkSuQmCC"
+    }
+  ]
+}

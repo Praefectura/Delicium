@@ -20,6 +20,7 @@ use std::{cmp::Ordering, collections::HashSet};
 use crate::model::error::ModelError;
 use crate::model::limits::LoadLimits;
 use crate::model::schema as raw;
+use crate::model::schema_v02 as raw2;
 
 /// Maximum length of any name in the document (model, parameter, layer,
 /// deformer, animation, joint); mirrors [`crate::model::MAX_NAME_LEN`].
@@ -93,6 +94,106 @@ pub(super) fn validate(env: &raw::RawEnvelope, limits: &LoadLimits) -> Result<()
             format!("unknown model kind `{other}`; expected `sprite2d` or `skeleton3d`"),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 0.2 entry point
+// ---------------------------------------------------------------------------
+
+/// Validates a parsed `0.2` document against the format rules and the budgets.
+///
+/// Shares every check that did not change with the `0.1` validators; the
+/// additions are the image table, texture references, UVs and the basic
+/// material, plus the effective-alpha rule for the opaque mode.
+pub(super) fn validate_v02(env: &raw2::RawEnvelope, limits: &LoadLimits) -> Result<(), ModelError> {
+    if env.format != raw::FORMAT {
+        return Err(ModelError::UnsupportedFormat {
+            found: env.format.clone(),
+        });
+    }
+    if env.format_version != raw2::FORMAT_VERSION {
+        return Err(ModelError::UnsupportedVersion {
+            found: env.format_version.clone(),
+        });
+    }
+    check_name(&env.name, "name")?;
+
+    let image_names = validate_images(&env.images, limits)?;
+
+    match env.kind.as_str() {
+        "sprite2d" => {
+            let payload = env
+                .sprite2d
+                .as_ref()
+                .ok_or(ModelError::MissingPayload { kind: "sprite2d" })?;
+            if env.skeleton3d.is_some() {
+                return Err(ModelError::UnexpectedPayload {
+                    kind: "sprite2d",
+                    other: "skeleton3d",
+                });
+            }
+            validate_sprite2d_v02(payload, &env.interaction, &image_names, limits)
+        }
+        "skeleton3d" => {
+            let payload = env
+                .skeleton3d
+                .as_ref()
+                .ok_or(ModelError::MissingPayload { kind: "skeleton3d" })?;
+            if env.sprite2d.is_some() {
+                return Err(ModelError::UnexpectedPayload {
+                    kind: "skeleton3d",
+                    other: "sprite2d",
+                });
+            }
+            validate_skeleton3d_v02(payload, &env.interaction, &image_names, limits)
+        }
+        other => Err(ModelError::invalid(
+            "kind",
+            format!("unknown model kind `{other}`; expected `sprite2d` or `skeleton3d`"),
+        )),
+    }
+}
+
+/// Image table: count budget, unique non-empty ids. Returns the id list used
+/// to resolve texture references.
+fn validate_images<'a>(
+    images: &'a [raw2::RawImage],
+    limits: &LoadLimits,
+) -> Result<Vec<&'a str>, ModelError> {
+    if images.len() > limits.max_images {
+        return Err(ModelError::LimitExceeded {
+            what: "images",
+            actual: images.len() as u64,
+            max: limits.max_images as u64,
+        });
+    }
+    let mut names = Vec::with_capacity(images.len());
+    let mut seen = HashSet::new();
+    for (i, image) in images.iter().enumerate() {
+        check_name(&image.id, &format!("images[{i}].id"))?;
+        if !seen.insert(image.id.clone()) {
+            return Err(ModelError::DuplicateName {
+                kind: "image",
+                name: image.id.clone(),
+            });
+        }
+        names.push(image.id.as_str());
+    }
+    Ok(names)
+}
+
+/// Every declared image must be referenced; an unused embedded payload is a
+/// document error, not a silent waste.
+fn reject_unused_images(names: &[&str], used: &[bool]) -> Result<(), ModelError> {
+    for (i, name) in names.iter().enumerate() {
+        if !used[i] {
+            return Err(ModelError::invalid(
+                format!("images[{i}]"),
+                format!("image `{name}` is never referenced by a layer or mesh"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -225,43 +326,157 @@ fn validate_layers(
         }
         check_color(layer.color, &format!("{ctx}.color"))?;
 
-        match (&layer.vertices, &layer.indices, &layer.grid) {
-            (Some(vertices), Some(indices), None) => {
-                if vertices.is_empty() {
+        let (vertex_count, index_count) = check_layer_mesh(
+            layer.vertices.as_deref(),
+            layer.indices.as_deref(),
+            layer.grid.as_ref(),
+            &ctx,
+            limits,
+        )?;
+        total_vertices = add_budget(total_vertices, vertex_count, "vertices")?;
+        total_indices = add_budget(total_indices, index_count, "indices")?;
+
+        if let Some(name) = &layer.deformer {
+            resolve_names(
+                &deformer_names,
+                name,
+                "deformer",
+                &format!("{ctx}.deformer"),
+            )?;
+        }
+        if let Some(mask) = &layer.mask {
+            check_mask(&mask.points, &format!("{ctx}.mask"), limits)?;
+        }
+    }
+
+    if total_vertices > limits.max_vertices {
+        return Err(ModelError::LimitExceeded {
+            what: "vertices",
+            actual: total_vertices as u64,
+            max: limits.max_vertices as u64,
+        });
+    }
+    if total_indices > limits.max_indices {
+        return Err(ModelError::LimitExceeded {
+            what: "indices",
+            actual: total_indices as u64,
+            max: limits.max_indices as u64,
+        });
+    }
+    Ok(())
+}
+
+/// `0.2` sprite: the `0.1` checks plus per-layer texture bindings and UVs.
+fn validate_sprite2d_v02(
+    s: &raw2::RawSprite2d,
+    interaction: &raw::RawInteraction,
+    image_names: &[&str],
+    limits: &LoadLimits,
+) -> Result<(), ModelError> {
+    let parameter_names = validate_parameters(&s.parameters, limits)?;
+    let used_images = validate_layers_v02(&s.layers, &s.deformers, image_names, limits)?;
+    reject_unused_images(image_names, &used_images)?;
+    validate_deformers(&s.deformers, &parameter_names, limits)?;
+    validate_parameter_animations(&s.animations, &s.parameters, limits)?;
+
+    if let Some(name) = &interaction.gaze_parameter {
+        resolve_name(
+            &parameter_names,
+            name,
+            "parameter",
+            "interaction.gaze_parameter",
+        )?;
+    }
+    if let Some(name) = &interaction.head_joint {
+        return Err(ModelError::invalid(
+            "interaction.head_joint",
+            format!(
+                "`{name}` is only valid for kind `skeleton3d`; 2D models declare `gaze_parameter`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `0.2` layers. Returns one `used` flag per declared image (referenced by
+/// any layer) so the caller can reject unused resources.
+fn validate_layers_v02(
+    layers: &[raw2::RawLayer2d],
+    deformers: &[raw::RawDeformer2d],
+    image_names: &[&str],
+    limits: &LoadLimits,
+) -> Result<Vec<bool>, ModelError> {
+    if layers.is_empty() {
+        return Err(ModelError::invalid(
+            "layers",
+            "a model needs at least one layer",
+        ));
+    }
+    if layers.len() > limits.max_layers {
+        return Err(ModelError::LimitExceeded {
+            what: "layers",
+            actual: layers.len() as u64,
+            max: limits.max_layers as u64,
+        });
+    }
+
+    let deformer_names: Vec<&str> = deformers.iter().map(|d| d.name.as_str()).collect();
+    let mut used_images = vec![false; image_names.len()];
+
+    let mut total_vertices: usize = 0;
+    let mut total_indices: usize = 0;
+    let mut seen = HashSet::new();
+
+    for (i, layer) in layers.iter().enumerate() {
+        let ctx = format!("layers[{i}]");
+        check_name(&layer.name, &format!("{ctx}.name"))?;
+        if !seen.insert(layer.name.clone()) {
+            return Err(ModelError::DuplicateName {
+                kind: "layer",
+                name: layer.name.clone(),
+            });
+        }
+        check_color(layer.color, &format!("{ctx}.color"))?;
+
+        let (vertex_count, index_count) = check_layer_mesh(
+            layer.vertices.as_deref(),
+            layer.indices.as_deref(),
+            layer.grid.as_ref(),
+            &ctx,
+            limits,
+        )?;
+        total_vertices = add_budget(total_vertices, vertex_count, "vertices")?;
+        total_indices = add_budget(total_indices, index_count, "indices")?;
+
+        // Texture reference and UVs. The grid vertex count is the generated
+        // `(columns + 1) * (rows + 1)`; explicit meshes use their vertices.
+        let texture = match &layer.texture {
+            Some(name) => {
+                let index = resolve_names(image_names, name, "image", &format!("{ctx}.texture"))?;
+                used_images[index] = true;
+                Some(index)
+            }
+            None => None,
+        };
+        match (&layer.uvs, &layer.grid) {
+            (Some(uvs), Some(grid)) => {
+                let expected = generated_grid_vertices(grid, &format!("{ctx}.grid"), limits)?;
+                check_uvs(uvs, expected, &format!("{ctx}.uvs"))?;
+            }
+            (Some(uvs), None) => {
+                let count = layer.vertices.as_ref().map_or(0, Vec::len);
+                check_uvs(uvs, count, &format!("{ctx}.uvs"))?;
+            }
+            // A grid without explicit UVs auto-generates them when textured;
+            // untextured layers ignore UVs entirely.
+            (None, Some(_)) => {}
+            (None, None) => {
+                if texture.is_some() {
                     return Err(ModelError::invalid(
-                        format!("{ctx}.vertices"),
-                        "explicit meshes need at least one vertex",
+                        &ctx,
+                        "a textured explicit mesh requires `uvs`",
                     ));
                 }
-                for (k, v) in vertices.iter().enumerate() {
-                    check_2d(*v, &format!("{ctx}.vertices[{k}]"))?;
-                }
-                check_triangle_list_2d(indices, vertices, &format!("{ctx}.indices"))?;
-                total_vertices = add_budget(total_vertices, vertices.len(), "vertices")?;
-                total_indices = add_budget(total_indices, indices.len(), "indices")?;
-            }
-            (None, None, Some(grid)) => {
-                let (vertices, indices) = grid_counts(grid, &format!("{ctx}.grid"), limits)?;
-                total_vertices = add_budget(total_vertices, vertices, "vertices")?;
-                total_indices = add_budget(total_indices, indices, "indices")?;
-            }
-            (Some(_), None, None) => {
-                return Err(ModelError::invalid(&ctx, "`vertices` requires `indices`"));
-            }
-            (None, Some(_), None) => {
-                return Err(ModelError::invalid(&ctx, "`indices` requires `vertices`"));
-            }
-            (None, None, None) => {
-                return Err(ModelError::invalid(
-                    &ctx,
-                    "layer needs either `vertices` + `indices` or `grid`",
-                ));
-            }
-            (_, _, Some(_)) => {
-                return Err(ModelError::invalid(
-                    &ctx,
-                    "`grid` cannot be combined with an explicit mesh",
-                ));
             }
         }
 
@@ -292,7 +507,136 @@ fn validate_layers(
             max: limits.max_indices as u64,
         });
     }
+    Ok(used_images)
+}
+
+/// Vertex count a generated grid produces, `(columns + 1) * (rows + 1)`,
+/// with the same bounds as [`grid_counts`] so an invalid grid is reported
+/// once, by the mesh check.
+fn generated_grid_vertices(
+    grid: &raw::RawGrid2d,
+    ctx: &str,
+    limits: &LoadLimits,
+) -> Result<usize, ModelError> {
+    let (vertices, _) = grid_counts(grid, ctx, limits)?;
+    Ok(vertices)
+}
+
+/// UV arrays: one entry per vertex, finite, inside `[0, 1]`.
+fn check_uvs(uvs: &[[f32; 2]], expected: usize, ctx: &str) -> Result<(), ModelError> {
+    if uvs.len() != expected {
+        return Err(ModelError::invalid(
+            ctx,
+            format!(
+                "expected {expected} UVs (one per vertex), found {}",
+                uvs.len()
+            ),
+        ));
+    }
+    for (i, uv) in uvs.iter().enumerate() {
+        for (k, value) in uv.iter().enumerate() {
+            let value = finite(*value, &format!("{ctx}[{i}][{k}]"))?;
+            if !(0.0..=1.0).contains(&value) {
+                return Err(ModelError::invalid(
+                    format!("{ctx}[{i}][{k}]"),
+                    format!("UV components must be in [0, 1], found {value}"),
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+/// Basic material: every present field finite and in range; an explicit
+/// `alpha_cutoff` is only valid with cutout.
+fn validate_material(m: &raw2::RawMaterial3d, ctx: &str) -> Result<(), ModelError> {
+    if let Some(roughness) = m.roughness {
+        let roughness = finite(roughness, &format!("{ctx}.roughness"))?;
+        if !(0.0..=1.0).contains(&roughness) {
+            return Err(ModelError::invalid(
+                format!("{ctx}.roughness"),
+                format!("roughness must be in [0, 1], found {roughness}"),
+            ));
+        }
+    }
+    if let Some(metallic) = m.metallic {
+        let metallic = finite(metallic, &format!("{ctx}.metallic"))?;
+        if !(0.0..=1.0).contains(&metallic) {
+            return Err(ModelError::invalid(
+                format!("{ctx}.metallic"),
+                format!("metallic must be in [0, 1], found {metallic}"),
+            ));
+        }
+    }
+
+    match m.alpha_mode.as_deref() {
+        None | Some("opaque") => {
+            if m.alpha_cutoff.is_some() {
+                return Err(ModelError::invalid(
+                    format!("{ctx}.alpha_cutoff"),
+                    "`alpha_cutoff` is only valid with `alpha_mode: \"cutout\"`",
+                ));
+            }
+        }
+        Some("cutout") => {
+            if let Some(cutoff) = m.alpha_cutoff {
+                let cutoff = finite(cutoff, &format!("{ctx}.alpha_cutoff"))?;
+                if cutoff <= 0.0 || cutoff > 1.0 {
+                    return Err(ModelError::invalid(
+                        format!("{ctx}.alpha_cutoff"),
+                        format!("alpha_cutoff must be in (0, 1], found {cutoff}"),
+                    ));
+                }
+            }
+        }
+        Some(other) => {
+            return Err(ModelError::invalid(
+                format!("{ctx}.alpha_mode"),
+                format!("unknown alpha mode `{other}`; expected `opaque` or `cutout`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks one layer mesh (explicit or generated) and returns the
+/// `(vertices, indices)` counts it contributes to the model budgets.
+///
+/// Shared by the `0.1` and `0.2` layer validators so both versions enforce
+/// exactly the same geometry rules and messages.
+fn check_layer_mesh(
+    vertices: Option<&[[f32; 2]]>,
+    indices: Option<&[u32]>,
+    grid: Option<&raw::RawGrid2d>,
+    ctx: &str,
+    limits: &LoadLimits,
+) -> Result<(usize, usize), ModelError> {
+    match (vertices, indices, grid) {
+        (Some(vertices), Some(indices), None) => {
+            if vertices.is_empty() {
+                return Err(ModelError::invalid(
+                    format!("{ctx}.vertices"),
+                    "explicit meshes need at least one vertex",
+                ));
+            }
+            for (k, v) in vertices.iter().enumerate() {
+                check_2d(*v, &format!("{ctx}.vertices[{k}]"))?;
+            }
+            check_triangle_list_2d(indices, vertices, &format!("{ctx}.indices"))?;
+            Ok((vertices.len(), indices.len()))
+        }
+        (None, None, Some(grid)) => grid_counts(grid, &format!("{ctx}.grid"), limits),
+        (Some(_), None, None) => Err(ModelError::invalid(ctx, "`vertices` requires `indices`")),
+        (None, Some(_), None) => Err(ModelError::invalid(ctx, "`indices` requires `vertices`")),
+        (None, None, None) => Err(ModelError::invalid(
+            ctx,
+            "layer needs either `vertices` + `indices` or `grid`",
+        )),
+        (_, _, Some(_)) => Err(ModelError::invalid(
+            ctx,
+            "`grid` cannot be combined with an explicit mesh",
+        )),
+    }
 }
 
 /// Returns `(vertices, indices)` a grid will generate, with every step of
@@ -651,24 +995,125 @@ fn validate_skeleton3d(
     interaction: &raw::RawInteraction,
     limits: &LoadLimits,
 ) -> Result<(), ModelError> {
-    if s.joints.is_empty() {
+    let joint_names = validate_joints(&s.joints, limits)?;
+    validate_vertices(&s.vertices, s.joints.len(), limits)?;
+    validate_mesh3d(&s.indices, &s.vertices, limits)?;
+
+    validate_skeletal_animations(&s.animations, &joint_names, &s.joints, limits)?;
+
+    if let Some(name) = &interaction.head_joint {
+        resolve_name(&joint_names, name, "joint", "interaction.head_joint")?;
+    }
+    if let Some(name) = &interaction.gaze_parameter {
+        return Err(ModelError::invalid(
+            "interaction.gaze_parameter",
+            format!("`{name}` is only valid for kind `sprite2d`; 3D models declare `head_joint`"),
+        ));
+    }
+    Ok(())
+}
+
+/// `0.2` skeleton: the `0.1` checks plus texture/UVs/material, the unused
+/// image rejection and the effective-alpha rule of the opaque mode.
+fn validate_skeleton3d_v02(
+    s: &raw2::RawSkeleton3d,
+    interaction: &raw::RawInteraction,
+    image_names: &[&str],
+    limits: &LoadLimits,
+) -> Result<(), ModelError> {
+    let joint_names = validate_joints(&s.joints, limits)?;
+    validate_vertices(&s.vertices, s.joints.len(), limits)?;
+    validate_mesh3d(&s.indices, &s.vertices, limits)?;
+    validate_skeletal_animations(&s.animations, &joint_names, &s.joints, limits)?;
+
+    let mut used_images = vec![false; image_names.len()];
+    let texture = match &s.texture {
+        Some(name) => {
+            let index = resolve_names(image_names, name, "image", "skeleton3d.texture")?;
+            used_images[index] = true;
+            Some(index)
+        }
+        None => None,
+    };
+    reject_unused_images(image_names, &used_images)?;
+
+    match &s.uvs {
+        Some(uvs) => check_uvs(uvs, s.vertices.len(), "skeleton3d.uvs")?,
+        None => {
+            if texture.is_some() {
+                return Err(ModelError::invalid(
+                    "skeleton3d",
+                    "a textured mesh requires `uvs` (one per vertex)",
+                ));
+            }
+        }
+    }
+
+    if let Some(material) = &s.material {
+        validate_material(material, "skeleton3d.material")?;
+    }
+
+    // Effective alpha rule: as soon as the model takes the PBR path (texture
+    // or material declared) with the opaque mode, every vertex color must be
+    // exactly opaque; the bound image is checked against its decoded alpha in
+    // the compiler. Cutout leaves the comparison to the GPU.
+    let takes_pbr_path = texture.is_some() || s.material.is_some();
+    // An unknown mode never reaches this point: `validate_material` above
+    // rejects it, so `cutout` is the only non-opaque case left.
+    let mode_is_opaque = !matches!(
+        s.material.as_ref().and_then(|m| m.alpha_mode.as_deref()),
+        Some("cutout")
+    );
+    if takes_pbr_path && mode_is_opaque {
+        for (i, v) in s.vertices.iter().enumerate() {
+            if v.color[3] != 1.0 {
+                return Err(ModelError::invalid(
+                    format!("skeleton3d.vertices[{i}].color[3]"),
+                    format!(
+                        "opaque models require vertex alpha exactly 1, found {}",
+                        v.color[3]
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(name) = &interaction.head_joint {
+        resolve_name(&joint_names, name, "joint", "interaction.head_joint")?;
+    }
+    if let Some(name) = &interaction.gaze_parameter {
+        return Err(ModelError::invalid(
+            "interaction.gaze_parameter",
+            format!("`{name}` is only valid for kind `sprite2d`; 3D models declare `head_joint`"),
+        ));
+    }
+    Ok(())
+}
+
+/// Joint names, per-joint fields, parenting and cycles. Shared by both
+/// versions; returns the declared joint names.
+fn validate_joints(
+    joints: &[raw::RawJoint],
+    limits: &LoadLimits,
+) -> Result<Vec<String>, ModelError> {
+    if joints.is_empty() {
         return Err(ModelError::invalid(
             "skeleton3d.joints",
             "a skeleton needs at least one joint",
         ));
     }
-    if s.joints.len() > limits.max_joints {
+    if joints.len() > limits.max_joints {
         return Err(ModelError::LimitExceeded {
             what: "joints",
-            actual: s.joints.len() as u64,
+            actual: joints.len() as u64,
             max: limits.max_joints as u64,
         });
     }
 
     // Joint names + per-joint fields.
-    let mut joint_names = Vec::with_capacity(s.joints.len());
+    let mut joint_names = Vec::with_capacity(joints.len());
     let mut seen = HashSet::new();
-    for (i, joint) in s.joints.iter().enumerate() {
+    for (i, joint) in joints.iter().enumerate() {
         let ctx = format!("skeleton3d.joints[{i}]");
         check_name(&joint.name, &format!("{ctx}.name"))?;
         if !seen.insert(joint.name.clone()) {
@@ -684,8 +1129,8 @@ fn validate_skeleton3d(
     }
 
     // Joint parenting: resolve, self-parenting, cycles.
-    let mut parents: Vec<Option<usize>> = Vec::with_capacity(s.joints.len());
-    for (i, joint) in s.joints.iter().enumerate() {
+    let mut parents: Vec<Option<usize>> = Vec::with_capacity(joints.len());
+    for (i, joint) in joints.iter().enumerate() {
         match &joint.parent {
             None => parents.push(None),
             Some(parent) => {
@@ -706,35 +1151,39 @@ fn validate_skeleton3d(
         }
     }
     ensure_acyclic(&parents, "skeleton3d.joints")?;
+    Ok(joint_names)
+}
 
-    // Vertices.
-    if s.vertices.is_empty() {
+/// Vertex fields, joint indices and weight sums. Shared by both versions.
+fn validate_vertices(
+    vertices: &[raw::RawVertex3d],
+    joint_count: usize,
+    limits: &LoadLimits,
+) -> Result<(), ModelError> {
+    if vertices.is_empty() {
         return Err(ModelError::invalid(
             "skeleton3d.vertices",
             "a skeleton needs at least one vertex",
         ));
     }
-    if s.vertices.len() > limits.max_vertices {
+    if vertices.len() > limits.max_vertices {
         return Err(ModelError::LimitExceeded {
             what: "vertices",
-            actual: s.vertices.len() as u64,
+            actual: vertices.len() as u64,
             max: limits.max_vertices as u64,
         });
     }
-    for (i, v) in s.vertices.iter().enumerate() {
+    for (i, v) in vertices.iter().enumerate() {
         let ctx = format!("skeleton3d.vertices[{i}]");
         check_bounded_vec3(v.position, &format!("{ctx}.position"))?;
         check_normal(v.normal, &format!("{ctx}.normal"))?;
         check_color(v.color, &format!("{ctx}.color"))?;
         for (k, joint) in v.joints.iter().enumerate() {
             let joint = *joint as usize;
-            if joint >= s.joints.len() {
+            if joint >= joint_count {
                 return Err(ModelError::invalid(
                     format!("{ctx}.joints[{k}]"),
-                    format!(
-                        "joint index {joint} is out of range ({} joints)",
-                        s.joints.len()
-                    ),
+                    format!("joint index {joint} is out of range ({joint_count} joints)"),
                 ));
             }
         }
@@ -761,7 +1210,7 @@ fn validate_skeleton3d(
                 "skin weights must sum to a positive value",
             ));
         }
-        if !s.vertices.is_empty() {
+        {
             // A vertex whose weights touch no real joint is unusable: the
             // normalization in the compiler would divide by a zero sum for
             // the zero-weight slots.
@@ -774,29 +1223,24 @@ fn validate_skeleton3d(
             }
         }
     }
+    Ok(())
+}
 
-    // Indices.
-    if s.indices.len() > limits.max_indices {
+/// Index budget plus triangle-list degeneracy checks. Shared by both
+/// versions.
+fn validate_mesh3d(
+    indices: &[u32],
+    vertices: &[raw::RawVertex3d],
+    limits: &LoadLimits,
+) -> Result<(), ModelError> {
+    if indices.len() > limits.max_indices {
         return Err(ModelError::LimitExceeded {
             what: "indices",
-            actual: s.indices.len() as u64,
+            actual: indices.len() as u64,
             max: limits.max_indices as u64,
         });
     }
-    check_triangle_list_3d(&s.indices, &s.vertices, "skeleton3d.indices")?;
-
-    validate_skeletal_animations(&s.animations, &joint_names, &s.joints, limits)?;
-
-    if let Some(name) = &interaction.head_joint {
-        resolve_name(&joint_names, name, "joint", "interaction.head_joint")?;
-    }
-    if let Some(name) = &interaction.gaze_parameter {
-        return Err(ModelError::invalid(
-            "interaction.gaze_parameter",
-            format!("`{name}` is only valid for kind `sprite2d`; 3D models declare `head_joint`"),
-        ));
-    }
-    Ok(())
+    check_triangle_list_3d(indices, vertices, "skeleton3d.indices")
 }
 
 fn validate_skeletal_animations(
