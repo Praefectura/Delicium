@@ -15,6 +15,8 @@ pub(super) const QUEUE_CAPACITY: usize = 4;
 pub(super) enum LoadSource {
     Example2d,
     Example3d,
+    TexturedExample2d,
+    TexturedExample3d,
     File(PathBuf),
     ValidationProbe,
 }
@@ -24,8 +26,20 @@ impl LoadSource {
         match self {
             Self::Example2d => "Bundled 2D example".into(),
             Self::Example3d => "Bundled 3D example".into(),
+            Self::TexturedExample2d => "Bundled textured 2D example".into(),
+            Self::TexturedExample3d => "Bundled textured 3D example".into(),
             Self::File(path) => path.display().to_string(),
             Self::ValidationProbe => "Smoke-test invalid model".into(),
+        }
+    }
+
+    pub fn example_index(&self) -> Option<usize> {
+        match self {
+            Self::Example2d => Some(0),
+            Self::Example3d => Some(1),
+            Self::TexturedExample2d => Some(2),
+            Self::TexturedExample3d => Some(3),
+            Self::File(_) | Self::ValidationProbe => None,
         }
     }
 
@@ -37,6 +51,14 @@ impl LoadSource {
             ),
             Self::Example3d => load_model_bytes(
                 include_bytes!("../../assets/examples/robot3d.dmodel.json"),
+                limits,
+            ),
+            Self::TexturedExample2d => load_model_bytes(
+                include_bytes!("../../assets/examples/puppet2d-textured.dmodel.json"),
+                limits,
+            ),
+            Self::TexturedExample3d => load_model_bytes(
+                include_bytes!("../../assets/examples/robot3d-textured.dmodel.json"),
                 limits,
             ),
             Self::File(path) => {
@@ -112,6 +134,44 @@ impl Loader {
             Ok(result) => Ok(Some(result)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err("Model loading worker has stopped".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_sources_keep_legacy_and_textured_cache_slots_separate() {
+        let sources = [
+            LoadSource::Example2d,
+            LoadSource::Example3d,
+            LoadSource::TexturedExample2d,
+            LoadSource::TexturedExample3d,
+        ];
+        for (index, source) in sources.iter().enumerate() {
+            assert_eq!(source.example_index(), Some(index));
+            let model = source.load(&LoadLimits::default()).unwrap();
+            assert_eq!(model.images.is_empty(), index < 2);
+        }
+        assert_eq!(
+            LoadSource::File(PathBuf::from("local.dmodel.json")).example_index(),
+            None
+        );
+        assert_eq!(LoadSource::ValidationProbe.example_index(), None);
+    }
+
+    #[test]
+    fn file_source_still_rejects_network_paths_before_reading() {
+        for path in [
+            "//server/share/model.dmodel.json",
+            r"\\server\share\model.dmodel.json",
+        ] {
+            let error = LoadSource::File(PathBuf::from(path))
+                .load(&LoadLimits::default())
+                .unwrap_err();
+            assert!(error.contains("Only local model paths"));
         }
     }
 }

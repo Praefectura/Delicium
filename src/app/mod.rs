@@ -1,4 +1,6 @@
+mod benchmark;
 pub mod cli;
+mod hit_region;
 mod loader;
 mod ui;
 
@@ -12,7 +14,7 @@ use std::{
 use glam::Vec3;
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalPosition},
+    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowId, WindowLevel},
@@ -21,12 +23,20 @@ use winit::{
 use crate::{
     model::ModelKind,
     platform,
-    renderer::{Graphics, InstanceDraw, RenderFrame, screen_to_world},
-    simulation::{AssetId, InstanceId, Simulation, render_asset},
+    renderer::{
+        Graphics, InstanceDraw, LEGACY, RenderFrame, SceneFrameOutcome, SceneView, desktop_view,
+        screen_to_world_with,
+    },
+    simulation::{
+        AssetId, InstanceId, Simulation, WANDER_EDGE_MARGIN, WanderEvent, WorldXBounds,
+        render_asset,
+    },
 };
 
 use self::{
-    cli::{Options, ParseResult},
+    benchmark::{Benchmark, Phase, RegionDecision, SceneSample},
+    cli::{BenchMode, Options, ParseResult},
+    hit_region::HitGeometry,
     loader::{CompletedLoad, LoadJob, LoadSource, Loader},
     ui::{ControlUi, InstanceSummary, UiCommand},
 };
@@ -44,9 +54,16 @@ pub fn run() -> Result<(), String> {
     };
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let mut application = Application::new(options)?;
-    event_loop
-        .run_app(&mut application)
-        .map_err(|error| error.to_string())?;
+    if let Err(error) = event_loop.run_app(&mut application) {
+        let error = error.to_string();
+        if let Some(benchmark) = &mut application.benchmark {
+            benchmark.fail(error.clone());
+        }
+        application.fatal = Some(error);
+    }
+    if let Some(benchmark) = &mut application.benchmark {
+        benchmark.finish()?;
+    }
     if let Some(error) = application.fatal {
         return Err(error);
     }
@@ -68,11 +85,86 @@ struct Runtime {
     graphics: Graphics,
     egui_context: egui::Context,
     egui_input: egui_winit::State,
+    /// The scene view the renderer, picking, dragging and the native hit
+    /// region all share. [`LEGACY`] for bounded scenes; the desktop formula
+    /// while the scene spans the primary monitor.
+    scene_view: SceneView,
+    /// Whether the scene window spans the primary monitor (ordinary launch)
+    /// rather than a bounded explicit `--overlay-size` window.
+    desktop_scene: bool,
 }
 
 enum Operation {
     Spawn { positions: Vec<Vec3> },
     Replace { instance: InstanceId },
+}
+
+/// How the scene window intercepts input.
+///
+/// `Interactive` is whole-window input, `Pixel` is the character outline
+/// region, `FullWindow` is the whole window with no native region (used while
+/// a drag must survive the cursor leaving a character), and `Fallback` means
+/// region building failed and the whole window is click-through until the
+/// user switches modes again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegionMode {
+    Interactive,
+    Pixel,
+    /// Whole-window input through a cleared region; on Windows this keeps the
+    /// window's own shape instead of growing a synthetic full-client region.
+    FullWindow,
+    Fallback,
+}
+
+/// Horizontal world bounds of a scene view at the given physical size,
+/// matching [`screen_to_world_with`]: `x = ±span / 2 * aspect`.
+fn wander_bounds(view: SceneView, size: PhysicalSize<u32>) -> WorldXBounds {
+    let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+    let half = view.span * 0.5 * aspect;
+    WorldXBounds {
+        left: -half,
+        right: half,
+    }
+}
+
+/// Pushes the current scene view into the simulation and logs the result.
+///
+/// `left`/`right` are the raw visible range; the walkable inset
+/// ([`WANDER_EDGE_MARGIN`]) is applied inside the simulation and reported
+/// here so scripts can assert against the effective range without copying
+/// the policy. Failures only warn: an invalid bounds value would be a bug,
+/// but it must not kill a running frame.
+fn sync_wander_bounds(
+    simulation: &mut Simulation,
+    wander_enabled: bool,
+    view: SceneView,
+    size: PhysicalSize<u32>,
+) {
+    let bounds = wander_enabled.then(|| wander_bounds(view, size));
+    match simulation.set_wander_bounds(bounds) {
+        Ok(()) => match bounds {
+            Some(bounds) => log::info!(
+                "wander bounds left={:.4} right={:.4} margin={:.3}",
+                bounds.left,
+                bounds.right,
+                WANDER_EDGE_MARGIN
+            ),
+            None => log::info!("wander bounds none"),
+        },
+        Err(error) => log::warn!("wander bounds unchanged: {error}"),
+    }
+}
+
+/// The last successfully installed region and the geometry it came from.
+struct HitRegionCache {
+    mode: RegionMode,
+    geometry: Option<HitGeometry>,
+    /// Whether the overlay is currently whole-window click-through
+    /// (`WS_EX_TRANSPARENT` on, i.e. `set_click_through(enabled = true)`).
+    /// Tracked so mode transitions flip the style only when it differs and in
+    /// an order that never widens input interception on the way.
+    click_through: bool,
+    failed: bool,
 }
 
 #[derive(Default)]
@@ -98,21 +190,28 @@ struct Application {
     initial_models: VecDeque<PathBuf>,
     latest_replacement: HashMap<InstanceId, u64>,
     sources: HashMap<InstanceId, LoadSource>,
-    examples: [Option<AssetId>; 2],
+    examples: [Option<AssetId>; 4],
     next_request: u64,
     cursor: [f32; 2],
     dragging: Option<(InstanceId, Vec3)>,
+    /// The region mode a drag suspended (`Pixel`), restored on the first
+    /// frame after the drag ends.
+    drag_region: Option<RegionMode>,
+    hit_region: HitRegionCache,
     started: Instant,
     last_frame: Instant,
     next_frame: Instant,
     rendered_frames: u64,
     smoke: SmokeState,
+    benchmark: Option<Benchmark>,
+    scene_sample: Option<SceneSample>,
     fatal: Option<String>,
 }
 
 impl Application {
     fn new(options: Options) -> Result<Self, String> {
         let now = Instant::now();
+        let benchmark = options.bench.clone().map(Benchmark::new);
         Ok(Self {
             options,
             runtime: None,
@@ -123,15 +222,24 @@ impl Application {
             initial_models: VecDeque::new(),
             latest_replacement: HashMap::new(),
             sources: HashMap::new(),
-            examples: [None, None],
+            examples: [None; 4],
             next_request: 1,
             cursor: [0.0; 2],
             dragging: None,
+            drag_region: None,
+            hit_region: HitRegionCache {
+                mode: RegionMode::Pixel,
+                geometry: None,
+                click_through: false,
+                failed: false,
+            },
             started: now,
             last_frame: now,
             next_frame: now,
             rendered_frames: 0,
             smoke: SmokeState::default(),
+            benchmark,
+            scene_sample: None,
             fatal: None,
         })
     }
@@ -147,17 +255,39 @@ impl Application {
         let monitor_size = monitor
             .as_ref()
             .map(|monitor| monitor.size().to_logical::<f64>(scale));
-        let width = monitor_size.map_or(self.options.overlay_size[0] as f64, |size| {
-            (self.options.overlay_size[0] as f64).min((size.width - 430.0).max(320.0))
+        // Ordinary launch (no --overlay-size) makes the scene cover the
+        // primary monitor's physical rectangle; an explicit --overlay-size,
+        // --smoke-test and --bench keep the bounded window (normalized in the
+        // CLI). Without a primary monitor the bounded path runs instead.
+        let desktop_scene = self.options.overlay_size.is_none() && monitor.is_some();
+        let requested = self.options.overlay_size.unwrap_or([960, 640]);
+        let width = monitor_size.map_or(requested[0] as f64, |size| {
+            (requested[0] as f64).min((size.width - 430.0).max(320.0))
         });
-        let height = monitor_size.map_or(self.options.overlay_size[1] as f64, |size| {
-            (self.options.overlay_size[1] as f64).min((size.height - 110.0).max(240.0))
+        let height = monitor_size.map_or(requested[1] as f64, |size| {
+            (requested[1] as f64).min((size.height - 110.0).max(240.0))
         });
-        let overlay = Arc::new(
+        let overlay = Arc::new(if desktop_scene {
+            let monitor = monitor.as_ref().unwrap();
+            let size = monitor.size();
             event_loop
                 .create_window(platform::overlay_attributes(
                     Window::default_attributes()
                         .with_title("Delicium Scene")
+                        .with_visible(false)
+                        .with_decorations(false)
+                        .with_transparent(true)
+                        .with_window_level(WindowLevel::AlwaysOnTop)
+                        .with_inner_size(PhysicalSize::new(size.width, size.height))
+                        .with_position(monitor.position()),
+                ))
+                .map_err(|error| error.to_string())?
+        } else {
+            event_loop
+                .create_window(platform::overlay_attributes(
+                    Window::default_attributes()
+                        .with_title("Delicium Scene")
+                        .with_visible(false)
                         .with_decorations(false)
                         .with_transparent(true)
                         .with_window_level(WindowLevel::AlwaysOnTop)
@@ -167,10 +297,31 @@ impl Application {
                             origin.y + (50.0 * scale) as i32,
                         )),
                 ))
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| error.to_string())?
+        });
+        let scene_view = if desktop_scene {
+            desktop_view(overlay.inner_size().height, overlay.scale_factor() as f32)
+        } else {
+            LEGACY
+        };
+        log::info!(
+            "scene_view mode={} span={:.6} bottom={:.6}",
+            if desktop_scene { "desktop" } else { "bounded" },
+            scene_view.span,
+            scene_view.bottom
         );
         let control_height =
             monitor_size.map_or(680.0, |size| (size.height - 110.0).clamp(480.0, 680.0));
+        // Desktop mode anchors the control window at the monitor's top-right
+        // corner (50 logical pixels in from each edge; the 430 constant is the
+        // 380-wide control plus that 50-pixel margin). Bounded mode keeps the
+        // control window beside the scene exactly as before.
+        let control_x = if desktop_scene {
+            let monitor = monitor.as_ref().unwrap();
+            monitor.position().x + monitor.size().width as i32 - (430.0 * scale) as i32
+        } else {
+            origin.x + ((width + 50.0) * scale) as i32
+        };
         let control = Arc::new(
             event_loop
                 .create_window(
@@ -179,7 +330,7 @@ impl Application {
                         .with_window_level(WindowLevel::AlwaysOnTop)
                         .with_inner_size(LogicalSize::new(380.0, control_height))
                         .with_position(PhysicalPosition::new(
-                            origin.x + ((width + 50.0) * scale) as i32,
+                            control_x,
                             origin.y + (50.0 * scale) as i32,
                         )),
                 )
@@ -206,26 +357,86 @@ impl Application {
             None,
             None,
         );
-        platform::set_click_through(&overlay, &control, true)?;
+        // Default mode is per-character hit regions: normal hit testing with
+        // an empty region until the first frame builds the character outlines,
+        // so nothing is intercepted before anything is visible. If even the
+        // empty region cannot be installed (non-Windows builds), the overlay
+        // stays whole-window click-through, as it was before regions existed,
+        // and holds that fallback until the user switches modes.
+        platform::set_click_through(&overlay, &control, false)?;
+        match platform::set_hit_region(&overlay, &[]) {
+            Ok(()) => log::info!("hit_region mode=pixel polygons=0"),
+            Err(error) => {
+                platform::set_click_through(&overlay, &control, true)?;
+                self.hit_region.mode = RegionMode::Fallback;
+                self.hit_region.failed = true;
+                self.hit_region.click_through = true;
+                self.ui.pixel_hittest = false;
+                log::info!("hit_region mode=fallback error={error}");
+                self.report_error(format!(
+                    "Character hit regions are unavailable; the scene is click-through until the mode changes: {error}"
+                ));
+            }
+        }
         self.runtime = Some(Runtime {
             overlay,
             control,
             graphics,
             egui_context,
             egui_input,
+            scene_view,
+            desktop_scene,
         });
+        log::info!(
+            "wander mode={}",
+            if self.options.wander { "on" } else { "off" }
+        );
+        {
+            let runtime = self.runtime.as_ref().unwrap();
+            sync_wander_bounds(
+                &mut self.simulation,
+                self.options.wander,
+                runtime.scene_view,
+                runtime.overlay.inner_size(),
+            );
+        }
+        self.runtime.as_ref().unwrap().overlay.set_visible(true);
         self.started = Instant::now();
         self.last_frame = self.started;
         self.next_frame = self.started;
-        if self.options.models.is_empty() {
+        if let Some(options) = self.options.bench.clone() {
+            let runtime = self.runtime.as_ref().unwrap();
+            self.benchmark.as_mut().unwrap().configure(
+                runtime.graphics.diagnostics(),
+                self.options.overlay_size.unwrap_or([960, 640]),
+                runtime.overlay.scale_factor(),
+                runtime.control.scale_factor(),
+                self.options.wander,
+            )?;
+            if options.mode == BenchMode::Interactive {
+                self.apply_command(UiCommand::PixelHitTest(false), event_loop)?;
+            }
             self.submit_load(
                 LoadSource::Example2d,
+                Operation::Spawn {
+                    positions: benchmark::positions(options.instances, ModelKind::Sprite2d),
+                },
+            )?;
+            self.submit_load(
+                LoadSource::Example3d,
+                Operation::Spawn {
+                    positions: benchmark::positions(options.instances, ModelKind::Skeleton3d),
+                },
+            )?;
+        } else if self.options.models.is_empty() {
+            self.submit_load(
+                LoadSource::TexturedExample2d,
                 Operation::Spawn {
                     positions: vec![Vec3::new(-2.4, 0.15, 0.0), Vec3::new(-0.8, 0.15, 0.0)],
                 },
             )?;
             self.submit_load(
-                LoadSource::Example3d,
+                LoadSource::TexturedExample3d,
                 Operation::Spawn {
                     positions: vec![Vec3::new(0.8, 0.15, 0.0), Vec3::new(2.4, 0.15, 0.0)],
                 },
@@ -356,14 +567,8 @@ impl Application {
                         }
                     }
                 }
-                match completed.source {
-                    LoadSource::Example2d if self.examples[0].is_none() => {
-                        self.examples[0] = Some(asset)
-                    }
-                    LoadSource::Example3d if self.examples[1].is_none() => {
-                        self.examples[1] = Some(asset)
-                    }
-                    _ => {}
+                if let Some(index) = completed.source.example_index() {
+                    self.examples[index].get_or_insert(asset);
                 }
                 result
             }
@@ -372,10 +577,8 @@ impl Application {
                 .replace_model(instance, asset)
                 .map(|()| {
                     self.sources.insert(instance, completed.source.clone());
-                    match &completed.source {
-                        LoadSource::Example2d => self.examples[0] = Some(asset),
-                        LoadSource::Example3d => self.examples[1] = Some(asset),
-                        _ => {}
+                    if let Some(index) = completed.source.example_index() {
+                        self.examples[index] = Some(asset);
                     }
                     log::info!(
                         "replace instance={instance} asset={asset} kind={}",
@@ -384,11 +587,18 @@ impl Application {
                 })
                 .map_err(|error| error.to_string()),
         };
+        let succeeded = result.is_ok();
         match result {
             Ok(()) => self.ui.status = format!("Loaded {}", model.name),
             Err(error) => self.report_error(error),
         }
         self.collect_assets();
+        if succeeded
+            && let Some(benchmark) = &mut self.benchmark
+            && let Err(error) = benchmark.load_succeeded(completed.id, asset)
+        {
+            benchmark.fail(error);
+        }
     }
 
     fn collect_assets(&mut self) {
@@ -415,16 +625,21 @@ impl Application {
         command: UiCommand,
         event_loop: &ActiveEventLoop,
     ) -> Result<(), String> {
+        if self
+            .benchmark
+            .as_ref()
+            .is_some_and(|b| b.phase != Phase::Setup)
+            && !matches!(&command, UiCommand::Quit)
+        {
+            return Err("Benchmark workload modified through the controls".into());
+        }
         match command {
             UiCommand::SpawnExample(kind) => {
-                let index = match kind {
-                    ModelKind::Sprite2d => 0,
-                    ModelKind::Skeleton3d => 1,
-                };
-                let source = if index == 0 {
-                    LoadSource::Example2d
-                } else {
-                    LoadSource::Example3d
+                let (source, index) = match (kind, self.options.bench.is_some()) {
+                    (ModelKind::Sprite2d, true) => (LoadSource::Example2d, 0),
+                    (ModelKind::Skeleton3d, true) => (LoadSource::Example3d, 1),
+                    (ModelKind::Sprite2d, false) => (LoadSource::TexturedExample2d, 2),
+                    (ModelKind::Skeleton3d, false) => (LoadSource::TexturedExample3d, 3),
                 };
                 let position = self.next_spawn_position();
                 if let Some(asset) = self.examples[index] {
@@ -450,7 +665,7 @@ impl Application {
                 self.sources.remove(&instance);
                 self.latest_replacement.remove(&instance);
                 if self.dragging.is_some_and(|(target, _)| target == instance) {
-                    self.dragging = None;
+                    self.end_drag();
                 }
                 if self.ui.selected == Some(instance) {
                     self.ui.selected = None;
@@ -476,21 +691,33 @@ impl Application {
                 self.submit_load(source, Operation::Replace { instance })?;
             }
             UiCommand::Move(instance, position) => {
+                // A position edit owns the character for as long as the user
+                // drags the value; the walk is cancelled by set_position.
+                if let Err(error) = self.simulation.suspend_wander(instance) {
+                    self.report_error(error.to_string());
+                }
                 self.simulation
                     .set_position(instance, position)
                     .map_err(|error| error.to_string())?;
             }
-            UiCommand::ClickThrough(enabled) => {
-                let runtime = self.runtime.as_ref().ok_or("Windows are not ready")?;
-                if let Err(error) =
-                    platform::set_click_through(&runtime.overlay, &runtime.control, enabled)
-                {
-                    self.ui.click_through = !enabled;
-                    return Err(error);
-                }
-                self.ui.click_through = enabled;
-                self.dragging = None;
-                log::info!("click_through={enabled}");
+            UiCommand::PixelHitTest(enabled) => {
+                let target = if enabled {
+                    RegionMode::Pixel
+                } else {
+                    RegionMode::Interactive
+                };
+                // An explicit mode switch clears the fallback latch, so a
+                // failed mode can be retried, unlike the per-frame path.
+                self.hit_region.failed = false;
+                self.hit_region.geometry = None;
+                self.hit_region.mode = target;
+                self.end_drag();
+                self.drag_region = None;
+                self.sync_hit_region_now()?;
+                // Report the state that was actually reached: a switch that
+                // fell back leaves the checkbox off, and the `interactive`
+                // line is only logged by the switch that reached it.
+                self.ui.pixel_hittest = enabled && self.hit_region.mode == RegionMode::Pixel;
             }
             UiCommand::Quit => event_loop.exit(),
         }
@@ -501,30 +728,116 @@ impl Application {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_frame);
         self.last_frame = now;
+        self.scene_sample = self
+            .benchmark
+            .as_ref()
+            .map(|b| SceneSample::new(b.phase, elapsed));
         self.ui.frame_ms = self.ui.frame_ms * 0.9 + elapsed.as_secs_f32() * 1000.0 * 0.1;
-        self.simulation
-            .advance(elapsed)
-            .map_err(|error| error.to_string())?;
+        let timer = self.bench_clock();
+        let advanced = self.simulation.advance(elapsed);
+        if let Some(sample) = &mut self.scene_sample {
+            sample.advance = timer.map(|timer| timer.elapsed());
+        }
+        let report = advanced.map_err(|error| error.to_string())?;
+        if let Some(sample) = &mut self.scene_sample {
+            sample.steps = report.steps;
+            sample.dropped_steps = report.dropped_steps;
+        }
+        // Drained here, right after the advance: every step of this frame has
+        // already been recorded, and a zero-step frame cannot replay events.
+        for event in self.simulation.drain_wander_events() {
+            match event {
+                WanderEvent::Start {
+                    instance,
+                    x,
+                    y,
+                    target_x,
+                } => log::info!(
+                    "wander start instance={instance} x={x:.3} y={y:.3} target={target_x:.3}"
+                ),
+                WanderEvent::Arrive { instance, x, y } => {
+                    log::info!("wander arrive instance={instance} x={x:.3} y={y:.3}")
+                }
+            }
+        }
         self.ui.tick_count = self.simulation.tick_count();
         self.ui.interactions = self.simulation.interactions().len();
-        let frame = self
-            .simulation
-            .render_frame()
-            .map_err(|error| error.to_string())?;
+        let timer = self.bench_clock();
+        let generated = self.simulation.render_frame();
+        if let Some(sample) = &mut self.scene_sample {
+            sample.render_frame = timer.map(|timer| timer.elapsed());
+        }
+        let frame = generated.map_err(|error| error.to_string())?;
         if self.options.smoke_test {
             self.observe_smoke_frame(&frame);
         }
+        self.restore_region_after_drag();
+        self.sync_hit_region(&frame)?;
         if let Some(runtime) = &mut self.runtime {
-            runtime
-                .graphics
-                .render_scene(&frame)
-                .map_err(|error| error.to_string())?;
+            let view = runtime.scene_view;
+            if let Some(sample) = &mut self.scene_sample {
+                let measured = runtime
+                    .graphics
+                    .render_scene_measured(&frame, view)
+                    .map_err(|error| error.to_string())?;
+                sample.outcome = Some(measured.outcome);
+                sample.graphics = measured.timings;
+            } else {
+                runtime
+                    .graphics
+                    .render_scene(&frame, view)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if let Some(mut sample) = self.scene_sample.take() {
+            sample.callback = Some(now.elapsed());
+            let submitted = sample.outcome == Some(SceneFrameOutcome::Submitted);
+            self.benchmark.as_mut().unwrap().record_scene(sample)?;
+            if submitted {
+                // The benchmark loads the two untextured examples into slots
+                // 0 and 1; slots 2/3 hold the textured variants used by
+                // ordinary launches and stay empty under --bench, so only
+                // those two slots can gate readiness.
+                let ready_target = if self.pending.is_empty()
+                    && self.examples[0].is_some()
+                    && self.examples[1].is_some()
+                    && self.simulation.asset_count() == 2
+                    && frame.instances.len() == self.benchmark.as_ref().unwrap().options.instances
+                {
+                    frame.instances.iter().find_map(|draw| match draw {
+                        InstanceDraw::Sprite2d { instance, .. } => Some(*instance),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+                let benchmark = self.benchmark.as_mut().unwrap();
+                let elapsed = benchmark.elapsed();
+                let confirmation = benchmark.on_submission(
+                    elapsed,
+                    ready_target,
+                    frame.instances.iter().map(draw_identity),
+                )?;
+                if let Some(confirmation) = confirmation {
+                    let data = self.benchmark_snapshot()?;
+                    self.benchmark.as_ref().unwrap().reload_confirmed(
+                        elapsed,
+                        confirmation,
+                        data,
+                    )?;
+                }
+            }
         }
         self.rendered_frames += 1;
         Ok(())
     }
 
+    fn bench_clock(&self) -> Option<Instant> {
+        self.benchmark.as_ref().map(|_| Instant::now())
+    }
+
     fn redraw_control(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        let measurement = self.benchmark.as_ref().map(|b| (b.phase, Instant::now()));
         let instances: Vec<_> = self
             .simulation
             .instances()
@@ -562,6 +875,90 @@ impl Application {
             if let Err(error) = self.apply_command(command, event_loop) {
                 self.report_error(error);
             }
+        }
+        if let Some((phase, timer)) = measurement {
+            self.benchmark
+                .as_mut()
+                .unwrap()
+                .record_control(phase, timer.elapsed())?;
+        }
+        Ok(())
+    }
+
+    fn benchmark_snapshot(&self) -> Result<serde_json::Value, String> {
+        let benchmark = self.benchmark.as_ref().ok_or("Benchmark not enabled")?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or("Benchmark runtime unavailable")?;
+        let instances = self.simulation.instances();
+        let expected =
+            benchmark::expected_assets(instances.iter().map(|info| info.asset), &self.examples);
+        let graphics = runtime.graphics.diagnostics();
+        benchmark.validate_windows(
+            [graphics.physical_size, graphics.control_physical_size],
+            [
+                runtime.overlay.scale_factor(),
+                runtime.control.scale_factor(),
+            ],
+        )?;
+        let gpu = runtime.graphics.scene_resource_diagnostics();
+        let cpu = self.simulation.asset_count();
+        if cpu != expected || gpu.asset_count != expected {
+            return Err(format!(
+                "Benchmark asset mismatch: cpu={cpu} gpu={} expected={expected}",
+                gpu.asset_count
+            ));
+        }
+        if instances.len() != benchmark.options.instances {
+            return Err("Benchmark instance count changed".into());
+        }
+        let mode = match self.hit_region.mode {
+            RegionMode::Pixel => "pixel",
+            RegionMode::Interactive => "interactive",
+            RegionMode::FullWindow => "full-window",
+            RegionMode::Fallback => "fallback",
+        };
+        if mode != benchmark.options.mode.as_str() {
+            return Err("Benchmark input mode changed or entered fallback".into());
+        }
+        Ok(serde_json::json!({
+            "instance_count": instances.len(),
+            "sprite_instances": instances.iter().filter(|i| i.kind == ModelKind::Sprite2d).count(),
+            "skeleton_instances": instances.iter().filter(|i| i.kind == ModelKind::Skeleton3d).count(),
+            "cpu_assets": cpu, "gpu_assets": gpu.asset_count, "expected_assets": expected,
+            "mask_bytes": gpu.mask_bytes, "sprite_vertex_capacity_bytes": gpu.sprite_vertex_capacity_bytes,
+            "instance_capacity_bytes": gpu.instance_capacity_bytes, "palette_capacity_bytes": gpu.palette_capacity_bytes,
+            "pending": self.pending.len(), "region_mode": mode,
+        }))
+    }
+
+    fn advance_benchmark(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        let Some(benchmark) = &mut self.benchmark else {
+            return Ok(());
+        };
+        let now = benchmark.elapsed();
+        benchmark.update(now)?;
+        if benchmark.stopped() {
+            event_loop.exit();
+            return Ok(());
+        }
+        if let Some((instance, is_3d)) = benchmark.reload_due(now) {
+            let source = if is_3d {
+                LoadSource::Example3d
+            } else {
+                LoadSource::Example2d
+            };
+            let request = self.submit_load(source, Operation::Replace { instance })?;
+            self.benchmark
+                .as_mut()
+                .unwrap()
+                .begin_reload(request, instance, now)?;
+        }
+        let benchmark = self.benchmark.as_mut().unwrap();
+        if benchmark.phase != Phase::Setup && benchmark.snapshot_due(now) {
+            let data = self.benchmark_snapshot()?;
+            self.benchmark.as_ref().unwrap().snapshot(now, data)?;
         }
         Ok(())
     }
@@ -605,9 +1002,11 @@ impl Application {
         }
         let seconds = self.started.elapsed().as_secs_f32();
         if self.smoke.stage == 0 && seconds > 2.0 {
-            let was_enabled = self.ui.click_through;
-            self.apply_command(UiCommand::ClickThrough(false), event_loop)?;
-            self.smoke.input_mode_toggled = was_enabled && !self.ui.click_through;
+            let was_enabled = self.ui.pixel_hittest;
+            self.apply_command(UiCommand::PixelHitTest(false), event_loop)?;
+            self.smoke.input_mode_toggled = was_enabled
+                && !self.ui.pixel_hittest
+                && self.hit_region.mode == RegionMode::Interactive;
             self.smoke.stage = 1;
         }
         if self.smoke.stage == 1 && seconds > 3.0 {
@@ -652,9 +1051,14 @@ impl Application {
             self.smoke.stage = 3;
         }
         if self.smoke.stage == 3 && seconds > 6.0 {
-            let was_disabled = !self.ui.click_through;
-            self.apply_command(UiCommand::ClickThrough(true), event_loop)?;
-            self.smoke.input_mode_toggled &= was_disabled && self.ui.click_through;
+            let was_disabled = !self.ui.pixel_hittest;
+            self.apply_command(UiCommand::PixelHitTest(true), event_loop)?;
+            // The mode must actually be back on the region, not merely show
+            // the checkbox as checked (a fallback would leave it unchecked).
+            self.smoke.input_mode_toggled &= was_disabled
+                && self.ui.pixel_hittest
+                && self.hit_region.mode == RegionMode::Pixel
+                && !self.hit_region.failed;
             self.smoke.stage = 4;
         }
         if self.smoke.stage >= 4 && seconds > 9.0 {
@@ -684,7 +1088,8 @@ impl Application {
     fn pick_character(&self) -> Option<InstanceId> {
         let runtime = self.runtime.as_ref()?;
         let size = runtime.overlay.inner_size();
-        let point = screen_to_world(self.cursor, [size.width, size.height]);
+        let point =
+            screen_to_world_with(self.cursor, [size.width, size.height], runtime.scene_view);
         let mut frame = self.simulation.render_frame().ok()?;
         frame.instances.sort_by_key(|draw| {
             (
@@ -749,11 +1154,272 @@ impl Application {
 
     fn report_error(&mut self, error: String) {
         log::warn!("{error}");
+        if let Some(benchmark) = &mut self.benchmark {
+            benchmark.fail(error.clone());
+        }
         self.ui.last_error = Some(error);
+    }
+
+    // -- hit region ----------------------------------------------------------
+
+    /// Installs the target mode's region immediately, for mode switches and
+    /// the start of a drag. A failed build or native call enters the
+    /// click-through fallback and returns `Ok`; an error is only returned
+    /// when the fallback itself could not be established, because then the
+    /// window could be left intercepting input and the app must not run on.
+    fn sync_hit_region_now(&mut self) -> Result<(), String> {
+        match self.hit_region.mode {
+            RegionMode::Interactive | RegionMode::FullWindow => {
+                let label = if self.hit_region.mode == RegionMode::Interactive {
+                    "interactive"
+                } else {
+                    "full-window"
+                };
+                if let Err(error) = self.apply_full_input() {
+                    self.enter_fallback(format!("Cannot restore whole-window input: {error}"))?;
+                    return Ok(());
+                }
+                log::info!("hit_region mode={label}");
+                Ok(())
+            }
+            RegionMode::Fallback => Ok(()),
+            RegionMode::Pixel => {
+                let geometry = match self.build_geometry(None) {
+                    Ok(geometry) => geometry,
+                    Err(error) => {
+                        self.enter_fallback(format!(
+                            "Cannot build character hit regions: {error}"
+                        ))?;
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = self.install_pixel_geometry(geometry) {
+                    self.enter_fallback(format!("Cannot install character hit regions: {error}"))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Per-frame pixel-region update, right before the frame is drawn so the
+    /// installed region matches the pose on screen.
+    fn sync_hit_region(&mut self, frame: &RenderFrame) -> Result<(), String> {
+        if self.hit_region.mode != RegionMode::Pixel || self.hit_region.failed {
+            return Ok(());
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(());
+        };
+        let size = runtime.overlay.inner_size();
+        let size = [size.width, size.height];
+        let view = runtime.scene_view;
+        let timer = self.bench_clock();
+        let collected = HitGeometry::from_frame_with_view(&self.simulation, frame, size, view);
+        if let Some(sample) = &mut self.scene_sample {
+            sample.hit_geometry = timer.map(|timer| timer.elapsed());
+        }
+        let geometry = match collected {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                if let Some(sample) = &mut self.scene_sample {
+                    sample.region = RegionDecision::Failed;
+                }
+                self.enter_fallback(format!("Cannot build character hit regions: {error}"))?;
+                return Ok(());
+            }
+        };
+        let timer = self.bench_clock();
+        let unchanged = self
+            .hit_region
+            .geometry
+            .as_ref()
+            .is_some_and(|previous| !geometry.changed_since(previous));
+        if let Some(sample) = &mut self.scene_sample {
+            sample.hit_compare = timer.map(|timer| timer.elapsed());
+            sample.polygons = geometry.polygons().len();
+        }
+        if unchanged {
+            if let Some(sample) = &mut self.scene_sample {
+                sample.region = RegionDecision::Reused;
+            }
+            log::trace!("hit_region mode=pixel unchanged");
+            return Ok(());
+        }
+        if let Err(error) = self.install_pixel_geometry(geometry) {
+            if let Some(sample) = &mut self.scene_sample {
+                sample.region = RegionDecision::Failed;
+            }
+            self.enter_fallback(format!("Cannot install character hit regions: {error}"))?;
+        } else if let Some(sample) = &mut self.scene_sample {
+            sample.region = RegionDecision::Rebuilt;
+        }
+        Ok(())
+    }
+
+    /// Installs `geometry` as the window region and makes it the new
+    /// comparison baseline. Mode transitions log at info; per-frame rebuilds
+    /// of an already-installed mode log at trace.
+    fn install_pixel_geometry(&mut self, geometry: HitGeometry) -> Result<(), String> {
+        let Some(runtime) = &self.runtime else {
+            return Ok(());
+        };
+        let timer = self.scene_sample.as_ref().map(|_| Instant::now());
+        let installed = platform::set_hit_region(&runtime.overlay, geometry.polygons());
+        if let Some(sample) = &mut self.scene_sample {
+            sample.native_region_build_install = timer.map(|timer| timer.elapsed());
+        }
+        installed?;
+        if self.hit_region.click_through {
+            // Leaving the click-through fallback: the target region is
+            // already installed, so enabling hit testing cannot leave the
+            // whole window intercepting input in between.
+            platform::set_click_through(&runtime.overlay, &runtime.control, false)?;
+            self.hit_region.click_through = false;
+        }
+        let count = geometry.polygons().len();
+        let first = self.hit_region.geometry.is_none();
+        self.hit_region.geometry = Some(geometry);
+        if first {
+            log::info!("hit_region mode=pixel polygons={count}");
+        } else {
+            log::trace!("hit_region mode=pixel polygons={count} rebuilt");
+        }
+        Ok(())
+    }
+
+    /// Suspends the character regions so a drag may leave the character; the
+    /// mode is restored by [`Self::restore_region_after_drag`].
+    fn begin_region_drag(&mut self) -> Result<(), String> {
+        if self.hit_region.mode != RegionMode::Pixel {
+            return Ok(());
+        }
+        self.drag_region = Some(RegionMode::Pixel);
+        self.hit_region.mode = RegionMode::FullWindow;
+        // The installed region is dropped; the comparison baseline goes with
+        // it, so the restore rebuilds instead of trusting stale geometry.
+        self.hit_region.geometry = None;
+        self.sync_hit_region_now()
+    }
+
+    /// Ends the current drag, if any, and releases the character's parked
+    /// wandering. The single exit every drag-terminating path goes through:
+    /// a release, the cursor leaving the overlay, focus loss, a mode switch,
+    /// the fallback latch, or the character being removed.
+    ///
+    /// The resume is skipped when the instance is already gone, so removing a
+    /// dragged character reports no error. Every other case resumes with a
+    /// fresh idle pause, so a released character never leaves immediately.
+    fn end_drag(&mut self) {
+        let Some((instance, _)) = self.dragging.take() else {
+            return;
+        };
+        if self.simulation.instance(instance).is_none() {
+            return;
+        }
+        if let Err(error) = self.simulation.resume_wander(instance) {
+            self.report_error(error.to_string());
+        }
+    }
+
+    /// Restores the mode a drag suspended, on the first frame after the drag
+    /// ended (release, cursor leaving the overlay, or focus loss).
+    fn restore_region_after_drag(&mut self) {
+        if self.dragging.is_none()
+            && let Some(saved) = self.drag_region.take()
+        {
+            self.hit_region.mode = saved;
+            self.hit_region.geometry = None;
+        }
+    }
+
+    /// Whole-window input: normal hit testing, no native region. Used by the
+    /// `Interactive` and `FullWindow` modes. When coming out of the fallback
+    /// the style is flipped first: the region is already clear, so the window
+    /// must not start intercepting input before the target region is ready.
+    fn apply_full_input(&mut self) -> Result<(), String> {
+        let Some(runtime) = &self.runtime else {
+            return Ok(());
+        };
+        if self.hit_region.click_through {
+            platform::set_click_through(&runtime.overlay, &runtime.control, false)?;
+            self.hit_region.click_through = false;
+        } else {
+            platform::clear_hit_region(&runtime.overlay)?;
+        }
+        Ok(())
+    }
+
+    /// Whole-window click-through: the native region is cleared first and the
+    /// overlay stops hit testing entirely (the fallback state).
+    fn apply_click_through(&mut self) -> Result<(), String> {
+        let Some(runtime) = &self.runtime else {
+            return Ok(());
+        };
+        platform::clear_hit_region(&runtime.overlay)?;
+        platform::set_click_through(&runtime.overlay, &runtime.control, true)?;
+        self.hit_region.click_through = true;
+        Ok(())
+    }
+
+    fn build_geometry(&self, frame: Option<&RenderFrame>) -> Result<HitGeometry, String> {
+        let runtime = self.runtime.as_ref().ok_or("Windows are not ready")?;
+        let size = runtime.overlay.inner_size();
+        let size = [size.width, size.height];
+        let view = runtime.scene_view;
+        let frame = match frame {
+            Some(frame) => frame.clone(),
+            None => self
+                .simulation
+                .render_frame()
+                .map_err(|error| error.to_string())?,
+        };
+        HitGeometry::from_frame_with_view(&self.simulation, &frame, size, view)
+    }
+
+    /// Region building or installation failed: clear the region, make the
+    /// whole window click-through and hold that state until the user switches
+    /// modes again. Returns a fatal error when even the fallback cannot be
+    /// established, because the window would be left intercepting input.
+    fn enter_fallback(&mut self, error: String) -> Result<(), String> {
+        if self.runtime.is_none() {
+            return Ok(());
+        }
+        let first = !self.hit_region.failed;
+        self.hit_region.mode = RegionMode::Fallback;
+        self.hit_region.failed = true;
+        self.hit_region.geometry = None;
+        self.end_drag();
+        self.drag_region = None;
+        if first && self.ui.pixel_hittest {
+            self.ui.pixel_hittest = false;
+            log::warn!("hit regions disabled after a failure; the checkbox reflects the fallback");
+        }
+        match self.apply_click_through() {
+            Ok(()) => {
+                log::info!("hit_region mode=fallback error={error}");
+                if first {
+                    self.report_error(format!(
+                        "Character hit regions failed; the scene is click-through until the mode changes: {error}"
+                    ));
+                }
+                Ok(())
+            }
+            Err(apply_error) => Err(format!(
+                "Cannot apply the hit-region fallback ({apply_error}); the scene window may intercept input: {error}"
+            )),
+        }
     }
 
     fn fail(&mut self, error: String, event_loop: &ActiveEventLoop) {
         log::error!("{error}");
+        if let Some(benchmark) = &mut self.benchmark {
+            if let Some(sample) = self.scene_sample.take()
+                && let Err(sample_error) = benchmark.record_scene(sample)
+            {
+                log::warn!("{sample_error}");
+            }
+            benchmark.fail(error.clone());
+        }
         self.fatal = Some(error);
         event_loop.exit();
     }
@@ -790,19 +1456,73 @@ impl ApplicationHandler for Application {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => runtime.graphics.resize(window_id, size),
+            WindowEvent::Resized(size) => {
+                if let Some(benchmark) = &mut self.benchmark
+                    && benchmark.phase != Phase::Setup
+                {
+                    let diagnostics = runtime.graphics.diagnostics();
+                    let previous = if is_overlay {
+                        diagnostics.physical_size
+                    } else {
+                        diagnostics.control_physical_size
+                    };
+                    if previous != [size.width, size.height] {
+                        benchmark.fail("Benchmark window dimensions changed".into());
+                    }
+                }
+                if is_overlay {
+                    runtime.scene_view = if runtime.desktop_scene {
+                        desktop_view(size.height, runtime.overlay.scale_factor() as f32)
+                    } else {
+                        LEGACY
+                    };
+                    sync_wander_bounds(
+                        &mut self.simulation,
+                        self.options.wander,
+                        runtime.scene_view,
+                        size,
+                    );
+                }
+                runtime.graphics.resize(window_id, size);
+            }
             WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(benchmark) = &mut self.benchmark
+                    && benchmark.phase != Phase::Setup
+                {
+                    benchmark.fail("Benchmark window scale factor changed".into());
+                }
                 let window = if is_control {
                     &runtime.control
                 } else {
                     &runtime.overlay
                 };
+                if !is_control {
+                    let size = window.inner_size();
+                    runtime.scene_view = if runtime.desktop_scene {
+                        desktop_view(size.height, window.scale_factor() as f32)
+                    } else {
+                        LEGACY
+                    };
+                    sync_wander_bounds(
+                        &mut self.simulation,
+                        self.options.wander,
+                        runtime.scene_view,
+                        size,
+                    );
+                }
                 runtime.graphics.resize(window_id, window.inner_size());
                 window.request_redraw();
             }
             WindowEvent::Focused(true) if is_overlay => platform::raise_controls(&runtime.control),
-            WindowEvent::Focused(false) if is_overlay => self.dragging = None,
+            WindowEvent::Focused(false) if is_overlay => self.end_drag(),
             WindowEvent::DroppedFile(path) => {
+                if self.benchmark.is_some() {
+                    self.fail(
+                        "Benchmark workload modified by a dropped file".into(),
+                        event_loop,
+                    );
+                    return;
+                }
                 let position = self.next_spawn_position();
                 if let Err(error) = self.submit_load(
                     LoadSource::File(path),
@@ -826,12 +1546,13 @@ impl ApplicationHandler for Application {
             WindowEvent::CursorMoved { position, .. } if is_overlay => {
                 self.cursor = [position.x as f32, position.y as f32];
                 if let Some((instance, offset)) = self.dragging {
-                    let size = self
+                    let probe = self
                         .runtime
                         .as_ref()
-                        .map(|runtime| runtime.overlay.inner_size());
-                    if let Some(size) = size {
-                        let point = screen_to_world(self.cursor, [size.width, size.height]);
+                        .map(|runtime| (runtime.overlay.inner_size(), runtime.scene_view));
+                    if let Some((size, view)) = probe {
+                        let point =
+                            screen_to_world_with(self.cursor, [size.width, size.height], view);
                         let position = Vec3::new(point[0], point[1], 0.0) + offset;
                         if let Err(error) = self.simulation.set_position(instance, position) {
                             self.report_error(error.to_string());
@@ -843,7 +1564,16 @@ impl ApplicationHandler for Application {
                 state,
                 button: MouseButton::Left,
                 ..
-            } if is_overlay && !self.ui.click_through => {
+            } if is_overlay => {
+                if self.benchmark.is_some() {
+                    self.fail("Benchmark scene received mouse input".into(), event_loop);
+                    return;
+                }
+                // Picking needs a window that can actually receive input: the
+                // click-through fallback must never pick, while an ongoing
+                // drag still gets its release.
+                let pick_allowed =
+                    self.hit_region.mode != RegionMode::Fallback || self.dragging.is_some();
                 if state == ElementState::Released {
                     if let Some((instance, _)) = self.dragging
                         && let Some(info) = self.simulation.instance(instance)
@@ -855,16 +1585,35 @@ impl ApplicationHandler for Application {
                             info.position.y
                         );
                     }
-                    self.dragging = None;
-                } else if let Some(instance) = self.pick_character()
+                    self.end_drag();
+                } else if pick_allowed
+                    && let Some(instance) = self.pick_character()
                     && let Some(info) = self.simulation.instance(instance)
                     && let Some(runtime) = &self.runtime
                 {
                     let size = runtime.overlay.inner_size();
-                    let point = screen_to_world(self.cursor, [size.width, size.height]);
+                    let view = runtime.scene_view;
+                    // Suspend the character region for the gesture: the
+                    // pointer may leave the character without losing the
+                    // drag, and the region is rebuilt on the first frame
+                    // after the release.
+                    if let Err(error) = self.begin_region_drag() {
+                        self.fail(error, event_loop);
+                        return;
+                    }
+                    if self.hit_region.mode == RegionMode::Fallback {
+                        return;
+                    }
+                    let point = screen_to_world_with(self.cursor, [size.width, size.height], view);
                     self.dragging =
                         Some((instance, info.position - Vec3::new(point[0], point[1], 0.0)));
                     self.ui.selected = Some(instance);
+                    // Park the character: a press must not let it walk away
+                    // from under the pointer, even if the pointer holds still
+                    // for longer than one idle period.
+                    if let Err(error) = self.simulation.suspend_wander(instance) {
+                        self.report_error(error.to_string());
+                    }
                     log::info!(
                         "drag start instance={} x={:.3} y={:.3}",
                         instance,
@@ -873,7 +1622,7 @@ impl ApplicationHandler for Application {
                     );
                 }
             }
-            WindowEvent::CursorLeft { .. } if is_overlay => self.dragging = None,
+            WindowEvent::CursorLeft { .. } if is_overlay => self.end_drag(),
             _ => {}
         }
     }
@@ -885,6 +1634,11 @@ impl ApplicationHandler for Application {
         if let Some(exit_after) = self.options.exit_after
             && self.started.elapsed() >= exit_after
         {
+            if let Some(benchmark) = &mut self.benchmark
+                && !benchmark.stopped()
+            {
+                benchmark.fail("Benchmark emergency exit limit reached".into());
+            }
             log::info!(
                 "exit frames={} ticks={} assets={}",
                 self.rendered_frames,
@@ -897,8 +1651,12 @@ impl ApplicationHandler for Application {
         if let Err(error) = self
             .poll_loads()
             .and_then(|()| self.advance_smoke(event_loop))
+            .and_then(|()| self.advance_benchmark(event_loop))
         {
             self.fail(error, event_loop);
+            return;
+        }
+        if self.benchmark.as_ref().is_some_and(Benchmark::stopped) {
             return;
         }
         let now = Instant::now();
@@ -921,6 +1679,17 @@ impl ApplicationHandler for Application {
             self.next_frame.min(self.started + duration)
         });
         event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
+    }
+}
+
+fn draw_identity(draw: &InstanceDraw) -> (u64, u64) {
+    match draw {
+        InstanceDraw::Sprite2d {
+            instance, asset, ..
+        }
+        | InstanceDraw::Skeleton3d {
+            instance, asset, ..
+        } => (*instance, *asset),
     }
 }
 
@@ -958,6 +1727,35 @@ mod tests {
         let asset = app.simulation.insert_asset(model).unwrap();
         let instance = app.simulation.spawn(asset, Vec3::ZERO).unwrap();
         (app, instance, asset)
+    }
+
+    #[test]
+    fn collection_keeps_all_four_example_slots_without_mixing_assets() {
+        let mut app = Application::new(Options::default()).unwrap();
+        let examples = [
+            include_bytes!("../../assets/examples/puppet2d.dmodel.json").as_slice(),
+            include_bytes!("../../assets/examples/robot3d.dmodel.json").as_slice(),
+            include_bytes!("../../assets/examples/puppet2d-textured.dmodel.json").as_slice(),
+            include_bytes!("../../assets/examples/robot3d-textured.dmodel.json").as_slice(),
+        ];
+        for (index, bytes) in examples.iter().enumerate() {
+            let model = load_model_bytes(bytes, &LoadLimits::default()).unwrap();
+            app.examples[index] = Some(app.simulation.insert_asset(model).unwrap());
+        }
+        let slots = app.examples;
+        app.collect_assets();
+        assert_eq!(app.simulation.asset_count(), 4);
+        for (index, asset) in slots.into_iter().enumerate() {
+            let model = app.simulation.asset(asset.unwrap()).unwrap();
+            assert_eq!(model.images.is_empty(), index < 2);
+        }
+        let released = app.examples[2].take().unwrap();
+        app.collect_assets();
+        assert!(app.simulation.asset(released).is_none());
+        assert_eq!(app.simulation.asset_count(), 3);
+        for index in [0, 1, 3] {
+            assert!(app.simulation.asset(app.examples[index].unwrap()).is_some());
+        }
     }
 
     #[test]

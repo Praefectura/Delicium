@@ -21,14 +21,17 @@ pub(super) enum UiCommand {
     },
     Reload(u64),
     Move(u64, Vec3),
-    ClickThrough(bool),
+    /// Enable or disable per-character hit regions (default on).
+    PixelHitTest(bool),
     Quit,
 }
 
 pub(super) struct ControlUi {
     pub selected: Option<u64>,
     pub file_path: String,
-    pub click_through: bool,
+    /// Whether the scene window intercepts input only over character regions
+    /// (`true`, the default) or over the whole scene window.
+    pub pixel_hittest: bool,
     pub last_error: Option<String>,
     pub status: String,
     pub adapter: String,
@@ -43,7 +46,7 @@ impl Default for ControlUi {
         Self {
             selected: None,
             file_path: String::new(),
-            click_through: true,
+            pixel_hittest: true,
             last_error: None,
             status: "Loading bundled models...".into(),
             adapter: String::new(),
@@ -69,13 +72,18 @@ impl ControlUi {
                     ui.heading("Delicium");
                     ui.label("Native 2D / 3D character prototype");
                     ui.separator();
-                    if ui
-                        .checkbox(&mut self.click_through, "Scene click-through")
-                        .changed()
-                    {
-                        commands.push(UiCommand::ClickThrough(self.click_through));
+                    let response = ui
+                        .checkbox(&mut self.pixel_hittest, "Character hit regions")
+                        .on_hover_text(
+                            "Scene input is limited to the projected character outlines, \
+                             padded by 8 px per axis; empty areas stay click-through. \
+                             Off: the whole scene window intercepts input. \
+                             The control window never becomes click-through.",
+                        );
+                    if response.changed() {
+                        commands.push(UiCommand::PixelHitTest(self.pixel_hittest));
                     }
-                    ui.small("This control window never becomes click-through.");
+                    ui.small("Character regions + 8px; off: full scene.");
                     ui.horizontal(|ui| {
                         if ui.button("Add 2D").clicked() {
                             commands.push(UiCommand::SpawnExample(ModelKind::Sprite2d));
