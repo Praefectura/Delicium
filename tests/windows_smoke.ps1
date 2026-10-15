@@ -13,6 +13,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 $references = [System.IO.Directory]::GetFiles((Join-Path $PSHOME 'ref'), '*.dll') + @(
     [System.Windows.Forms.Form].Assembly.Location,
     [System.Windows.Forms.FormBorderStyle].Assembly.Location,
+    [System.Reflection.Assembly]::Load('System.Windows.Forms.Primitives').Location,
     [System.Drawing.Bitmap].Assembly.Location,
     [System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus').Location,
     [System.Reflection.Assembly]::Load('System.Private.Windows.Core').Location
@@ -25,6 +26,15 @@ using System.Threading;
 using System.Windows.Forms;
 
 public static class DeliciumWindowTest {
+    // Fail closed if the scene silently grew to the full primary monitor:
+    // this capture harness must never turn into a whole-desktop screenshot.
+    public static bool SpansPrimaryMonitor(Rectangle rectangle) {
+        var primary = Screen.PrimaryScreen;
+        if (primary == null) return false;
+        var bounds = primary.Bounds;
+        return rectangle.Left == bounds.Left && rectangle.Top == bounds.Top
+            && rectangle.Width == bounds.Width && rectangle.Height == bounds.Height;
+    }
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] public struct MouseInput { public int X, Y; public uint Data, Flags, Time; public UIntPtr Extra; }
@@ -97,8 +107,27 @@ public static class DeliciumWindowTest {
     public static bool PassesThrough(IntPtr window) {
         return (GetWindowLongPtrW(window, -20).ToInt64() & 0x20) != 0;
     }
+    [DllImport("gdi32.dll")] private static extern IntPtr CreateRectRgn(int left, int top, int right, int bottom);
+    [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr region);
+    [DllImport("user32.dll")] private static extern int GetWindowRgn(IntPtr window, IntPtr region);
+    public static bool HasRegion(IntPtr window) {
+        var region = CreateRectRgn(0, 0, 0, 0);
+        if (region == IntPtr.Zero) throw new Exception("Cannot allocate region probe");
+        try { return GetWindowRgn(window, region) != 0; }
+        finally { DeleteObject(region); }
+    }
+    public static void EmptyArea(string path, int x, int y) {
+        using (var bitmap = new Bitmap(path)) {
+            for (int dy = -10; dy <= 10; dy++) for (int dx = -10; dx <= 10; dx++) {
+                var color = bitmap.GetPixel(x + dx, y + dy);
+                if (Math.Abs(color.R-36)>6 || Math.Abs(color.G-58)>6 || Math.Abs(color.B-78)>6)
+                    throw new Exception("Empty-area probe overlaps rendered content");
+            }
+        }
+    }
     public static void Capture(IntPtr scene, IntPtr controls, IntPtr backdrop, string path) {
         var rectangle = Client(scene);
+        if (SpansPrimaryMonitor(rectangle)) throw new Exception("Capture aborted: scene client equals the primary-monitor rectangle (desktop-span mode must not be captured)");
         foreach (var point in new [] { new Point {X=rectangle.Left+2,Y=rectangle.Top+2}, new Point {X=rectangle.Right-3,Y=rectangle.Bottom-3} }) {
             var hit = Hit(point.X, point.Y);
             if (hit != scene && hit != controls && hit != backdrop) {
@@ -188,33 +217,33 @@ function Toggle-SceneInput([IntPtr]$Controls, [IntPtr]$Scene) {
     [DeliciumWindowTest]::Click($rectangle.Left + 18, $rectangle.Top + 12)
     Start-Sleep -Milliseconds 120
     Assert-Test ([DeliciumWindowTest]::GetForegroundWindow() -eq $Controls) 'Physical click can focus the control window'
-    # Click the "Scene click-through" checkbox row directly. The control
+    # Click the character hit-region checkbox row directly. The control
     # layout is 380 logical pixels wide, so the physical scale follows the
     # measured client width; the checkbox sits at logical (12, 67).
     $scale = $rectangle.Width / 380.0
     $checkX = $rectangle.Left + [int](12 * $scale)
     $checkY = $rectangle.Top + [int](67 * $scale)
-    Assert-Test ([DeliciumWindowTest]::Hit($checkX, $checkY) -eq $Controls) 'Click-through checkbox is not covered by a foreign window'
-    # The toggle is applied on the app's event loop; wait for the scene's
-    # WS_EX_TRANSPARENT bit to actually flip instead of guessing a delay.
-    # The app also re-raises the control window on every toggle.
-    $wasPassing = [DeliciumWindowTest]::PassesThrough($Scene)
+    Assert-Test ([DeliciumWindowTest]::Hit($checkX, $checkY) -eq $Controls) 'Hit-region checkbox is not covered by a foreign window'
+    # Wait for the native window region rather than the checkbox animation.
+    $hadRegion = [DeliciumWindowTest]::HasRegion($Scene)
     [DeliciumWindowTest]::Click($checkX, $checkY)
     $deadline = [DateTime]::Now.AddSeconds(3)
-    while ([DeliciumWindowTest]::PassesThrough($Scene) -eq $wasPassing -and [DateTime]::Now -lt $deadline) { Start-Sleep -Milliseconds 50 }
-    Assert-Test ([DeliciumWindowTest]::PassesThrough($Scene) -ne $wasPassing) 'Click-through toggle reaches the scene window'
+    while ([DeliciumWindowTest]::HasRegion($Scene) -eq $hadRegion -and [DateTime]::Now -lt $deadline) { Start-Sleep -Milliseconds 50 }
+    Assert-Test ([DeliciumWindowTest]::HasRegion($Scene) -ne $hadRegion) 'Hit-region toggle reaches the scene window'
+    Assert-Test (-not [DeliciumWindowTest]::PassesThrough($Scene)) 'Input mode did not fall back to whole-window pass-through'
     Start-Sleep -Milliseconds 150
 }
 
-[void][DeliciumWindowTest]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
+if ([DeliciumWindowTest]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) -eq [IntPtr]::Zero) { throw 'Cannot enable physical-pixel DPI coordinates' }
 $cursor = [DeliciumWindowTest+Point]::new()
-[void][DeliciumWindowTest]::GetCursorPos([ref]$cursor)
+if (-not [DeliciumWindowTest]::GetCursorPos([ref]$cursor)) { throw 'Cannot save the cursor position before testing' }
 $process = $null
 $scene = [IntPtr]::Zero
+$mouseDown = $false
 try {
     # Hide the app's own console window: it is product noise, not overlay
     # under test, and a visible one can cover the scene corner during capture.
-    $process = Start-Process -FilePath $Executable -ArgumentList '--exit-after', '120' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError (Join-Path $run 'stderr.log')
+    $process = Start-Process -FilePath $Executable -ArgumentList '--overlay-size', '960x640', '--no-wander', '--exit-after', '120' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError (Join-Path $run 'stderr.log')
     $deadline = [DateTime]::Now.AddSeconds(15)
     do {
         if ($process.HasExited) { throw "Delicium exited before windows became ready; see $run" }
@@ -243,18 +272,30 @@ try {
     Start-Sleep -Milliseconds 700
     [DeliciumWindowTest]::Capture($scene, $controls, $backdrop, (Join-Path $run 'scene-later.png'))
 
+    Assert-Test ([DeliciumWindowTest]::HasRegion($scene)) 'Character hit regions are enabled by default'
+    Assert-Test (-not [DeliciumWindowTest]::PassesThrough($scene)) 'Default mode does not make the whole scene click-through'
     $actorX = $rectangle.Left + [int]((0.5 - 2.4 / (4.5 * $rectangle.Width / $rectangle.Height)) * $rectangle.Width)
     $actorY = $rectangle.Top + [int]((3.6 - 0.15) / 4.5 * $rectangle.Height)
+    $emptyX = $rectangle.Right - 40
+    $emptyY = $rectangle.Bottom - 40
+    [DeliciumWindowTest]::EmptyArea($first, ($rectangle.Width - 40), ($rectangle.Height - 40))
+    Assert-Test ([DeliciumWindowTest]::Hit($emptyX, $emptyY) -eq $backdrop) 'Empty-area probe belongs to the owned backdrop'
+    $before = [DeliciumBackdrop]::Clicks
+    [DeliciumWindowTest]::Click($emptyX, $emptyY)
+    Start-Sleep -Milliseconds 200
+    Assert-Test ([DeliciumBackdrop]::Clicks -eq ($before + 1)) 'Pixel mode delivers an empty-area click to the owned backdrop'
+    Assert-Test ([DeliciumWindowTest]::Hit($actorX, $actorY) -eq $scene) 'Character anchor belongs to the scene'
     $before = [DeliciumBackdrop]::Clicks
     [DeliciumWindowTest]::Click($actorX, $actorY)
     Start-Sleep -Milliseconds 200
-    Assert-Test ([DeliciumBackdrop]::Clicks -gt $before) 'Enabled click-through delivers a physical click to the owned backdrop'
+    Assert-Test ([DeliciumBackdrop]::Clicks -eq $before) 'Pixel mode keeps a character click inside the scene'
 
     Toggle-SceneInput $controls $scene
+    Assert-Test ([DeliciumWindowTest]::Hit($emptyX, $emptyY) -eq $scene) 'Interactive mode intercepts the empty-area probe'
     $before = [DeliciumBackdrop]::Clicks
-    [DeliciumWindowTest]::Click($actorX, $actorY)
+    [DeliciumWindowTest]::Click($emptyX, $emptyY)
     Start-Sleep -Milliseconds 200
-    Assert-Test ([DeliciumBackdrop]::Clicks -eq $before) 'Disabled click-through intercepts a physical character click'
+    Assert-Test ([DeliciumBackdrop]::Clicks -eq $before) 'Interactive mode intercepts an empty-area click'
 
     $controlRectangle = [DeliciumWindowTest]::Client($controls)
     [DeliciumWindowTest]::Move($controls, $rectangle.Right - $controlRectangle.Width - 24, $rectangle.Top + 30)
@@ -263,10 +304,16 @@ try {
     [DeliciumWindowTest]::Click($actorX, $actorY)
     Start-Sleep -Milliseconds 200
     Toggle-SceneInput $controls $scene
+    # The overlapping control window covers the lower-right probe; use the
+    # verified empty upper-left area instead, never click through controls.
+    [DeliciumWindowTest]::EmptyArea($first, 40, 40)
+    $overlapEmptyX = $rectangle.Left + 40
+    $overlapEmptyY = $rectangle.Top + 40
+    Assert-Test ([DeliciumWindowTest]::Hit($overlapEmptyX, $overlapEmptyY) -eq $backdrop) 'Overlapping-mode empty probe belongs to the owned backdrop'
     $before = [DeliciumBackdrop]::Clicks
-    [DeliciumWindowTest]::Click($actorX, $actorY)
+    [DeliciumWindowTest]::Click($overlapEmptyX, $overlapEmptyY)
     Start-Sleep -Milliseconds 200
-    Assert-Test ([DeliciumBackdrop]::Clicks -gt $before) 'Overlapping controls can restore click-through after scene focus'
+    Assert-Test ([DeliciumBackdrop]::Clicks -eq ($before + 1)) 'Overlapping controls restore pixel mode after scene focus'
 
     # ---- GUI coverage: drag, add, reload, remove, typed load, failure preserved ----
     # Drives the control window with physical clicks and the scene with a real
@@ -340,9 +387,10 @@ try {
         [DeliciumWindowTest]::Key(0x11, $true);  Start-Sleep -Milliseconds 250
     }
 
-    # Drag: the overlay must receive mouse input, so disable click-through
-    # first (this is the third toggle overall; it starts enabled here).
+    # Keep the existing full-scene drag coverage; the dedicated pixel-hit
+    # harness separately verifies dragging directly in the default mode.
     Toggle-SceneInput $controls $scene
+    Assert-Test (-not [DeliciumWindowTest]::HasRegion($scene)) 'Third toggle enters full-scene interactive mode'
     Start-Sleep -Milliseconds 250
     $sceneRectangle = [DeliciumWindowTest]::Client($scene)
     $probe = Join-Path $run 'scene-drag-before.png'
@@ -367,6 +415,7 @@ try {
     $dragBaseline = Count-Log 'drag start instance='
     [void][DeliciumWindowTest]::SetCursorPos($anchorX, $anchorY)
     Start-Sleep -Milliseconds 150
+    $mouseDown = $true
     [DeliciumWindowTest]::Mouse(2)
     Start-Sleep -Milliseconds 180
     foreach ($step in 1..8) {
@@ -374,6 +423,7 @@ try {
         Start-Sleep -Milliseconds 45
     }
     [DeliciumWindowTest]::Mouse(4)
+    $mouseDown = $false
     Start-Sleep -Milliseconds 350
     Assert-Test ((Count-Log 'drag start instance=') -gt $dragBaseline) 'Pressing a character starts a drag'
     Assert-Test ((Count-Log 'drag release instance=') -gt $dragBaseline) 'Releasing the press completes the drag'
@@ -427,12 +477,17 @@ try {
     Click-Control 169 ($field.LogicalY - 48) 'Remove selected'
     Assert-Test (Wait-Increase 'remove instance=1\b' $removeBaseline 1 4000) 'Remove selected removes the character that survived the failed replace'
 
+    Assert-Test ((Count-Log 'hit_region mode=fallback') -eq 0) 'All GUI coverage completed without hit-region fallback'
     Write-Output ('WINDOWS_RESULT pass=true artifacts=' + $run)
 } finally {
-    [DeliciumBackdrop]::Shut()
-    if ($process -and -not $process.HasExited) {
-        if ($scene -ne [IntPtr]::Zero) { [void][DeliciumWindowTest]::PostMessage($scene, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
-        if (-not $process.WaitForExit(1500)) { Stop-Process -Id $process.Id -Force -Confirm:$false }
+    try {
+        if ($mouseDown) { [DeliciumWindowTest]::Mouse(4) }
+        [DeliciumBackdrop]::Shut()
+        if ($process -and -not $process.HasExited) {
+            if ($scene -ne [IntPtr]::Zero) { [void][DeliciumWindowTest]::PostMessage($scene, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
+            if (-not $process.WaitForExit(1500)) { Stop-Process -Id $process.Id -Force -Confirm:$false }
+        }
+    } finally {
+        [void][DeliciumWindowTest]::SetCursorPos($cursor.X, $cursor.Y)
     }
-    [void][DeliciumWindowTest]::SetCursorPos($cursor.X, $cursor.Y)
 }
