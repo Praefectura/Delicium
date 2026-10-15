@@ -5,6 +5,7 @@ edition = "2024"
 description = "A Windows desktop character runtime with native 2D and 3D models"
 
 [dependencies]
+base64 = "=0.22.1"
 bevy_ecs = { version = "0.20", default-features = false, features = ["std", "multi_threaded"] }
 bevy_tasks = { version = "0.20", features = ["multi_threaded"] }
 bytemuck = { version = "1.25", features = ["derive"] }
@@ -15,14 +16,12 @@ env_logger = "0.11"
 glam = "0.34"
 log = "0.4"
 pollster = "1.0"
+png = "=0.18.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 wgpu = "30.0"
 winit = "0.30"
-
-[dev-dependencies]
-png = "0.18"
 
 [profile.release]
 lto = "thin"
