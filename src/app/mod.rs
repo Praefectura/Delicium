@@ -165,6 +165,63 @@ struct HitRegionCache {
     /// an order that never widens input interception on the way.
     click_through: bool,
     failed: bool,
+    /// Consecutive frames whose fresh geometry differed from the installed
+    /// baseline without being installed (the install-throttle counter).
+    dirty_frames: u32,
+    /// The next changed frame installs regardless of the cadence. Set by the
+    /// drag restore so a released character never runs on an empty region.
+    force_install: bool,
+}
+
+/// Frames between installs under sustained change, by current polygon count.
+///
+/// The installed region may lag the silhouette by up to `cadence - 1` dirty
+/// frames; `region_cadence` is 1 below 2048 polygons, so the desktop
+/// (four instances, ~650 polygons) and every GUI acceptance script keep the
+/// historical install-every-changed-frame behavior. The thresholds sit well
+/// clear of the measured polygon counts (648 / 2616 / 5232 / 10512), so a
+/// resize that shifts the geometry slightly cannot flap between tiers.
+fn region_cadence(polygons: usize) -> u32 {
+    if polygons < 2048 {
+        1
+    } else if polygons < 8192 {
+        2
+    } else {
+        4
+    }
+}
+
+impl HitRegionCache {
+    /// The fresh geometry matches the installed baseline: nothing to deliver,
+    /// so the throttle no longer owes an install.
+    fn note_unchanged(&mut self) {
+        self.dirty_frames = 0;
+    }
+
+    /// The fresh geometry differs from the installed baseline. Returns
+    /// `true` when this frame should install, `false` when the cadence
+    /// defers the delivery. A `true` does not reset the counter; only
+    /// [`Self::note_installed`] does, so a failed install keeps owing.
+    fn note_changed(&mut self, polygons: usize) -> bool {
+        let cadence = if self.force_install {
+            1
+        } else {
+            region_cadence(polygons)
+        };
+        if self.dirty_frames + 1 >= cadence {
+            true
+        } else {
+            self.dirty_frames += 1;
+            false
+        }
+    }
+
+    /// An install succeeded: the delivered geometry is the new baseline, so
+    /// the owed install and any forced pass are both consumed.
+    fn note_installed(&mut self) {
+        self.dirty_frames = 0;
+        self.force_install = false;
+    }
 }
 
 #[derive(Default)]
@@ -232,6 +289,8 @@ impl Application {
                 geometry: None,
                 click_through: false,
                 failed: false,
+                dirty_frames: 0,
+                force_install: false,
             },
             started: now,
             last_frame: now,
@@ -707,9 +766,12 @@ impl Application {
                     RegionMode::Interactive
                 };
                 // An explicit mode switch clears the fallback latch, so a
-                // failed mode can be retried, unlike the per-frame path.
+                // failed mode can be retried, unlike the per-frame path. The
+                // throttle state resets with the baseline it belongs to.
                 self.hit_region.failed = false;
                 self.hit_region.geometry = None;
+                self.hit_region.dirty_frames = 0;
+                self.hit_region.force_install = false;
                 self.hit_region.mode = target;
                 self.end_drag();
                 self.drag_region = None;
@@ -1239,10 +1301,21 @@ impl Application {
             sample.polygons = geometry.polygons().len();
         }
         if unchanged {
+            self.hit_region.note_unchanged();
             if let Some(sample) = &mut self.scene_sample {
                 sample.region = RegionDecision::Reused;
             }
             log::trace!("hit_region mode=pixel unchanged");
+            return Ok(());
+        }
+        if !self.hit_region.note_changed(geometry.polygons().len()) {
+            if let Some(sample) = &mut self.scene_sample {
+                sample.region = RegionDecision::Deferred;
+            }
+            log::trace!(
+                "hit_region mode=pixel deferred dirty_frames={}",
+                self.hit_region.dirty_frames
+            );
             return Ok(());
         }
         if let Err(error) = self.install_pixel_geometry(geometry) {
@@ -1279,6 +1352,7 @@ impl Application {
         let count = geometry.polygons().len();
         let first = self.hit_region.geometry.is_none();
         self.hit_region.geometry = Some(geometry);
+        self.hit_region.note_installed();
         if first {
             log::info!("hit_region mode=pixel polygons={count}");
         } else {
@@ -1298,6 +1372,8 @@ impl Application {
         // The installed region is dropped; the comparison baseline goes with
         // it, so the restore rebuilds instead of trusting stale geometry.
         self.hit_region.geometry = None;
+        self.hit_region.dirty_frames = 0;
+        self.hit_region.force_install = false;
         self.sync_hit_region_now()
     }
 
@@ -1322,13 +1398,19 @@ impl Application {
     }
 
     /// Restores the mode a drag suspended, on the first frame after the drag
-    /// ended (release, cursor leaving the overlay, or focus loss).
+    /// ended (release, cursor leaving the overlay, or focus loss). The next
+    /// changed frame installs immediately: a released character must never
+    /// run on the empty region or wait out the throttle.
     fn restore_region_after_drag(&mut self) {
         if self.dragging.is_none()
             && let Some(saved) = self.drag_region.take()
         {
             self.hit_region.mode = saved;
             self.hit_region.geometry = None;
+            self.hit_region.dirty_frames = 0;
+            // `drag_region` is only ever `Some(Pixel)` (begin_region_drag
+            // guards on the mode), so the forced pass always lands.
+            self.hit_region.force_install = true;
         }
     }
 
@@ -1388,6 +1470,8 @@ impl Application {
         self.hit_region.mode = RegionMode::Fallback;
         self.hit_region.failed = true;
         self.hit_region.geometry = None;
+        self.hit_region.dirty_frames = 0;
+        self.hit_region.force_install = false;
         self.end_drag();
         self.drag_region = None;
         if first && self.ui.pixel_hittest {
@@ -1837,5 +1921,96 @@ mod tests {
         layers[0][0][0] += 0.5;
         app.observe_smoke_frame(&frame);
         assert!(app.smoke.pose_changed);
+    }
+
+    #[test]
+    fn region_cadence_maps_measured_polygon_counts_to_k() {
+        assert_eq!(region_cadence(0), 1);
+        assert_eq!(region_cadence(648), 1);
+        assert_eq!(region_cadence(2047), 1);
+        assert_eq!(region_cadence(2048), 2);
+        assert_eq!(region_cadence(2616), 2);
+        assert_eq!(region_cadence(5232), 2);
+        assert_eq!(region_cadence(8191), 2);
+        assert_eq!(region_cadence(8192), 4);
+        assert_eq!(region_cadence(10512), 4);
+    }
+
+    #[test]
+    fn install_throttle_defers_until_k_dirty_frames() {
+        let mut cache = HitRegionCache {
+            mode: RegionMode::Pixel,
+            geometry: None,
+            click_through: false,
+            failed: false,
+            dirty_frames: 0,
+            force_install: false,
+        };
+        // K=4 (10512 polygons): three dirty frames defer, the fourth installs.
+        assert!(!cache.note_changed(10512));
+        assert_eq!(cache.dirty_frames, 1);
+        assert!(!cache.note_changed(10512));
+        assert!(!cache.note_changed(10512));
+        assert!(cache.note_changed(10512));
+        assert_eq!(cache.dirty_frames, 3);
+        cache.note_installed();
+        assert_eq!(cache.dirty_frames, 0);
+        // K=2 (2616 polygons): one defer, then install.
+        assert!(!cache.note_changed(2616));
+        assert!(cache.note_changed(2616));
+        // K=1 (648 polygons): every changed frame installs, as before.
+        cache.note_installed();
+        assert!(cache.note_changed(648));
+        cache.note_installed();
+        assert!(cache.note_changed(648));
+    }
+
+    #[test]
+    fn unchanged_frames_reset_the_throttle_counter() {
+        let mut cache = HitRegionCache {
+            mode: RegionMode::Pixel,
+            geometry: None,
+            click_through: false,
+            failed: false,
+            dirty_frames: 0,
+            force_install: false,
+        };
+        assert!(!cache.note_changed(2616));
+        assert_eq!(cache.dirty_frames, 1);
+        cache.note_unchanged();
+        assert_eq!(cache.dirty_frames, 0);
+        // The K=2 sequence restarts instead of installing immediately.
+        assert!(!cache.note_changed(2616));
+        assert!(cache.note_changed(2616));
+    }
+
+    #[test]
+    fn forced_install_bypasses_the_cadence_once() {
+        let mut cache = HitRegionCache {
+            mode: RegionMode::Pixel,
+            geometry: None,
+            click_through: false,
+            failed: false,
+            dirty_frames: 0,
+            force_install: true,
+        };
+        // K=4 would defer, but a forced pass installs on the first frame.
+        assert!(cache.note_changed(10512));
+        cache.note_installed();
+        assert!(!cache.force_install);
+        // The one-shot is consumed: the next dirty frame defers again.
+        assert!(!cache.note_changed(10512));
+    }
+
+    #[test]
+    fn drag_restore_forces_the_next_pixel_install() {
+        let (mut app, _, _) = application_with_character();
+        app.drag_region = Some(RegionMode::Pixel);
+        app.hit_region.dirty_frames = 2;
+        app.restore_region_after_drag();
+        assert_eq!(app.hit_region.mode, RegionMode::Pixel);
+        assert!(app.hit_region.geometry.is_none());
+        assert_eq!(app.hit_region.dirty_frames, 0);
+        assert!(app.hit_region.force_install);
     }
 }

@@ -49,6 +49,9 @@ pub(super) enum RegionDecision {
     #[default]
     NotUsed,
     Reused,
+    /// The fresh geometry differed from the installed baseline, but the
+    /// install throttle deferred the delivery to a later frame.
+    Deferred,
     Rebuilt,
     Failed,
 }
@@ -539,6 +542,7 @@ impl Benchmark {
         let mut dropped_steps = 0_u64;
         let mut rebuilt = 0_u64;
         let mut reused = 0_u64;
+        let mut deferred = 0_u64;
         let mut failed = 0_u64;
         let mut polygon_max = 0;
         let mut skip_reasons = serde_json::Map::new();
@@ -558,6 +562,7 @@ impl Benchmark {
             match sample.region {
                 RegionDecision::Rebuilt => rebuilt += 1,
                 RegionDecision::Reused => reused += 1,
+                RegionDecision::Deferred => deferred += 1,
                 RegionDecision::Failed => failed += 1,
                 RegionDecision::NotUsed => {}
             }
@@ -603,7 +608,7 @@ impl Benchmark {
             "scene": { "attempts": samples.len(), "submitted": submitted, "skipped": skipped, "errors": errors,
                 "submitted_per_second": if seconds > 0.0 { submitted as f64 / seconds } else { 0.0 }, "skip_reasons": skip_reasons },
             "simulation": { "steps": steps, "dropped_steps": dropped_steps },
-            "regions": { "rebuilt": rebuilt, "reused": reused, "failed": failed, "polygon_max": polygon_max },
+            "regions": { "rebuilt": rebuilt, "reused": reused, "deferred": deferred, "failed": failed, "polygon_max": polygon_max },
             "stages": stages,
             "reloads": { "requested": self.requested, "successful": self.successful,
                 "render_confirmed": self.confirmed, "expected": self.options.reloads.unwrap_or(0) },
