@@ -183,6 +183,16 @@ mod win32 {
     #[link(name = "gdi32")]
     unsafe extern "system" {
         fn CreatePolygonRgn(points: *const Point, count: i32, fill_mode: i32) -> Hrgn;
+        /// One region from many polygons in a single call: `points` holds all
+        /// polygons end to end, `counts[i]` is the point count of polygon `i`,
+        /// and `polygons` is the number of polygons.
+        #[cfg(test)]
+        fn CreatePolyPolygonRgn(
+            points: *const Point,
+            counts: *const i32,
+            polygons: i32,
+            fill_mode: i32,
+        ) -> Hrgn;
         fn CreateRectRgn(x1: i32, y1: i32, x2: i32, y2: i32) -> Hrgn;
         fn CombineRgn(destination: Hrgn, source1: Hrgn, source2: Hrgn, mode: i32) -> i32;
         fn DeleteObject(object: *mut c_void) -> i32;
@@ -252,9 +262,10 @@ mod win32 {
         GdiRegion::from_raw(region, "CreateRectRgn")
     }
 
-    /// One polygon as a winding-fill GDI region; malformed input is rejected
-    /// rather than silently replaced by something else.
-    fn polygon_region(points: &[[i32; 2]]) -> Result<GdiRegion, String> {
+    /// Validates one polygon: at least three points, a point count GDI
+    /// accepts, and every coordinate inside the signed 27-bit GDI range.
+    /// Returns the point count as the `i32` GDI expects.
+    fn validate_polygon(points: &[[i32; 2]]) -> Result<i32, String> {
         if points.len() < 3 {
             return Err(format!(
                 "A hit region polygon needs at least 3 points, got {}",
@@ -267,7 +278,6 @@ mod win32 {
                 points.len()
             )
         })?;
-        let mut native = Vec::with_capacity(points.len());
         for point in points {
             if point[0] < GDI_MIN_COORD
                 || point[0] > GDI_MAX_COORD
@@ -279,11 +289,24 @@ mod win32 {
                     point[0], point[1]
                 ));
             }
-            native.push(Point {
-                x: point[0],
-                y: point[1],
-            });
         }
+        Ok(count)
+    }
+
+    /// Appends validated points to `native` in the native `POINT` layout.
+    fn push_native_points(points: &[[i32; 2]], native: &mut Vec<Point>) {
+        native.extend(points.iter().map(|point| Point {
+            x: point[0],
+            y: point[1],
+        }));
+    }
+
+    /// One polygon as a winding-fill GDI region; malformed input is rejected
+    /// rather than silently replaced by something else.
+    fn polygon_region(points: &[[i32; 2]]) -> Result<GdiRegion, String> {
+        let count = validate_polygon(points)?;
+        let mut native = Vec::with_capacity(points.len());
+        push_native_points(points, &mut native);
         #[cfg(test)]
         if region_tests::fail_call(region_tests::Call::Polygon) {
             return GdiRegion::from_raw(core::ptr::null_mut(), "CreatePolygonRgn");
@@ -321,6 +344,103 @@ mod win32 {
         // Dropping both sources deletes them; the fresh destination holds
         // their union.
         Ok(destination)
+    }
+
+    /// Process-side cap on the total point count of one batched region.
+    ///
+    /// It is a fail-fast guard far above the measured workload (~72k points
+    /// at 64 instances) and far below any batch whose `POINT` buffer could
+    /// exhaust the process; the exact native region limits are not documented
+    /// and, when exceeded, surface as a null `CreatePolyPolygonRgn` that this
+    /// module turns into a fail-closed error (the caller falls back). The
+    /// probe additionally measured that a batch whose geometry spans >= 2^24
+    /// on the y axis is rejected the same fail-closed way, while the x axis
+    /// and single polygons carry no such limit; the batch path is experimental
+    /// (see `poly_poly_batch_probe`) and not used by production.
+    #[cfg(test)]
+    const MAX_BATCH_POINTS: usize = 1 << 22;
+
+    /// Twice the signed area of a polygon (shoelace); the sign follows
+    /// winding. `i128` keeps the sum exact across the full GDI coordinate
+    /// range and any batch size.
+    #[cfg(test)]
+    fn signed_area_twice(points: &[[i32; 2]]) -> i128 {
+        let mut sum = 0_i128;
+        for (index, &[x, y]) in points.iter().enumerate() {
+            let [next_x, next_y] = points[(index + 1) % points.len()];
+            sum += i128::from(x) * i128::from(next_y) - i128::from(next_x) * i128::from(y);
+        }
+        sum
+    }
+
+    /// Validates and flattens `polygons` for a single `CreatePolyPolygonRgn`
+    /// call: returns the native point array, each polygon's point count, and
+    /// the polygon count. Every polygon is validated first, so a malformed
+    /// batch is rejected before any native call.
+    ///
+    /// Point order is normalized to one winding direction: under the winding
+    /// fill rule a point covered by `k` same-winding polygons fills with
+    /// winding `k >= 1`, so the batch fill is the union of the polygons.
+    /// Reversing a polygon mirrors the sign of its winding numbers everywhere
+    /// without changing where they are zero, so normalization never moves an
+    /// edge of the polygon's own filled area.
+    #[cfg(test)]
+    fn batch_points(polygons: &[Vec<[i32; 2]>]) -> Result<(Vec<Point>, Vec<i32>, i32), String> {
+        let mut total_points = 0_usize;
+        let mut counts = Vec::with_capacity(polygons.len());
+        for polygon in polygons {
+            let count = validate_polygon(polygon)?;
+            counts.push(count);
+            total_points += polygon.len();
+        }
+        if total_points > MAX_BATCH_POINTS {
+            return Err(format!(
+                "Hit region batch has {total_points} points, more than GDI accepts in one region"
+            ));
+        }
+        let polygon_count = i32::try_from(polygons.len()).map_err(|_| {
+            format!(
+                "Hit region batch has {} polygons, more than GDI accepts",
+                polygons.len()
+            )
+        })?;
+        let mut native = Vec::with_capacity(total_points);
+        for polygon in polygons {
+            if signed_area_twice(polygon) < 0 {
+                native.extend(polygon.iter().rev().map(|point| Point {
+                    x: point[0],
+                    y: point[1],
+                }));
+            } else {
+                push_native_points(polygon, &mut native);
+            }
+        }
+        Ok((native, counts, polygon_count))
+    }
+
+    /// One region from every polygon in a single `CreatePolyPolygonRgn` call,
+    /// or an empty region when there are none.
+    ///
+    /// See [`batch_points`] for validation and the winding-normalization
+    /// argument that makes the batch the exact union of the polygons.
+    #[cfg(test)]
+    fn batched_region(polygons: &[Vec<[i32; 2]>]) -> Result<GdiRegion, String> {
+        if polygons.is_empty() {
+            return empty_region();
+        }
+        let (native, counts, polygon_count) = batch_points(polygons)?;
+        #[cfg(test)]
+        if region_tests::fail_call(region_tests::Call::PolyPoly) {
+            return GdiRegion::from_raw(core::ptr::null_mut(), "CreatePolyPolygonRgn");
+        }
+        // SAFETY: `native` holds one initialized point per region vertex and
+        // `counts` one point count per polygon; both buffers stay alive for
+        // the call and `CreatePolyPolygonRgn` only reads them. Coordinates,
+        // counts and the batch size were validated above.
+        let region = unsafe {
+            CreatePolyPolygonRgn(native.as_ptr(), counts.as_ptr(), polygon_count, WINDING)
+        };
+        GdiRegion::from_raw(region, "CreatePolyPolygonRgn")
     }
 
     /// The union of all polygons, or an empty region when there are none.
@@ -485,13 +605,14 @@ mod win32 {
             Polygon,
             Empty,
             Union,
+            PolyPoly,
         }
 
         #[derive(Clone, Copy, Default)]
         struct State {
             live: usize,
             peak: usize,
-            calls: [usize; 3],
+            calls: [usize; 4],
             failure: Option<(Call, usize)>,
         }
 
@@ -713,6 +834,647 @@ mod win32 {
             assert_ne!(deleted, 0);
             assert_eq!(live_after_transfer, 0);
             assert_eq!(state().live, 0);
+        }
+
+        /// Phase-0 decision-gate probe for the batched (single-call) region
+        /// install.
+        ///
+        /// Run explicitly, in release, with output:
+        /// `cargo test --release --locked --offline --lib platform -- --ignored --nocapture`
+        ///
+        /// Outcome (2026-10-15, evidence `.artifacts/perf-batch-20261015-230238/`):
+        /// the whole-frame single `CreatePolyPolygonRgn` is rejected — 11.5x
+        /// slower than the balanced fold at 10512 polygons and superlinear in
+        /// the batch's polygon count — while one batch per instance
+        /// (~164 polygons) measured 0.60x of the production-ordered balanced
+        /// fold with exact equivalence. Boundaries observed: multi-polygon
+        /// batches reject a y-spread >= 2^24 (fail-closed), and ~10512
+        /// simultaneously live regions exceed the process GDI handle quota.
+        /// The probe stays as the reproduction harness for the per-instance
+        /// follow-up; it never rides along with the regular suite (ignored),
+        /// asserts only the exactness of the batch (hard failure), and prints
+        /// the timing evidence for the decision made outside the test.
+        #[test]
+        #[ignore = "phase-0 micro-benchmark; run explicitly with --ignored"]
+        fn poly_poly_batch_probe() {
+            use std::time::{Duration, Instant};
+
+            fn time(mut work: impl FnMut()) -> Duration {
+                let start = Instant::now();
+                work();
+                start.elapsed()
+            }
+
+            /// Andrew's monotone chain hull (probe-local); returns the convex
+            /// hull with collinear points removed.
+            fn hull(points: &mut Vec<[i32; 2]>) -> Vec<[i32; 2]> {
+                points.sort();
+                points.dedup();
+                if points.len() <= 2 {
+                    return points.clone();
+                }
+                let cross = |o: [i32; 2], a: [i32; 2], b: [i32; 2]| -> i64 {
+                    let abx = i64::from(a[0]) - i64::from(o[0]);
+                    let aby = i64::from(a[1]) - i64::from(o[1]);
+                    let acx = i64::from(b[0]) - i64::from(o[0]);
+                    let acy = i64::from(b[1]) - i64::from(o[1]);
+                    abx * acy - aby * acx
+                };
+                let mut out: Vec<[i32; 2]> = Vec::with_capacity(points.len() * 2);
+                for &point in points.iter() {
+                    while out.len() >= 2
+                        && cross(out[out.len() - 2], out[out.len() - 1], point) <= 0
+                    {
+                        out.pop();
+                    }
+                    out.push(point);
+                }
+                let threshold = out.len() + 1;
+                for &point in points.iter().rev().skip(1) {
+                    while out.len() >= threshold
+                        && cross(out[out.len() - 2], out[out.len() - 1], point) <= 0
+                    {
+                        out.pop();
+                    }
+                    out.push(point);
+                }
+                out.pop();
+                out
+            }
+
+            /// ~10512 convex 5..=8-point polygons (the measured 64-instance
+            /// polygon count) clustered like 64 character instances over a
+            /// monitor-sized area; deterministic LCG as in the stress test.
+            fn probe_fixture() -> Vec<Vec<[i32; 2]>> {
+                let mut seed = 20_261_015_u32;
+                let mut next = move || {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    seed
+                };
+                let mut polygons = Vec::with_capacity(10_512);
+                for index in 0..10_512_usize {
+                    let cluster = index % 64;
+                    let cx = ((cluster % 8) as i32) * 200 + (next() % 60) as i32;
+                    let cy = ((cluster / 8) as i32) * 125 + (next() % 40) as i32;
+                    // First three points span a guaranteed non-degenerate
+                    // triangle ((30+)*(30+)) − 20*20 ≥ 500 > 0), the rest are
+                    // jittered inside the cluster.
+                    let mut points = vec![
+                        [cx, cy],
+                        [cx + 30 + (next() % 15) as i32, cy + (next() % 20) as i32],
+                        [cx + (next() % 20) as i32, cy + 30 + (next() % 15) as i32],
+                    ];
+                    for _ in 3..5 + (next() % 4) {
+                        points.push([cx + (next() % 41) as i32, cy + (next() % 41) as i32]);
+                    }
+                    polygons.push(hull(&mut points));
+                }
+                polygons
+            }
+
+            fn pcts(mut samples: Vec<Duration>) -> (f64, f64) {
+                samples.sort();
+                let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                let p50 = ms(samples[samples.len() / 2]);
+                let p95 = {
+                    let index = (samples.len() * 95 / 100).min(samples.len() - 1);
+                    ms(samples[index])
+                };
+                (p50, p95)
+            }
+
+            reset();
+            let fixture = probe_fixture();
+            let total_points: usize = fixture.iter().map(Vec::len).sum();
+            println!(
+                "PROBE fixture polygons={} points={} avg_points={:.2}",
+                fixture.len(),
+                total_points,
+                total_points as f64 / fixture.len() as f64
+            );
+
+            // Hard assert: the single-call batch is the exact same region as
+            // the independent sequential oracle, for the probe fixture and
+            // for small adversarial cases (rotation, reversal, mixed winding,
+            // degenerate polygons, extreme coordinates). Every case is
+            // attempted and reported before failing, so one run maps the whole
+            // incompatibility surface.
+            {
+                let square = rectangle(0, 0, 10, 10);
+                let concave = vec![
+                    [0, 0],
+                    [10, 0],
+                    [10, 30],
+                    [30, 30],
+                    [30, 0],
+                    [40, 0],
+                    [40, 40],
+                    [0, 40],
+                ];
+                let mut mixed_winding = rectangle(5, 5, 10, 10);
+                mixed_winding.reverse();
+                let mut small = vec![
+                    vec![],
+                    vec![square.clone()],
+                    vec![
+                        square.clone(),
+                        rectangle(5, 5, 10, 10),
+                        rectangle(10, 0, 10, 10),
+                    ],
+                    vec![concave, rectangle(50, 50, 10, 10)],
+                    vec![
+                        vec![[0, 0], [1, 30], [0, 30]],
+                        vec![[1, 0], [2, 30], [1, 30]],
+                    ],
+                    // Collinear triple and three identical points: no area.
+                    vec![vec![[0, 0], [1, 1], [2, 2]], vec![[0, 0], [0, 0], [0, 0]]],
+                    // Both GDI coordinate range corners, one corner per case:
+                    // a single batch rejects the full-range spread of mixing
+                    // both corners (see the acceptance lab below), so each
+                    // pair keeps its spread small while still covering the
+                    // extreme coordinates.
+                    vec![
+                        rectangle(GDI_MIN_COORD, GDI_MIN_COORD, 16, 16),
+                        rectangle(GDI_MIN_COORD + 32, GDI_MIN_COORD + 32, 16, 16),
+                    ],
+                    vec![
+                        rectangle(GDI_MAX_COORD - 16, GDI_MAX_COORD - 16, 16, 16),
+                        rectangle(GDI_MAX_COORD - 32, GDI_MAX_COORD - 32, 16, 16),
+                    ],
+                    // Mixed winding: raw WINDING fill would cancel in the
+                    // overlap; canonicalization must keep the union.
+                    vec![square.clone(), mixed_winding],
+                ];
+                /// Probes one arrangement: batch vs sequential oracle. A
+                /// failure is recorded, not panicked, so one run maps the whole
+                /// incompatibility surface; a failing arrangement reports
+                /// growth-prefix verdicts (and, when small, per-polygon
+                /// verdicts through both paths) to find the minimal failing
+                /// sub-batch.
+                fn probe_arrangement(
+                    index: usize,
+                    label: &str,
+                    polygons: &[Vec<[i32; 2]>],
+                    failures: &mut Vec<String>,
+                ) {
+                    let total_points: usize = polygons.iter().map(Vec::len).sum();
+                    let verdict = batched_region(polygons).and_then(|batched| {
+                        let sequential = unified_region_sequential(polygons)?;
+                        regions_equal(&batched, &sequential)
+                    });
+                    let summary = match &verdict {
+                        Ok(true) => "equivalence=OK".to_owned(),
+                        Ok(false) => "equivalence=DIFF".to_owned(),
+                        Err(error) => format!("error={error}"),
+                    };
+                    println!(
+                        "PROBE case={index} {label} polygons={} points={total_points} {summary}",
+                        polygons.len()
+                    );
+                    match &verdict {
+                        Ok(true) => return,
+                        Ok(false) => {
+                            failures.push(format!("case={index} {label}: regions differ"));
+                        }
+                        Err(error) => {
+                            failures.push(format!("case={index} {label}: {error}"));
+                        }
+                    }
+                    let mut step = 1_usize;
+                    let mut sweep = Vec::new();
+                    while step < polygons.len() {
+                        sweep.push(step);
+                        step *= 2;
+                    }
+                    sweep.push(polygons.len());
+                    for prefix in sweep {
+                        let sub = &polygons[..prefix];
+                        let points: usize = sub.iter().map(Vec::len).sum();
+                        let verdict = match batched_region(sub) {
+                            Ok(region) => {
+                                drop(region);
+                                "ok".to_owned()
+                            }
+                            Err(error) => format!("Err: {error}"),
+                        };
+                        println!("PROBE case={index} prefix={prefix} points={points} -> {verdict}");
+                    }
+                    if polygons.len() <= 16 {
+                        for (position, polygon) in polygons.iter().enumerate() {
+                            let single = std::slice::from_ref(polygon);
+                            let batch = match batched_region(single) {
+                                Ok(region) => {
+                                    drop(region);
+                                    "ok".to_owned()
+                                }
+                                Err(error) => format!("Err: {error}"),
+                            };
+                            let sequential = match unified_region(single) {
+                                Ok(region) => {
+                                    drop(region);
+                                    "ok".to_owned()
+                                }
+                                Err(error) => format!("Err: {error}"),
+                            };
+                            println!(
+                                "PROBE case={index} polygon={position} points={} batch={batch} sequential={sequential}",
+                                polygon.len()
+                            );
+                        }
+                    }
+                }
+
+                let mut failures: Vec<String> = Vec::new();
+                for (index, polygons) in small.iter_mut().enumerate() {
+                    probe_arrangement(index, "raw", polygons.as_slice(), &mut failures);
+                    if !polygons.is_empty() {
+                        polygons.rotate_left(1);
+                        probe_arrangement(index, "rotated", polygons.as_slice(), &mut failures);
+                        for polygon in polygons.iter_mut() {
+                            polygon.reverse();
+                        }
+                        probe_arrangement(index, "reversed", polygons.as_slice(), &mut failures);
+                    }
+                }
+                probe_arrangement(small.len(), "fixture", fixture.as_slice(), &mut failures);
+                assert!(
+                    failures.is_empty(),
+                    "PROBE equivalence failures: {failures:#?}"
+                );
+                println!("PROBE equivalence=OK");
+
+                // Acceptance lab (print-only, no assertion): the batch call
+                // rejects some multi-polygon inputs that the sequential path
+                // unions fine, even though every polygon is individually
+                // acceptable. The probes narrow the condition (diagonal spread,
+                // x-only spread, y-only spread, full range). Production
+                // coordinates are window-local (a few thousand pixels), orders
+                // of magnitude below anything failing here, and a rejection is
+                // fail-closed (Err, never a wrong region).
+                let verdict = |result: Result<GdiRegion, String>| match result {
+                    Ok(region) => {
+                        drop(region);
+                        "ok"
+                    }
+                    Err(_) => "Err",
+                };
+                let side = |x: i32, y: i32| rectangle(x, y, 16, 16);
+                let min = GDI_MIN_COORD;
+                let lab_cases: Vec<(&str, Vec<Vec<[i32; 2]>>)> = vec![
+                    (
+                        "same-corner",
+                        vec![side(min, min), side(min + 48, min + 48)],
+                    ),
+                    (
+                        "diag-2^22",
+                        vec![side(min, min), side(min + (1 << 22), min + (1 << 22))],
+                    ),
+                    (
+                        "diag-2^23",
+                        vec![side(min, min), side(min + (1 << 23), min + (1 << 23))],
+                    ),
+                    (
+                        "diag-2^23+2^22",
+                        vec![
+                            side(min, min),
+                            side(min + (1 << 23) + (1 << 22), min + (1 << 23) + (1 << 22)),
+                        ],
+                    ),
+                    (
+                        "diag-2^24",
+                        vec![side(min, min), side(min + (1 << 24), min + (1 << 24))],
+                    ),
+                    (
+                        "span-x-2^25",
+                        vec![side(min, min), side(min + (1 << 25), min)],
+                    ),
+                    (
+                        "span-y-2^25",
+                        vec![side(min, min), side(min, min + (1 << 25))],
+                    ),
+                    (
+                        "span-x-2^26",
+                        vec![side(min, min), side(min + (1 << 26), min)],
+                    ),
+                    (
+                        "span-y-2^26",
+                        vec![side(min, min), side(min, min + (1 << 26))],
+                    ),
+                    (
+                        "full-range",
+                        vec![side(min, min), side(GDI_MAX_COORD - 16, GDI_MAX_COORD - 16)],
+                    ),
+                ];
+                for (label, pair) in &lab_cases {
+                    println!(
+                        "PROBE lab {label} batch={} sequential={}",
+                        verdict(batched_region(pair)),
+                        verdict(unified_region_sequential(pair))
+                    );
+                }
+                let huge = vec![rectangle(min, min, (1 << 27) - 48, 16)];
+                println!(
+                    "PROBE lab single-rect-full-range batched={} sequential={}",
+                    verdict(batched_region(&huge)),
+                    verdict(unified_region_sequential(&huge))
+                );
+            }
+
+            // Measured-what-we-claim: the timed runs must be the real paths.
+            for &count in &[2616_usize, 5232, 10512] {
+                reset();
+                drop(unified_region(&fixture[..count]).unwrap());
+                let stats = state();
+                assert_eq!(stats.calls[Call::Polygon as usize], count);
+                assert_eq!(stats.calls[Call::Union as usize], count - 1);
+                assert_eq!(stats.calls[Call::Empty as usize], count - 1);
+                assert_eq!(stats.live, 0);
+                reset();
+                drop(batched_region(&fixture[..count]).unwrap());
+                let stats = state();
+                assert_eq!(stats.calls[Call::PolyPoly as usize], 1);
+                assert_eq!(stats.calls[Call::Polygon as usize], 0);
+                assert_eq!(stats.calls[Call::Union as usize], 0);
+                assert_eq!(stats.calls[Call::Empty as usize], 0);
+                assert_eq!(stats.peak, 1);
+                assert_eq!(stats.live, 0);
+            }
+            reset();
+
+            const ROUNDS: usize = 20;
+            for &count in &[2616_usize, 5232, 10512] {
+                let polygons = &fixture[..count];
+                let mut balanced = Vec::with_capacity(ROUNDS);
+                let mut batched = Vec::with_capacity(ROUNDS);
+                // Warm both paths once (page-in, first-touch allocator effects).
+                drop(unified_region(polygons).unwrap());
+                drop(batched_region(polygons).unwrap());
+                for round in 0..ROUNDS {
+                    let run_balanced = || {
+                        time(|| {
+                            let region = unified_region(polygons).unwrap();
+                            drop(region);
+                        })
+                    };
+                    let run_batched = || {
+                        time(|| {
+                            let region = batched_region(polygons).unwrap();
+                            drop(region);
+                        })
+                    };
+                    if round % 2 == 0 {
+                        balanced.push(run_balanced());
+                        batched.push(run_batched());
+                    } else {
+                        batched.push(run_batched());
+                        balanced.push(run_balanced());
+                    }
+                }
+                let (balanced_p50, balanced_p95) = pcts(balanced);
+                let (batched_p50, batched_p95) = pcts(batched);
+                println!(
+                    "PROBE n={count} A_balanced p50={balanced_p50:.3}ms p95={balanced_p95:.3}ms"
+                );
+                println!(
+                    "PROBE n={count} B_batched  p50={batched_p50:.3}ms p95={batched_p95:.3}ms"
+                );
+                println!(
+                    "PROBE n={count} ratio p50={:.3} p95={:.3}",
+                    batched_p50 / balanced_p50,
+                    batched_p95 / balanced_p95
+                );
+            }
+
+            // Spatial-batching analysis (exploratory, print-only): the whole-
+            // fixture batch is superlinear in the polygon count, but a batch
+            // confined to one tight cluster may still pay off, since clusters
+            // have a small bounding box and few edges per scanline. Partition
+            // the fixture into K spatial groups (bands of its 8x8 cluster
+            // grid), time the K batch calls alone and with a carry-slot fold
+            // of the K regions, and check the folded region against the
+            // sequential oracle. K=1 is the B path already timed above.
+            fn cluster_groups(fixture: &[Vec<[i32; 2]>], groups: usize) -> Vec<Vec<Vec<[i32; 2]>>> {
+                let mut out: Vec<Vec<Vec<[i32; 2]>>> = (0..groups).map(|_| Vec::new()).collect();
+                for (index, polygon) in fixture.iter().enumerate() {
+                    // Fixture layout: polygon `index` belongs to cluster
+                    // `index % 64`; clusters form an 8x8 grid of 200x125 cells.
+                    out[(index % 64) / (64 / groups)].push(polygon.clone());
+                }
+                out
+            }
+
+            fn merge_regions(regions: Vec<GdiRegion>) -> Result<GdiRegion, String> {
+                let mut slots: [Option<GdiRegion>; usize::BITS as usize] =
+                    core::array::from_fn(|_| None);
+                for region in regions {
+                    let mut carry = region;
+                    let mut level = 0;
+                    while let Some(occupant) = slots[level].take() {
+                        carry = union_regions(occupant, carry)?;
+                        level += 1;
+                    }
+                    slots[level] = Some(carry);
+                }
+                let mut merged: Option<GdiRegion> = None;
+                for slot in &mut slots {
+                    let Some(region) = slot.take() else {
+                        continue;
+                    };
+                    merged = Some(match merged {
+                        Some(accumulated) => union_regions(accumulated, region)?,
+                        None => region,
+                    });
+                }
+                match merged {
+                    Some(region) => Ok(region),
+                    None => empty_region(),
+                }
+            }
+
+            let mut spatial_failures: Vec<usize> = Vec::new();
+            let oracle = unified_region_sequential(&fixture).unwrap();
+            const SPATIAL_ROUNDS: usize = 7;
+            for &group_count in &[16_usize, 64] {
+                let groups = cluster_groups(&fixture, group_count);
+                let mut batch_only = Vec::new();
+                let mut batch_merge = Vec::new();
+                let mut grouped_merge = Vec::new();
+                for _ in 0..SPATIAL_ROUNDS {
+                    batch_only.push(time(|| {
+                        let regions: Vec<GdiRegion> = groups
+                            .iter()
+                            .map(|group| batched_region(group).unwrap())
+                            .collect();
+                        drop(regions);
+                    }));
+                    batch_merge.push(time(|| {
+                        let regions: Vec<GdiRegion> = groups
+                            .iter()
+                            .map(|group| batched_region(group).unwrap())
+                            .collect();
+                        drop(merge_regions(regions).unwrap());
+                    }));
+                    // Grouped balanced: the same partition through the
+                    // per-polygon balanced path instead of one batch call, to
+                    // separate what the batch call saves from what the
+                    // partition alone (locality, fewer large merges) saves.
+                    grouped_merge.push(time(|| {
+                        let regions: Vec<GdiRegion> = groups
+                            .iter()
+                            .map(|group| unified_region(group).unwrap())
+                            .collect();
+                        drop(merge_regions(regions).unwrap());
+                    }));
+                }
+                let (only_p50, _) = pcts(batch_only);
+                let (batch_p50, _) = pcts(batch_merge);
+                let (grouped_p50, _) = pcts(grouped_merge);
+                let batch_merged = merge_regions(
+                    groups
+                        .iter()
+                        .map(|group| batched_region(group).unwrap())
+                        .collect(),
+                )
+                .unwrap();
+                let batch_equal = regions_equal(&batch_merged, &oracle).unwrap();
+                drop(batch_merged);
+                let grouped_merged = merge_regions(
+                    groups
+                        .iter()
+                        .map(|group| unified_region(group).unwrap())
+                        .collect(),
+                )
+                .unwrap();
+                let grouped_equal = regions_equal(&grouped_merged, &oracle).unwrap();
+                drop(grouped_merged);
+                println!(
+                    "PROBE clusters K={group_count} batch_only p50={only_p50:.3}ms \
+                     batch+merge p50={batch_p50:.3}ms grouped+merge p50={grouped_p50:.3}ms \
+                     equivalence={} grouped_equivalence={}",
+                    if batch_equal { "OK" } else { "DIFF" },
+                    if grouped_equal { "OK" } else { "DIFF" }
+                );
+                if !batch_equal || !grouped_equal {
+                    spatial_failures.push(group_count);
+                }
+            }
+            // Scaling calibration (print-only, exploratory): the batch call's
+            // cost separates into a polygon-count term and an extent term.
+            // Sweep each with the other fixed, using the same generator in a
+            // single cell. The production shape is ~164 polygons per character
+            // in a ~240x135px cell, so these numbers decide how the fine
+            // partitions above scale to production-sized instances.
+            fn single_cell(count: usize, width: i32, height: i32) -> Vec<Vec<[i32; 2]>> {
+                let mut seed = 20_261_015_u32;
+                let mut next = move || {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    seed
+                };
+                let mut polygons = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let cx = (next() % width as u32) as i32;
+                    let cy = (next() % height as u32) as i32;
+                    let mut points = vec![
+                        [cx, cy],
+                        [cx + 30 + (next() % 15) as i32, cy + (next() % 20) as i32],
+                        [cx + (next() % 20) as i32, cy + 30 + (next() % 15) as i32],
+                    ];
+                    for _ in 3..5 + (next() % 4) {
+                        points.push([cx + (next() % 41) as i32, cy + (next() % 41) as i32]);
+                    }
+                    polygons.push(hull(&mut points));
+                }
+                polygons
+            }
+            for &(label, count, width, height) in &[
+                ("count-164-cell-240x135", 164_usize, 240, 135),
+                ("count-328-cell-240x135", 328, 240, 135),
+                ("count-656-cell-240x135", 656, 240, 135),
+                ("count-1312-cell-240x135", 1312, 240, 135),
+                ("spread-120x68-count-164", 164, 120, 68),
+                ("spread-480x270-count-164", 164, 480, 270),
+                ("spread-960x540-count-164", 164, 960, 540),
+                ("spread-480x270-count-328", 328, 480, 270),
+            ] {
+                let cell = single_cell(count, width, height);
+                let mut samples = Vec::new();
+                for _ in 0..SPATIAL_ROUNDS {
+                    samples.push(time(|| {
+                        drop(batched_region(&cell).unwrap());
+                    }));
+                }
+                let (p50, p95) = pcts(samples);
+                println!(
+                    "PROBE calib {label} batch p50={p50:.3}ms p95={p95:.3}ms per_poly={:.3}us",
+                    p50 * 1000.0 / count as f64
+                );
+            }
+
+            // Same polygons, cluster-major input order, unchanged balanced
+            // path: does issuing same-cluster polygons consecutively (the
+            // production frame's natural order) by itself shrink the merge
+            // cost versus the interleaved order of the A measurement?
+            let mut order: Vec<usize> = (0..fixture.len()).collect();
+            order.sort_by_key(|&index| (index % 64, index / 64));
+            let cluster_major: Vec<Vec<[i32; 2]>> =
+                order.iter().map(|&index| fixture[index].clone()).collect();
+            let mut reordered = Vec::new();
+            for _ in 0..SPATIAL_ROUNDS {
+                reordered.push(time(|| {
+                    drop(unified_region(&cluster_major).unwrap());
+                }));
+            }
+            let (reordered_p50, _) = pcts(reordered);
+            let reordered_region = unified_region(&cluster_major).unwrap();
+            let reordered_equal = regions_equal(&reordered_region, &oracle).unwrap();
+            drop(reordered_region);
+            println!(
+                "PROBE order interleaved_p50={:.3}ms cluster_major_p50={reordered_p50:.3}ms equivalence={}",
+                pcts(
+                    (0..SPATIAL_ROUNDS)
+                        .map(|_| time(|| {
+                            drop(unified_region(&fixture).unwrap());
+                        }))
+                        .collect()
+                )
+                .0,
+                if reordered_equal { "OK" } else { "DIFF" }
+            );
+            if !reordered_equal {
+                spatial_failures.push(0);
+            }
+            assert!(
+                spatial_failures.is_empty(),
+                "PROBE spatial equivalence failures at K={spatial_failures:?}"
+            );
+            drop(oracle);
+
+            // Coarse attribution: leaf creation alone vs the flatten step.
+            // Chunked so the live-region count stays inside the process GDI
+            // quota (~10k handles): creating all 10512 leaves at once would
+            // fail, which is also why the balanced path's bounded liveness
+            // matters. Per-leaf create cost is what this measures.
+            let leaves = time(|| {
+                for chunk in fixture.chunks(1000) {
+                    let regions: Vec<GdiRegion> =
+                        chunk.iter().map(|p| polygon_region(p).unwrap()).collect();
+                    drop(regions);
+                }
+            });
+            let flatten = time(|| {
+                let (points, counts, polygons) = batch_points(&fixture).unwrap();
+                assert_eq!(polygons as usize, fixture.len());
+                assert_eq!(points.len(), total_points);
+                assert_eq!(counts.len(), fixture.len());
+            });
+            println!(
+                "PROBE attrib leaves_only={:.3}ms batch_points(validate+flatten)={:.3}ms",
+                leaves.as_secs_f64() * 1000.0,
+                flatten.as_secs_f64() * 1000.0
+            );
+
+            println!("PROBE GATE thresholds adopt<=0.50 low=0.50..0.80 stop>=0.80 at n=10512");
+            assert_eq!(state().live, 0, "probe leaked regions");
         }
     }
 }
