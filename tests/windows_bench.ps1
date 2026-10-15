@@ -41,7 +41,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $project = Split-Path $PSScriptRoot -Parent
 
-$script:ScriptVersion = 3
+$script:ScriptVersion = 4
 $script:GuiReadyTimeoutSeconds = 30
 $script:WarmupSeconds = 10
 $script:ReloadBaselineSeconds = 5
@@ -839,7 +839,7 @@ function Read-BenchResult {
     if ($null -eq $regions) {
         Add-Reason $Reasons 'terminal regions missing'
     } else {
-        $parsed['regions'] = Read-IntFieldSet -Object $regions -Prefix 'regions' -Names @('rebuilt', 'reused', 'failed', 'polygon_max') -Reasons $Reasons
+        $parsed['regions'] = Read-IntFieldSet -Object $regions -Prefix 'regions' -Names @('rebuilt', 'reused', 'deferred', 'failed', 'polygon_max') -Reasons $Reasons
         $failed = $parsed['regions']['failed']
         if ($null -ne $failed -and [long]$failed -ne 0) {
             Add-Reason $Reasons ('regions.failed is ' + $failed + ', expected 0 (no hit-region fallback)')
@@ -2169,6 +2169,7 @@ function Get-CaseSummaryCells {
         if ($null -ne $regions) {
             $row['regions_rebuilt'] = Format-Number $regions['rebuilt'] 0
             $row['regions_reused'] = Format-Number $regions['reused'] 0
+            $row['regions_deferred'] = Format-Number $regions['deferred'] 0
             $row['regions_failed'] = Format-Number $regions['failed'] 0
             $row['polygon_max'] = Format-Number $regions['polygon_max'] 0
         }
@@ -2200,7 +2201,7 @@ function Get-CaseSummaryCells {
     if (-not $row.Contains('attempts')) {
         $row['attempts'] = ''; $row['submitted'] = ''; $row['skipped'] = ''; $row['scene_errors'] = ''; $row['submitted_per_second'] = ''
         $row['steps'] = ''; $row['dropped_steps'] = ''
-        $row['regions_rebuilt'] = ''; $row['regions_reused'] = ''; $row['regions_failed'] = ''; $row['polygon_max'] = ''
+        $row['regions_rebuilt'] = ''; $row['regions_reused'] = ''; $row['regions_deferred'] = ''; $row['regions_failed'] = ''; $row['polygon_max'] = ''
         $row['reloads_requested'] = ''; $row['reloads_successful'] = ''; $row['reloads_render_confirmed'] = ''; $row['reloads_expected'] = ''
     }
     if (-not $row.Contains('advance_count')) {
@@ -2414,6 +2415,23 @@ function New-SummaryMarkdown {
     $stageHeaders = @('stage')
     foreach ($caseResult in $CaseResults) { $stageHeaders += [string]$caseResult['name'] }
     [void]$lines.Add((Format-MarkdownTable -Headers $stageHeaders -Rows $stageRows))
+    [void]$lines.Add('')
+    [void]$lines.Add('## Region decisions')
+    [void]$lines.Add('')
+    [void]$lines.Add('Deferred counts frames whose geometry changed but the install throttle did not deliver; a pixel-mode case without a fallback satisfies rebuilt + reused + deferred + failed = scene attempts.')
+    [void]$lines.Add('')
+    $regionRows = @()
+    foreach ($caseResult in $CaseResults) {
+        $parsed = $caseResult['parsed']
+        $regions = $null
+        if ($null -ne $parsed) { $regions = $parsed['regions'] }
+        if ($null -ne $regions) {
+            $regionRows += , @([string]$caseResult['name'], (Format-Number $regions['rebuilt'] 0), (Format-Number $regions['reused'] 0), (Format-Number $regions['deferred'] 0), (Format-Number $regions['failed'] 0), (Format-Number $regions['polygon_max'] 0))
+        } else {
+            $regionRows += , @([string]$caseResult['name'], '', '', '', '', '')
+        }
+    }
+    [void]$lines.Add((Format-MarkdownTable -Headers @('case', 'rebuilt', 'reused', 'deferred', 'failed', 'polygon_max') -Rows $regionRows))
     [void]$lines.Add('')
     [void]$lines.Add('## Resources per case')
     [void]$lines.Add('')
@@ -2696,7 +2714,7 @@ function New-BenchFixtureTerminal {
             skip_reasons = [ordered]@{ suboptimal = 2 }
         }
         simulation = [ordered]@{ steps = 3600; dropped_steps = 0 }
-        regions = [ordered]@{ rebuilt = 900; reused = 900; failed = 0; polygon_max = 7 }
+        regions = [ordered]@{ rebuilt = 900; reused = 675; deferred = 225; failed = 0; polygon_max = 7 }
         stages = [ordered]@{
             advance = New-BenchFixtureStage -Count 1798 -Mean 0.12
             render_frame = New-BenchFixtureStage -Count 1798 -Mean 0.35
@@ -2978,6 +2996,14 @@ function Invoke-ValidationSelfChecks {
     $regionFailure['terminal']['regions']['failed'] = 1
     Invoke-FixtureCheck -Label 'region fallback' -Case $casePixel -StdoutText (New-BenchFixtureStdout -Fixture $regionFailure) -Expect @('regions.failed is 1') -Forbid @() | Out-Null
     $script:ValidateChecks++
+    $deferredMissing = New-BenchFixtureTerminal
+    [void]$deferredMissing['terminal']['regions'].Remove('deferred')
+    Invoke-FixtureCheck -Label 'region deferred missing' -Case $casePixel -StdoutText (New-BenchFixtureStdout -Fixture $deferredMissing) -Expect @('regions.deferred missing') -Forbid @() | Out-Null
+    $script:ValidateChecks++
+    $deferredBad = New-BenchFixtureTerminal
+    $deferredBad['terminal']['regions']['deferred'] = 1.5
+    Invoke-FixtureCheck -Label 'region deferred not an integer' -Case $casePixel -StdoutText (New-BenchFixtureStdout -Fixture $deferredBad) -Expect @('regions.deferred is not an integer') -Forbid @() | Out-Null
+    $script:ValidateChecks++
     $samplerOverflow = New-BenchFixtureTerminal
     $samplerOverflow['terminal']['sampler']['scene_used'] = 70000
     Invoke-FixtureCheck -Label 'sampler overflow' -Case $casePixel -StdoutText (New-BenchFixtureStdout -Fixture $samplerOverflow) -Expect @('sampler overflow: scene_used 70000') -Forbid @() | Out-Null
@@ -3198,7 +3224,7 @@ function Invoke-ValidationSelfChecks {
     $goodCase['parsed']['completion'] = 'completed'
     $goodCase['parsed']['measured_seconds'] = 30.0
     $goodCase['parsed']['scene'] = [ordered]@{ attempts = 1800; submitted = 1798; skipped = 2; errors = 0; submitted_per_second = 59.9 }
-    $goodCase['parsed']['regions'] = [ordered]@{ rebuilt = 1; reused = 1; failed = 0; polygon_max = 3 }
+    $goodCase['parsed']['regions'] = [ordered]@{ rebuilt = 1; reused = 1; deferred = 1; failed = 0; polygon_max = 3 }
     $goodCase['parsed']['reloads'] = [ordered]@{ requested = 0; successful = 0; render_confirmed = 0; expected = $null }
     $goodCase['parsed']['config'] = (New-BenchFixtureTerminal)['terminal']['config']
     $badCase = New-CaseResultSkeleton -Case $caseReload

@@ -389,3 +389,41 @@ fn result_config_echoes_the_wander_provenance() {
     assert_eq!(result["config"]["instance_count"], 4);
     assert_eq!(result["config"]["warmup_seconds"], 10.0);
 }
+
+#[test]
+fn region_decisions_accumulate_per_frame_including_deferred() {
+    let mut b = benchmark(None, 8);
+    for region in [
+        RegionDecision::Rebuilt,
+        RegionDecision::Reused,
+        RegionDecision::Deferred,
+        RegionDecision::Failed,
+    ] {
+        let mut sample = measured_sample(SceneFrameOutcome::Submitted);
+        sample.region = region;
+        b.record_scene(sample).unwrap();
+    }
+    let result = b.result();
+    assert_eq!(result["scene"]["attempts"], 4);
+    assert_eq!(result["regions"]["rebuilt"], 1);
+    assert_eq!(result["regions"]["reused"], 1);
+    assert_eq!(result["regions"]["deferred"], 1);
+    assert_eq!(result["regions"]["failed"], 1);
+}
+
+#[test]
+fn deferred_frames_keep_the_case_valid() {
+    let mut b = benchmark(None, 2);
+    b.on_submission(0.25, Some(1), std::iter::empty()).unwrap();
+    b.update(10.25).unwrap();
+    let mut sample = measured_sample(SceneFrameOutcome::Submitted);
+    sample.region = RegionDecision::Deferred;
+    b.record_scene(sample).unwrap();
+    b.update(40.5).unwrap();
+    let result = b.result();
+    // Deferred is a delivery decision, not a failure: only `failed` latches
+    // the fallback and the invalid outcome.
+    assert_eq!(result["valid"], true);
+    assert_eq!(result["regions"]["deferred"], 1);
+    assert_eq!(result["regions"]["failed"], 0);
+}
