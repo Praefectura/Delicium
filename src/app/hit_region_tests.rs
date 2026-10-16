@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use glam::{Mat4, Vec3};
@@ -10,10 +10,11 @@ use super::{
     HitGeometry, InstanceOutline, clip_depth, clip_to_client, pad_polygon, push_triangle,
     region_polygon,
 };
+use crate::platform::{ProbedPlan, probe_region_build, probe_region_equivalence};
 use crate::renderer::InstanceDraw;
 
 use crate::{
-    model::{LoadLimits, load_model_bytes},
+    model::{LoadLimits, ModelKind, load_model_bytes},
     renderer::{RenderFrame, SceneRenderer},
     simulation::{Simulation, render_asset},
 };
@@ -689,4 +690,480 @@ fn mirror_flip_rebuilds_the_region_and_projects_the_mirrored_outline() {
         unmatched.is_empty(),
         "mirrored region has vertices with no baseline counterpart: {unmatched:?}"
     );
+}
+
+/// The benchmark launcher's scene: half the instances drawn from the 2D
+/// puppet and half from the 3D robot, on the bench grid at the launcher's
+/// positions (instance ids ascending, phases 0.23s apart, stationary).
+fn bench_scene(count: usize) -> Simulation {
+    let mut simulation = Simulation::new();
+    for (bytes, kind) in [
+        (
+            include_bytes!("../../assets/examples/puppet2d.dmodel.json").as_slice(),
+            ModelKind::Sprite2d,
+        ),
+        (
+            include_bytes!("../../assets/examples/robot3d.dmodel.json").as_slice(),
+            ModelKind::Skeleton3d,
+        ),
+    ] {
+        let model = load_model_bytes(bytes, &LoadLimits::default()).unwrap();
+        let asset = simulation.insert_asset(model).unwrap();
+        for position in crate::app::benchmark::positions(count, kind) {
+            simulation.spawn(asset, position).unwrap();
+        }
+    }
+    simulation
+}
+
+/// A winding rectangle corner case for the adversarial equivalence matrix.
+fn probe_rectangle(x: i32, y: i32, width: i32, height: i32) -> Vec<[i32; 2]> {
+    vec![
+        [x, y],
+        [x + width, y],
+        [x + width, y + height],
+        [x, y + height],
+    ]
+}
+
+/// The GDI coordinate range: coordinates are signed 27-bit values. A
+/// multi-polygon batch additionally rejects a y spread >= 2^24 (measured by
+/// the platform batch probe), which is why the two corners stay in separate
+/// adversarial cases.
+const PROBE_GDI_MIN_COORD: i32 = -(1 << 26);
+const PROBE_GDI_MAX_COORD: i32 = (1 << 26) - 1;
+
+/// Phase-0 decision-gate probe for batched region installs: fixed chunks and
+/// per-instance groups through `CreatePolyPolygonRgn`, streamed into the
+/// same carry-slot fold as the previous per-polygon production path.
+///
+/// Outcome (2026-10-16, evidence `.artifacts/perf-perbatch-20261016-015856/`):
+/// ADOPT — 41-polygon chunks measured 0.332x the per-polygon fold's paired
+/// median (50.6ms -> 16.8ms p50 at 10512 polygons) with exact equivalence,
+/// beating the 82/164/328 arms (0.370x/0.473x/0.694x) and per-instance
+/// (0.599x), and became the production `REGION_CHUNK_POLYGONS`; this probe
+/// stays as the real-geometry reproduction harness. See also the synthetic
+/// `poly_poly_batch_probe` in `src/platform/mod.rs`.
+///
+/// Fixture: the benchmark launcher's 64-instance scene (32 sprite2d + 32
+/// skeleton3d on the bench grid) projected onto the archived c64 physical
+/// size (1440x960) under the frozen LEGACY view; pure CPU, no window and no
+/// GPU. The decision frame is the sampled frame with the most polygons.
+///
+/// Run explicitly, in release, with output:
+/// `cargo test --release --locked --offline --lib region_batch_gate_probe -- --ignored --nocapture --test-threads=1`
+///
+/// Hard assertions: exact region equivalence against the independent
+/// sequential oracle (decision frame under every arm, adversarial matrix,
+/// empty input, invalid polygons), fail-closed errors, exact native-call
+/// counts per plan, and region-ownership accounting (no leaks on any path).
+/// Timing is printed for the gate decision made outside the test; evidence
+/// lives in `.artifacts/perf-perbatch-20261016-015856/`.
+#[test]
+#[ignore = "phase-0 decision gate; run explicitly with --ignored"]
+fn region_batch_gate_probe() {
+    const SIZE: [u32; 2] = [1440, 960];
+    const ROUNDS: usize = 21;
+    const SECONDARY_ROUNDS: usize = 7;
+
+    fn ms(elapsed: Duration) -> f64 {
+        elapsed.as_secs_f64() * 1000.0
+    }
+
+    fn timed_build(polygons: &[Vec<[i32; 2]>], plan: ProbedPlan<'_>) -> f64 {
+        let start = Instant::now();
+        probe_region_build(polygons, plan).unwrap();
+        ms(start.elapsed())
+    }
+
+    fn percentiles(samples: &mut [f64]) -> (f64, f64) {
+        samples.sort_by(f64::total_cmp);
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+        (p50, p95)
+    }
+
+    fn median(samples: &mut [f64]) -> f64 {
+        samples.sort_by(f64::total_cmp);
+        let middle = samples.len() / 2;
+        if samples.len().is_multiple_of(2) {
+            (samples[middle - 1] + samples[middle]) / 2.0
+        } else {
+            samples[middle]
+        }
+    }
+
+    /// Frames `count` geometries `interval` frames apart, oldest first.
+    fn sample_geometries(
+        simulation: &mut Simulation,
+        label: &str,
+        count: usize,
+        interval: usize,
+        size: [u32; 2],
+    ) -> Vec<HitGeometry> {
+        let mut samples = Vec::with_capacity(count);
+        for step in 0..count {
+            if step != 0 {
+                for _ in 0..interval {
+                    simulation
+                        .advance(Duration::from_nanos(16_666_667))
+                        .unwrap();
+                }
+            }
+            let frame = simulation.render_frame().unwrap();
+            let geometry = HitGeometry::from_frame(simulation, &frame, size).unwrap();
+            println!(
+                "PROBE {label} sample={step} polygons={} points={}",
+                geometry.polygons().len(),
+                geometry.polygons().iter().map(Vec::len).sum::<usize>()
+            );
+            samples.push(geometry);
+        }
+        samples
+    }
+
+    fn decision_index(samples: &[HitGeometry]) -> usize {
+        samples
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, geometry)| geometry.polygons().len())
+            .map(|(index, _)| index)
+            .unwrap()
+    }
+
+    /// Polygons contributed by each instance, from the per-instance ends.
+    fn instance_polygon_counts(geometry: &HitGeometry) -> Vec<usize> {
+        let mut counts = Vec::new();
+        let mut previous = 0;
+        for &end in geometry.instance_polygon_ends() {
+            counts.push(end - previous);
+            previous = end;
+        }
+        counts
+    }
+
+    /// `rounds` timing rounds over the arms, with the arm order rotated by
+    /// the round (each round starts at the next arm) and one warmup per arm;
+    /// returns each arm's samples and the per-round paired ratios against
+    /// arm 0.
+    fn run_rounds(
+        label: &str,
+        polygons: &[Vec<[i32; 2]>],
+        arms: &[(&str, ProbedPlan<'_>)],
+        rounds: usize,
+    ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        for (name, plan) in arms {
+            timed_build(polygons, *plan);
+            println!("PROBE {label} warmup arm={name} ok");
+        }
+        let mut arm_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); arms.len()];
+        let mut arm_ratios: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); arms.len()];
+        for round in 0..rounds {
+            let mut round_times = vec![0.0_f64; arms.len()];
+            for position in 0..arms.len() {
+                let arm = (round + position) % arms.len();
+                round_times[arm] = timed_build(polygons, arms[arm].1);
+            }
+            for (slot, time) in arm_samples.iter_mut().zip(&round_times) {
+                slot.push(*time);
+            }
+            for (slot, time) in arm_ratios.iter_mut().zip(&round_times).skip(1) {
+                slot.push(time / round_times[0]);
+            }
+        }
+        (arm_samples, arm_ratios)
+    }
+
+    fn report_arms(
+        label: &str,
+        arms: &[(&str, ProbedPlan<'_>)],
+        arm_samples: &[Vec<f64>],
+        arm_ratios: &[Vec<f64>],
+    ) {
+        let mut base = arm_samples[0].clone();
+        let (base_p50, _) = percentiles(&mut base);
+        for (index, (name, _)) in arms.iter().enumerate() {
+            let mut times = arm_samples[index].clone();
+            let (p50, p95) = percentiles(&mut times);
+            let (paired, independent, drift) = if index == 0 {
+                (1.0, 1.0, 0.0)
+            } else {
+                let paired = median(&mut arm_ratios[index].clone());
+                let independent = p50 / base_p50;
+                (
+                    paired,
+                    independent,
+                    (paired - independent) / independent * 100.0,
+                )
+            };
+            let marker = if drift.abs() > 5.0 { " DRIFT" } else { "" };
+            println!(
+                "PROBE {label} arm={name} samples={} p50_ms={p50:.3} p95_ms={p95:.3} paired_median={paired:.4} indep_ratio={independent:.4} drift={drift:+.1}%{marker}",
+                arm_samples[index].len()
+            );
+        }
+    }
+
+    // -- primary fixture: the benchmark's 64-instance scene ---------------
+    let mut simulation = bench_scene(64);
+    let samples = sample_geometries(&mut simulation, "primary", 13, 30, SIZE);
+    let decision_at = decision_index(&samples);
+    let decision = &samples[decision_at];
+    let polygons = decision.polygons();
+    let polygon_count = polygons.len();
+    let ends = decision.instance_polygon_ends();
+    assert!(
+        polygon_count >= 9800,
+        "the decision frame must carry the full 64-instance load, got {polygon_count} polygons"
+    );
+    assert_eq!(ends.len(), 64, "one end offset per frame instance");
+    assert!(
+        ends.windows(2).all(|pair| pair[0] <= pair[1]),
+        "per-instance end offsets must be non-decreasing"
+    );
+    assert_eq!(
+        ends.last().copied().unwrap_or(0),
+        polygon_count,
+        "the last instance must end at the flattened polygon count"
+    );
+    println!(
+        "PROBE primary decision sample={decision_at} polygons={polygon_count} points={} instances={}",
+        polygons.iter().map(Vec::len).sum::<usize>(),
+        ends.len()
+    );
+    {
+        let mut counts = instance_polygon_counts(decision);
+        let empty = counts.iter().filter(|&&count| count == 0).count();
+        counts.sort_unstable();
+        println!(
+            "PROBE primary per_instance min={} p50={} max={} empty={empty}",
+            counts.first().copied().unwrap_or(0),
+            counts[counts.len() / 2],
+            counts.last().copied().unwrap_or(0),
+        );
+    }
+    {
+        let mut groups = 0;
+        let mut previous = 0;
+        for &end in ends {
+            if end > previous {
+                groups += 1;
+                previous = end;
+            }
+        }
+        println!(
+            "PROBE primary batches unified={polygon_count} chunk-41={} chunk-82={} chunk-164={} chunk-328={} per-instance={groups}",
+            polygon_count.div_ceil(41),
+            polygon_count.div_ceil(82),
+            polygon_count.div_ceil(164),
+            polygon_count.div_ceil(328),
+        );
+    }
+
+    let arms: Vec<(&str, ProbedPlan<'_>)> = vec![
+        ("unified", ProbedPlan::Unified),
+        ("chunk-41", ProbedPlan::Chunked(41)),
+        ("chunk-82", ProbedPlan::Chunked(82)),
+        ("chunk-164", ProbedPlan::Chunked(164)),
+        ("chunk-328", ProbedPlan::Chunked(328)),
+        ("per-instance", ProbedPlan::PerInstance(ends)),
+    ];
+    let (arm_samples, arm_ratios) = run_rounds("primary", polygons, &arms, ROUNDS);
+    report_arms("primary", &arms, &arm_samples, &arm_ratios);
+    {
+        // Diagnostic only: the batched path's per-batch leaf cost with no
+        // unions, i.e. the floor the chunked arms build on.
+        let plan = ProbedPlan::BuildOnlyChunked(164);
+        timed_build(polygons, plan);
+        let mut times: Vec<f64> = (0..9).map(|_| timed_build(polygons, plan)).collect();
+        let (p50, p95) = percentiles(&mut times);
+        println!(
+            "PROBE primary diagnostic=build-only-chunk-164 batches={} samples={} p50_ms={p50:.3} p95_ms={p95:.3}",
+            polygon_count.div_ceil(164),
+            times.len()
+        );
+    }
+
+    // -- secondary fixture: the 16-instance scene (print-only) ------------
+    {
+        let mut simulation = bench_scene(16);
+        let samples = sample_geometries(&mut simulation, "secondary", 7, 30, SIZE);
+        let decision_at = decision_index(&samples);
+        let decision = &samples[decision_at];
+        let polygons = decision.polygons();
+        let ends = decision.instance_polygon_ends();
+        println!(
+            "PROBE secondary decision sample={decision_at} polygons={} instances={}",
+            polygons.len(),
+            ends.len()
+        );
+        let arms: Vec<(&str, ProbedPlan<'_>)> = vec![
+            ("unified", ProbedPlan::Unified),
+            ("chunk-41", ProbedPlan::Chunked(41)),
+            ("chunk-82", ProbedPlan::Chunked(82)),
+            ("chunk-164", ProbedPlan::Chunked(164)),
+            ("chunk-328", ProbedPlan::Chunked(328)),
+            ("per-instance", ProbedPlan::PerInstance(ends)),
+        ];
+        let (arm_samples, arm_ratios) = run_rounds("secondary", polygons, &arms, SECONDARY_ROUNDS);
+        report_arms("secondary", &arms, &arm_samples, &arm_ratios);
+    }
+
+    // -- hard equivalence --------------------------------------------------
+    for (name, plan) in &arms {
+        assert!(
+            probe_region_equivalence(polygons, *plan).unwrap(),
+            "decision frame differs from the sequential oracle under arm {name}"
+        );
+    }
+    println!("PROBE equivalence decision_frame=true arms={}", arms.len());
+
+    let square = probe_rectangle(0, 0, 10, 10);
+    let concave = vec![
+        [0, 0],
+        [10, 0],
+        [10, 30],
+        [30, 30],
+        [30, 0],
+        [40, 0],
+        [40, 40],
+        [0, 40],
+    ];
+    let mut mixed_winding = probe_rectangle(5, 5, 10, 10);
+    mixed_winding.reverse();
+    let mut cases: Vec<Vec<Vec<[i32; 2]>>> = vec![
+        vec![],
+        vec![square.clone()],
+        vec![
+            square.clone(),
+            probe_rectangle(5, 5, 10, 10),
+            probe_rectangle(10, 0, 10, 10),
+        ],
+        vec![concave, probe_rectangle(50, 50, 10, 10)],
+        vec![
+            vec![[0, 0], [1, 30], [0, 30]],
+            vec![[1, 0], [2, 30], [1, 30]],
+        ],
+        vec![vec![[0, 0], [1, 1], [2, 2]], vec![[0, 0], [0, 0], [0, 0]]],
+        vec![
+            probe_rectangle(PROBE_GDI_MIN_COORD, PROBE_GDI_MIN_COORD, 16, 16),
+            probe_rectangle(PROBE_GDI_MIN_COORD + 32, PROBE_GDI_MIN_COORD + 32, 16, 16),
+        ],
+        vec![
+            probe_rectangle(PROBE_GDI_MAX_COORD - 16, PROBE_GDI_MAX_COORD - 16, 16, 16),
+            probe_rectangle(PROBE_GDI_MAX_COORD - 32, PROBE_GDI_MAX_COORD - 32, 16, 16),
+        ],
+        vec![square.clone(), mixed_winding],
+    ];
+    let chunk_plans = [
+        ("chunk-1", ProbedPlan::Chunked(1)),
+        ("chunk-2", ProbedPlan::Chunked(2)),
+        ("chunk-3", ProbedPlan::Chunked(3)),
+        ("chunk-164", ProbedPlan::Chunked(164)),
+    ];
+    let arrangements = ["raw", "rotated", "reversed"];
+    let mut failures: Vec<String> = Vec::new();
+    for (case, polygons) in cases.iter_mut().enumerate() {
+        for (arrangement, arrangement_name) in arrangements.iter().enumerate() {
+            match arrangement {
+                1 => {
+                    if polygons.is_empty() {
+                        continue;
+                    }
+                    polygons.rotate_left(1);
+                }
+                2 => {
+                    polygons.reverse();
+                    for polygon in polygons.iter_mut() {
+                        polygon.reverse();
+                    }
+                }
+                _ => {}
+            }
+            for (plan_name, plan) in &chunk_plans {
+                match probe_region_equivalence(polygons, *plan) {
+                    Ok(true) => {}
+                    Ok(false) => failures.push(format!(
+                        "case={case} {arrangement_name} {plan_name}: regions differ"
+                    )),
+                    Err(error) => failures.push(format!(
+                        "case={case} {arrangement_name} {plan_name}: {error}"
+                    )),
+                }
+            }
+            let ends = [polygons.len()];
+            match probe_region_equivalence(polygons, ProbedPlan::PerInstance(&ends)) {
+                Ok(true) => {}
+                Ok(false) => failures.push(format!(
+                    "case={case} {arrangement_name} per-instance: regions differ"
+                )),
+                Err(error) => failures.push(format!(
+                    "case={case} {arrangement_name} per-instance: {error}"
+                )),
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "PROBE adversarial equivalence failures: {failures:#?}"
+    );
+    println!(
+        "PROBE equivalence adversarial=true cases={} arrangements=3 plans=5",
+        cases.len()
+    );
+
+    let three = vec![
+        square.clone(),
+        probe_rectangle(5, 5, 10, 10),
+        probe_rectangle(10, 0, 10, 10),
+    ];
+    for ends in [&[0, 3, 3][..], &[1, 1, 3][..], &[3][..]] {
+        assert!(probe_region_equivalence(&three, ProbedPlan::PerInstance(ends)).unwrap());
+    }
+    for bad in [&[2][..], &[3, 2][..], &[4][..], &[][..]] {
+        assert!(probe_region_build(&three, ProbedPlan::PerInstance(bad)).is_err());
+    }
+    println!("PROBE equivalence empty_groups=true boundary_errors=true");
+
+    for plan in [
+        ProbedPlan::Unified,
+        ProbedPlan::Chunked(1),
+        ProbedPlan::Chunked(164),
+    ] {
+        assert!(
+            probe_region_equivalence(&[], plan).unwrap(),
+            "empty input under {plan:?}"
+        );
+    }
+    assert!(probe_region_equivalence(&[], ProbedPlan::PerInstance(&[0, 0, 0])).unwrap());
+    assert!(probe_region_build(&[], ProbedPlan::PerInstance(&[])).is_ok());
+    assert!(probe_region_build(&[], ProbedPlan::PerInstance(ends)).is_err());
+    println!("PROBE equivalence empty_input=true");
+
+    let invalid_plans = [
+        ("unified", ProbedPlan::Unified),
+        ("chunk-1", ProbedPlan::Chunked(1)),
+        ("chunk-2", ProbedPlan::Chunked(2)),
+        ("chunk-164", ProbedPlan::Chunked(164)),
+        ("per-instance", ProbedPlan::PerInstance(&[3])),
+    ];
+    for (case, invalid) in [
+        vec![[0, 0], [1, 1]],
+        vec![[0, 0], [PROBE_GDI_MAX_COORD + 1, 0], [0, 10]],
+        vec![[0, 0], [PROBE_GDI_MIN_COORD - 1, 0], [0, 10]],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut polygons = vec![square.clone(), probe_rectangle(20, 0, 10, 10)];
+        polygons.push(invalid);
+        for (plan_name, plan) in &invalid_plans {
+            assert!(
+                probe_region_build(&polygons, *plan).is_err(),
+                "invalid polygon case {case} must fail closed under {plan_name}"
+            );
+        }
+    }
+    println!("PROBE equivalence invalid_polygons=Err live=0");
+    println!("PROBE done");
 }

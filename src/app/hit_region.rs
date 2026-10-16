@@ -101,6 +101,11 @@ pub(super) struct HitGeometry {
     view: SceneView,
     instances: Vec<InstanceOutline>,
     polygons: Vec<Vec<[i32; 2]>>,
+    /// Exclusive end of every instance's polygons inside `polygons`, in
+    /// frame order; probe-only metadata for the batched-install decision
+    /// gate (see `.artifacts/perf-perbatch-20261016-015856/`).
+    #[cfg(all(test, target_os = "windows"))]
+    instance_polygon_ends: Vec<usize>,
 }
 
 impl HitGeometry {
@@ -134,6 +139,8 @@ impl HitGeometry {
         let height = size[1].max(1) as f32;
         let mut instances = Vec::with_capacity(frame.instances.len());
         let mut polygons = Vec::new();
+        #[cfg(all(test, target_os = "windows"))]
+        let mut instance_polygon_ends = Vec::with_capacity(frame.instances.len());
         if size[0] == 0 || size[1] == 0 {
             // A zero-sized client shows nothing and must not intercept input.
             return Ok(Self {
@@ -141,6 +148,8 @@ impl HitGeometry {
                 view,
                 instances,
                 polygons,
+                #[cfg(all(test, target_os = "windows"))]
+                instance_polygon_ends,
             });
         }
         for draw in &frame.instances {
@@ -198,12 +207,16 @@ impl HitGeometry {
                 instance: draw.instance(),
                 polys,
             });
+            #[cfg(all(test, target_os = "windows"))]
+            instance_polygon_ends.push(polygons.len());
         }
         Ok(Self {
             size,
             view,
             instances,
             polygons,
+            #[cfg(all(test, target_os = "windows"))]
+            instance_polygon_ends,
         })
     }
 
@@ -229,6 +242,13 @@ impl HitGeometry {
     /// physical client coordinates.
     pub(super) fn polygons(&self) -> &[Vec<[i32; 2]>] {
         &self.polygons
+    }
+
+    /// Exclusive end of every instance's polygons in [`HitGeometry::polygons`],
+    /// in frame order (probe-only; see the `instance_polygon_ends` field).
+    #[cfg(all(test, target_os = "windows"))]
+    pub(super) fn instance_polygon_ends(&self) -> &[usize] {
+        &self.instance_polygon_ends
     }
 }
 
