@@ -277,6 +277,10 @@ struct Application {
     rendered_frames: u64,
     smoke: SmokeState,
     benchmark: Option<Benchmark>,
+    /// The installed tray icon; `None` whenever the shell rejected it or a
+    /// benchmark is running, in which case closing the control window quits
+    /// as before.
+    tray: Option<platform::TrayIcon>,
     scene_sample: Option<SceneSample>,
     fatal: Option<String>,
 }
@@ -315,6 +319,7 @@ impl Application {
             rendered_frames: 0,
             smoke: SmokeState::default(),
             benchmark,
+            tray: None,
             scene_sample: None,
             fatal: None,
         })
@@ -463,6 +468,22 @@ impl Application {
             scene_view,
             desktop_scene,
         });
+        // The icon must not appear while a benchmark drives the windows;
+        // scripts and harness runs assume closing a window ends the process.
+        if self.benchmark.is_none() {
+            match platform::tray::install() {
+                Ok(tray) => {
+                    log::info!("tray installed");
+                    self.tray = Some(tray);
+                }
+                Err(error) => {
+                    log::warn!("tray install failed: {error}");
+                    self.report_error(format!(
+                        "The system tray is unavailable; closing the control window will quit: {error}"
+                    ));
+                }
+            }
+        }
         log::info!(
             "wander mode={}",
             if self.options.wander { "on" } else { "off" }
@@ -1586,7 +1607,14 @@ impl ApplicationHandler for Application {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if is_control && self.tray.is_some() {
+                    runtime.control.set_visible(false);
+                    log::info!("control hidden to tray");
+                } else {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(benchmark) = &mut self.benchmark
                     && benchmark.phase != Phase::Setup
@@ -1790,6 +1818,31 @@ impl ApplicationHandler for Application {
             event_loop.exit();
             return;
         }
+        if let Some(tray) = &self.tray {
+            while let Some(action) = tray.take_action() {
+                match action {
+                    platform::TrayAction::ToggleControls => {
+                        if let Some(runtime) = &self.runtime {
+                            let visible = runtime.control.is_visible().unwrap_or(true);
+                            runtime.control.set_visible(!visible);
+                            if !visible {
+                                platform::raise_controls(&runtime.control);
+                            }
+                            log::info!("tray toggle controls visible={}", !visible);
+                        }
+                    }
+                    platform::TrayAction::Quit => {
+                        log::info!("tray quit");
+                        event_loop.exit();
+                        return;
+                    }
+                    platform::TrayAction::Reinstall => match tray.reinstall_icon() {
+                        Ok(()) => log::info!("tray icon reinstalled"),
+                        Err(error) => log::warn!("tray reinstall failed: {error}"),
+                    },
+                }
+            }
+        }
         if let Err(error) = self
             .poll_loads()
             .and_then(|()| self.advance_smoke(event_loop))
@@ -1812,7 +1865,15 @@ impl ApplicationHandler for Application {
                 self.fail(error, event_loop);
                 return;
             }
-            if let Err(error) = self.redraw_control(event_loop) {
+            // A hidden control window has nothing to present; skipping its
+            // redraw avoids presenting into an invisible surface. The tick
+            // resumes drawing the frame it becomes visible again.
+            let control_visible = self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.control.is_visible())
+                .unwrap_or(true);
+            if control_visible && let Err(error) = self.redraw_control(event_loop) {
                 self.fail(error, event_loop);
                 return;
             }
