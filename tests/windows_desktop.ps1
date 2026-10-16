@@ -184,6 +184,8 @@ $process = $null; $scene = [IntPtr]::Zero; $controls = [IntPtr]::Zero; $backdrop
 try {
     # Ordinary launch: no --overlay-size, so the scene must span the primary monitor.
     # --no-wander keeps the pinned positions this script's anchors assume.
+    # The user's saved configuration must not leak into the test scene.
+    $env:DELICIUM_NO_CONFIG = '1'
     $process = Start-Process -FilePath $Executable -ArgumentList '--no-wander', '--exit-after', '120' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError (Join-Path $run 'stderr.log')
     $deadline = [DateTime]::Now.AddSeconds(15)
     do {

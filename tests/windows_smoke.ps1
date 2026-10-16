@@ -243,6 +243,8 @@ $mouseDown = $false
 try {
     # Hide the app's own console window: it is product noise, not overlay
     # under test, and a visible one can cover the scene corner during capture.
+    # The user's saved configuration must not leak into the test scene.
+    $env:DELICIUM_NO_CONFIG = '1'
     $process = Start-Process -FilePath $Executable -ArgumentList '--overlay-size', '960x640', '--no-wander', '--exit-after', '120' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError (Join-Path $run 'stderr.log')
     $deadline = [DateTime]::Now.AddSeconds(15)
     do {
@@ -419,7 +421,7 @@ try {
     [DeliciumWindowTest]::Mouse(2)
     Start-Sleep -Milliseconds 180
     foreach ($step in 1..8) {
-        [void][DeliciumWindowTest]::SetCursorPos($anchorX + 20 * $step, $anchorY)
+        [void][DeliciumWindowTest]::SetCursorPos($anchorX - 20 * $step, $anchorY)
         Start-Sleep -Milliseconds 45
     }
     [DeliciumWindowTest]::Mouse(4)
@@ -433,8 +435,61 @@ try {
     $releaseMatch = [regex]::Match([string]$releaseLine, 'drag release instance=(\d+) x=(-?[0-9.]+)')
     Assert-Test ($startMatch.Success -and $releaseMatch.Success) 'Drag log lines are parseable'
     Assert-Test ($startMatch.Groups[1].Value -eq $releaseMatch.Groups[1].Value) 'The drag moves a single character'
-    $dragDelta = [double]$releaseMatch.Groups[2].Value - [double]$startMatch.Groups[2].Value
-    Assert-Test ($dragDelta -gt 0.6 -and $dragDelta -lt 0.9) ('The drag moves the character right by ' + [Math]::Round($dragDelta, 2) + ' world units')
+    $dragDelta = [double]$startMatch.Groups[2].Value - [double]$releaseMatch.Groups[2].Value
+    Assert-Test ($dragDelta -gt 0.6 -and $dragDelta -lt 0.9) ('The drag moves the character left by ' + [Math]::Round($dragDelta, 2) + ' world units')
+
+    # ---- click reaction: a press released in place is a poke, not a drag ----
+    # The drag moved the character left by exactly the cursor travel (8
+    # steps of 20 physical pixels), so the poke anchor is the drag anchor
+    # minus 160 pixels. Dragging left is deliberate: a rightward drag would
+    # land the character inside the pick bounds of its right-hand twin
+    # (same sprite2d texture, higher instance id), and pick_character
+    # resolves such overlaps to the higher id. The small local window then
+    # cannot see the twin at all.
+    $probe = Join-Path $run 'scene-poke-before.png'
+    [DeliciumWindowTest]::Capture($scene, $controls, $backdrop, $probe)
+    $bitmap = [System.Drawing.Bitmap]::FromFile($probe)
+    $expectedX = $anchor[0] - 160
+    $expectedY = $anchor[1]
+    $anchor = $null; $best = 0
+    try {
+        for ($y = $expectedY - 16; $y -le $expectedY + 16; $y++) {
+            for ($x = $expectedX - 16; $x -le $expectedX + 16; $x++) {
+                $color = $bitmap.GetPixel($x, $y)
+                $distance = [Math]::Max([Math]::Abs($color.R - 36), [Math]::Max([Math]::Abs($color.G - 58), [Math]::Abs($color.B - 78)))
+                if ($distance -gt $best) { $best = $distance; $anchor = @($x, $y) }
+            }
+        }
+    } finally {
+        $bitmap.Dispose()
+    }
+    Assert-Test ($null -ne $anchor -and $best -gt 100) 'Character pixels are available for the poke anchor'
+    $anchorX = $sceneRectangle.Left + $anchor[0]
+    $anchorY = $sceneRectangle.Top + $anchor[1]
+    Assert-Test ([DeliciumWindowTest]::Hit($anchorX, $anchorY) -eq $scene) 'Poke anchor is not covered by a foreign window'
+    $pokeBaseline = Count-Log 'poke instance='
+    $dragStartBaseline = Count-Log 'drag start instance='
+    $dragReleaseBaseline = Count-Log 'drag release instance='
+    [void][DeliciumWindowTest]::SetCursorPos($anchorX, $anchorY)
+    Start-Sleep -Milliseconds 300
+    $mouseDown = $true
+    [DeliciumWindowTest]::Mouse(2)
+    Start-Sleep -Milliseconds 100
+    [DeliciumWindowTest]::Mouse(4)
+    $mouseDown = $false
+    Assert-Test (Wait-Increase 'poke instance=' $pokeBaseline 1 3000) 'Releasing a press in place pokes the character'
+    Start-Sleep -Milliseconds 200
+    # A click runs the full press/release cycle through the drag path (the
+    # same logs as a drag press), so both counts advance by exactly one.
+    Assert-Test ((Count-Log 'drag start instance=') -eq ($dragStartBaseline + 1)) 'A click still presses the character'
+    Assert-Test ((Count-Log 'drag release instance=') -eq ($dragReleaseBaseline + 1)) 'A click still releases the character'
+    $pokeLine = @(Get-Content -LiteralPath (Join-Path $run 'stderr.log') | Select-String 'poke instance=') | Select-Object -Last 1
+    $pokeMatch = [regex]::Match([string]$pokeLine, 'poke instance=(\d+) x=(-?[0-9.]+) y=(-?[0-9.]+)')
+    Assert-Test $pokeMatch.Success 'Poke log line is parseable'
+    Assert-Test ($pokeMatch.Groups[1].Value -eq $startMatch.Groups[1].Value) 'The poke hits the same character as the drag'
+    $pokeX = [double]$pokeMatch.Groups[2].Value
+    $pokeDelta = [Math]::Abs($pokeX - [double]$releaseMatch.Groups[2].Value)
+    Assert-Test ($pokeDelta -lt 0.001) ('A poke does not move the character: delta ' + $pokeDelta)
 
     # Add buttons spawn immediately from the loaded examples.
     $spawnBaseline = Count-Log 'spawn instance='

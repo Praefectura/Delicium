@@ -233,6 +233,8 @@ try {
         throw "Executable does not exist: $Executable"
     }
     # No --overlay-size and no --no-wander: this is the ordinary desktop-span path.
+    # The user's saved configuration must not leak into the test scene.
+    $env:DELICIUM_NO_CONFIG = '1'
     $process = Start-Process -FilePath $Executable -ArgumentList '--exit-after', '180' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError $logPath
     $deadline = [DateTime]::Now.AddSeconds(15)
     do {

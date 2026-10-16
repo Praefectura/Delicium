@@ -279,6 +279,8 @@ $cursor = [PixelHitNative+Point]::new()
 if (-not [PixelHitNative]::GetCursorPos([ref]$cursor)) { throw 'Cannot save the cursor position before testing' }
 $process = $null; $scene = [IntPtr]::Zero; $backdrop = [IntPtr]::Zero; $mouseDown = $false
 try {
+    # The user's saved configuration must not leak into the test scene.
+    $env:DELICIUM_NO_CONFIG = '1'
     $process = Start-Process -FilePath $Executable -ArgumentList '--overlay-size', '960x640', '--no-wander', '--exit-after', '120' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError (Join-Path $run 'stderr.log')
     $deadline = [DateTime]::Now.AddSeconds(15)
     do {
