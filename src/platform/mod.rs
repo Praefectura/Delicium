@@ -92,6 +92,46 @@ pub(crate) fn hit_region_matches_sequential_oracle(
     win32::hit_region_matches_sequential_oracle(polygons)
 }
 
+/// One region-build plan for the Phase-0 decision-gate probe
+/// (`region_batch_gate_probe` in the app tests); evidence and the verdict
+/// live in `.artifacts/perf-perbatch-20261016-015856/`.
+#[cfg(all(test, target_os = "windows"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProbedPlan<'a> {
+    /// The gate's A arm: the previous production fold, one
+    /// `CreatePolygonRgn` per polygon.
+    Unified,
+    /// Batches of `chunk` consecutive polygons through the streamed fold.
+    Chunked(usize),
+    /// Diagnostics only: build every batch of `chunk` polygons and drop it
+    /// again, with no unions at all (leaf-cost lower bound).
+    BuildOnlyChunked(usize),
+    /// One batch per instance, from the flat polygon list's end offsets.
+    PerInstance(&'a [usize]),
+}
+
+/// Builds `polygons` under `plan` and drops the result; returns the build
+/// outcome. Panics if any region is still owned afterwards, so a leaker
+/// fails the probe instead of skewing the timings.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn probe_region_build(
+    polygons: &[Vec<[i32; 2]>],
+    plan: ProbedPlan<'_>,
+) -> Result<(), String> {
+    win32::probe_region_build(polygons, plan)
+}
+
+/// Builds `polygons` under `plan` and compares the union against the
+/// independent sequential oracle. `BuildOnlyChunked` builds no union and is
+/// rejected.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn probe_region_equivalence(
+    polygons: &[Vec<[i32; 2]>],
+    plan: ProbedPlan<'_>,
+) -> Result<bool, String> {
+    win32::probe_region_equivalence(polygons, plan)
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::hit_region_contains;
@@ -182,11 +222,11 @@ mod win32 {
 
     #[link(name = "gdi32")]
     unsafe extern "system" {
+        #[cfg(test)]
         fn CreatePolygonRgn(points: *const Point, count: i32, fill_mode: i32) -> Hrgn;
         /// One region from many polygons in a single call: `points` holds all
         /// polygons end to end, `counts[i]` is the point count of polygon `i`,
         /// and `polygons` is the number of polygons.
-        #[cfg(test)]
         fn CreatePolyPolygonRgn(
             points: *const Point,
             counts: *const i32,
@@ -303,6 +343,10 @@ mod win32 {
 
     /// One polygon as a winding-fill GDI region; malformed input is rejected
     /// rather than silently replaced by something else.
+    ///
+    /// Test reference of the previous production leaf build (now batched);
+    /// kept next to the batch path so both share validation and messages.
+    #[cfg(test)]
     fn polygon_region(points: &[[i32; 2]]) -> Result<GdiRegion, String> {
         let count = validate_polygon(points)?;
         let mut native = Vec::with_capacity(points.len());
@@ -346,24 +390,39 @@ mod win32 {
         Ok(destination)
     }
 
+    /// Number of polygons per `CreatePolyPolygonRgn` batch in the production
+    /// region build.
+    ///
+    /// Chosen by the Phase-0 decision gate (see
+    /// `.artifacts/perf-perbatch-20261016-015856/02-gate-decision.md`,
+    /// 2026-10-16): on the real 64-instance benchmark geometry streamed
+    /// through the carry-slot fold, 41-polygon batches measured 0.332x the
+    /// paired median of the per-polygon balanced build (50.6ms -> 16.8ms p50
+    /// at 10512 polygons) with exact sequential-oracle equivalence — the
+    /// registered 82/164/328-polygon arms measured 0.370x/0.473x/0.694x and
+    /// per-instance (~250 polygons) 0.599x. The optimum sits at small batches
+    /// because the batch call cost grows superlinearly in the batch's polygon
+    /// count while the extra union count only grows linearly with 1/chunk.
+    const REGION_CHUNK_POLYGONS: usize = 41;
+
     /// Process-side cap on the total point count of one batched region.
     ///
-    /// It is a fail-fast guard far above the measured workload (~72k points
-    /// at 64 instances) and far below any batch whose `POINT` buffer could
-    /// exhaust the process; the exact native region limits are not documented
-    /// and, when exceeded, surface as a null `CreatePolyPolygonRgn` that this
-    /// module turns into a fail-closed error (the caller falls back). The
+    /// It is a fail-fast guard far above the production workload (with
+    /// `REGION_CHUNK_POLYGONS` polygons a batch holds a few hundred points)
+    /// and far below any batch whose `POINT` buffer could exhaust the
+    /// process; the exact native region limits are not documented and, when
+    /// exceeded, surface as a null `CreatePolyPolygonRgn` that this module
+    /// turns into a fail-closed error (the caller falls back). The batch
     /// probe additionally measured that a batch whose geometry spans >= 2^24
     /// on the y axis is rejected the same fail-closed way, while the x axis
-    /// and single polygons carry no such limit; the batch path is experimental
-    /// (see `poly_poly_batch_probe`) and not used by production.
-    #[cfg(test)]
+    /// and single polygons carry no such limit; production batches are
+    /// window-local (a few thousand pixels), orders of magnitude below that
+    /// boundary.
     const MAX_BATCH_POINTS: usize = 1 << 22;
 
     /// Twice the signed area of a polygon (shoelace); the sign follows
     /// winding. `i128` keeps the sum exact across the full GDI coordinate
     /// range and any batch size.
-    #[cfg(test)]
     fn signed_area_twice(points: &[[i32; 2]]) -> i128 {
         let mut sum = 0_i128;
         for (index, &[x, y]) in points.iter().enumerate() {
@@ -384,7 +443,6 @@ mod win32 {
     /// Reversing a polygon mirrors the sign of its winding numbers everywhere
     /// without changing where they are zero, so normalization never moves an
     /// edge of the polygon's own filled area.
-    #[cfg(test)]
     fn batch_points(polygons: &[Vec<[i32; 2]>]) -> Result<(Vec<Point>, Vec<i32>, i32), String> {
         let mut total_points = 0_usize;
         let mut counts = Vec::with_capacity(polygons.len());
@@ -423,7 +481,6 @@ mod win32 {
     ///
     /// See [`batch_points`] for validation and the winding-normalization
     /// argument that makes the batch the exact union of the polygons.
-    #[cfg(test)]
     fn batched_region(polygons: &[Vec<[i32; 2]>]) -> Result<GdiRegion, String> {
         if polygons.is_empty() {
             return empty_region();
@@ -443,6 +500,128 @@ mod win32 {
         GdiRegion::from_raw(region, "CreatePolyPolygonRgn")
     }
 
+    /// Batches of consecutive polygons (`start..end` runs) split at chunk
+    /// size, covering every polygon exactly once; empty input yields no
+    /// boundaries. `chunk` is at least 1.
+    fn boundaries_from_chunk(polygons_len: usize, chunk: usize) -> Vec<usize> {
+        let chunk = chunk.max(1);
+        let mut boundaries = Vec::new();
+        let mut end = 0_usize;
+        while end < polygons_len {
+            end = (end + chunk).min(polygons_len);
+            boundaries.push(end);
+        }
+        boundaries
+    }
+
+    /// Validates per-instance end offsets into one flat polygon list and
+    /// collapses zero-length instances: returns the strictly increasing
+    /// batch boundaries, or an error when the offsets are not non-decreasing
+    /// or do not cover exactly `polygons_len` polygons (fail-closed, no
+    /// batch is attempted on inconsistent input).
+    #[cfg(test)]
+    fn grouped_boundaries(
+        polygons_len: usize,
+        instance_ends: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        let mut previous = 0_usize;
+        let mut boundaries = Vec::with_capacity(instance_ends.len());
+        for &end in instance_ends {
+            if end < previous || end > polygons_len {
+                return Err(format!(
+                    "Hit region instance boundary {end} is invalid for {polygons_len} polygons"
+                ));
+            }
+            if end > previous {
+                boundaries.push(end);
+                previous = end;
+            }
+        }
+        if previous != polygons_len {
+            return Err(format!(
+                "Hit region instance boundaries cover {previous} of {polygons_len} polygons"
+            ));
+        }
+        Ok(boundaries)
+    }
+
+    /// Batched regions streamed through the same carry-slot fold as the
+    /// per-polygon build, with one `CreatePolyPolygonRgn` call per
+    /// `boundaries` run instead of one `CreatePolygonRgn` per polygon.
+    ///
+    /// `boundaries` holds the exclusive end of every batch and must be
+    /// strictly increasing with the last entry equal to `polygons.len()`
+    /// (empty for empty input); inconsistency is rejected before any native
+    /// call. Each batch folds into the slots as soon as it is built, so live
+    /// regions stay bounded by the slot count plus one batch in flight.
+    fn streamed_batched_region(
+        polygons: &[Vec<[i32; 2]>],
+        boundaries: &[usize],
+    ) -> Result<GdiRegion, String> {
+        let mut previous = 0_usize;
+        for &end in boundaries {
+            if end <= previous || end > polygons.len() {
+                return Err(format!(
+                    "Hit region batch boundary {end} is invalid for {} polygons",
+                    polygons.len()
+                ));
+            }
+            previous = end;
+        }
+        if previous != polygons.len() {
+            return Err(format!(
+                "Hit region batch boundaries cover {previous} of {} polygons",
+                polygons.len()
+            ));
+        }
+        let mut carry_slots: [Option<GdiRegion>; usize::BITS as usize] =
+            core::array::from_fn(|_| None);
+        let mut start = 0_usize;
+        for &end in boundaries {
+            let mut carry = batched_region(&polygons[start..end])?;
+            start = end;
+            let mut level = 0;
+            while let Some(occupant) = carry_slots[level].take() {
+                carry = union_regions(occupant, carry)?;
+                level += 1;
+            }
+            carry_slots[level] = Some(carry);
+        }
+        let mut unified: Option<GdiRegion> = None;
+        for slot in &mut carry_slots {
+            let Some(region) = slot.take() else {
+                continue;
+            };
+            unified = Some(match unified {
+                Some(accumulated) => union_regions(accumulated, region)?,
+                None => region,
+            });
+        }
+        match unified {
+            Some(region) => Ok(region),
+            None => empty_region(),
+        }
+    }
+
+    /// [`streamed_batched_region`] over fixed-size batches of `chunk`
+    /// consecutive polygons; the production build passes
+    /// [`REGION_CHUNK_POLYGONS`].
+    fn chunked_region(polygons: &[Vec<[i32; 2]>], chunk: usize) -> Result<GdiRegion, String> {
+        let boundaries = boundaries_from_chunk(polygons.len(), chunk);
+        streamed_batched_region(polygons, &boundaries)
+    }
+
+    /// [`streamed_batched_region`] over one batch per instance, from the
+    /// flat list's per-instance end offsets; empty groups are skipped.
+    #[cfg(test)]
+    fn grouped_region(
+        polygons: &[Vec<[i32; 2]>],
+        instance_ends: &[usize],
+    ) -> Result<GdiRegion, String> {
+        let boundaries = grouped_boundaries(polygons.len(), instance_ends)?;
+        streamed_batched_region(polygons, &boundaries)
+    }
+
     /// The union of all polygons, or an empty region when there are none.
     ///
     /// Polygons are validated and their regions created one at a time, in
@@ -451,6 +630,11 @@ mod win32 {
     /// leaf merges upward while its level is occupied, so every merge combines
     /// two runs of equal size. The leftover slots are folded low to high; live
     /// regions are bounded by the slot count plus the merge in flight.
+    ///
+    /// Test reference of the previous production fold (now batched via
+    /// [`chunked_region`]); the oracle and the probe's `Unified` arm hold the
+    /// per-polygon behavior under test.
+    #[cfg(test)]
     fn unified_region(polygons: &[Vec<[i32; 2]>]) -> Result<GdiRegion, String> {
         // One slot per bit of the polygon count: a carry standing on level `k`
         // is the union of `2^k` polygons, and `polygons.len()` cannot exceed
@@ -492,7 +676,7 @@ mod win32 {
         polygons: &[Vec<[i32; 2]>],
         points: &[[i32; 2]],
     ) -> Result<Vec<bool>, String> {
-        let region = unified_region(polygons)?;
+        let region = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
         Ok(points
             .iter()
             .map(|point| {
@@ -547,9 +731,160 @@ mod win32 {
     pub(super) fn hit_region_matches_sequential_oracle(
         polygons: &[Vec<[i32; 2]>],
     ) -> Result<bool, String> {
-        let balanced = unified_region(polygons)?;
+        // The production path: the hook mirrors what `set_hit_region`
+        // installs, so the test entry point tracks production exactly.
+        let production = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
         let sequential = unified_region_sequential(polygons)?;
-        regions_equal(&balanced, &sequential)
+        regions_equal(&production, &sequential)
+    }
+
+    /// One batch per `chunk` consecutive polygons, each built and dropped
+    /// immediately, with no unions: the batched path's leaf-cost floor.
+    #[cfg(test)]
+    fn build_only_chunked_region(polygons: &[Vec<[i32; 2]>], chunk: usize) -> Result<(), String> {
+        let boundaries = boundaries_from_chunk(polygons.len(), chunk);
+        let mut start = 0_usize;
+        for &end in &boundaries {
+            let region = batched_region(&polygons[start..end])?;
+            drop(region);
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Number of batches `Chunked(chunk)` will build for `polygons_len`
+    /// polygons.
+    #[cfg(test)]
+    fn expected_batches(polygons_len: usize, chunk: usize) -> usize {
+        polygons_len.div_ceil(chunk.max(1))
+    }
+
+    /// Builds `polygons` under `plan` (dropping the result), checks that the
+    /// plan actually used its intended native calls, and panics if any
+    /// region is still owned afterwards. Returns the build outcome.
+    #[cfg(test)]
+    pub(super) fn probe_region_build(
+        polygons: &[Vec<[i32; 2]>],
+        plan: super::ProbedPlan<'_>,
+    ) -> Result<(), String> {
+        region_tests::reset();
+        let result = match plan {
+            super::ProbedPlan::Unified => unified_region(polygons).map(drop),
+            super::ProbedPlan::Chunked(chunk) => chunked_region(polygons, chunk).map(drop),
+            super::ProbedPlan::BuildOnlyChunked(chunk) => {
+                build_only_chunked_region(polygons, chunk)
+            }
+            super::ProbedPlan::PerInstance(ends) => grouped_region(polygons, ends).map(drop),
+        };
+        if result.is_ok() {
+            match plan {
+                super::ProbedPlan::Unified => {
+                    assert_eq!(
+                        region_tests::call_count(region_tests::Call::Polygon),
+                        polygons.len(),
+                        "Unified must call CreatePolygonRgn once per polygon"
+                    );
+                    assert_eq!(region_tests::call_count(region_tests::Call::PolyPoly), 0);
+                }
+                super::ProbedPlan::Chunked(chunk) => {
+                    assert_eq!(
+                        region_tests::call_count(region_tests::Call::Polygon),
+                        0,
+                        "Chunked must not call CreatePolygonRgn"
+                    );
+                    assert_eq!(
+                        region_tests::call_count(region_tests::Call::PolyPoly),
+                        expected_batches(polygons.len(), chunk),
+                        "Chunked must call CreatePolyPolygonRgn once per batch"
+                    );
+                }
+                super::ProbedPlan::BuildOnlyChunked(chunk) => {
+                    assert_eq!(region_tests::call_count(region_tests::Call::Polygon), 0);
+                    assert_eq!(
+                        region_tests::call_count(region_tests::Call::PolyPoly),
+                        expected_batches(polygons.len(), chunk)
+                    );
+                    assert_eq!(
+                        region_tests::call_count(region_tests::Call::Union),
+                        0,
+                        "BuildOnlyChunked must not union"
+                    );
+                    assert_eq!(region_tests::call_count(region_tests::Call::Empty), 0);
+                }
+                super::ProbedPlan::PerInstance(ends) => {
+                    assert_eq!(
+                        region_tests::call_count(region_tests::Call::Polygon),
+                        0,
+                        "PerInstance must not call CreatePolygonRgn"
+                    );
+                    let mut previous = 0_usize;
+                    let mut groups = 0_usize;
+                    for &end in ends {
+                        if end > previous {
+                            groups += 1;
+                            previous = end;
+                        }
+                    }
+                    assert_eq!(
+                        region_tests::call_count(region_tests::Call::PolyPoly),
+                        groups,
+                        "PerInstance must call CreatePolyPolygonRgn once per non-empty instance"
+                    );
+                }
+            }
+        } else if !matches!(plan, super::ProbedPlan::Unified) {
+            assert_eq!(
+                region_tests::call_count(region_tests::Call::Polygon),
+                0,
+                "Batched plans must not call CreatePolygonRgn, even when they fail"
+            );
+        }
+        assert_eq!(
+            region_tests::live_regions(),
+            0,
+            "Probe build leaked an owned region: {plan:?}"
+        );
+        result
+    }
+
+    /// Builds `polygons` under `plan` and compares the union against the
+    /// independent sequential oracle. `BuildOnlyChunked` builds no union and
+    /// is rejected. Panics if any region is still owned afterwards, so a
+    /// leaker fails the probe instead of skewing the timings.
+    #[cfg(test)]
+    pub(super) fn probe_region_equivalence(
+        polygons: &[Vec<[i32; 2]>],
+        plan: super::ProbedPlan<'_>,
+    ) -> Result<bool, String> {
+        region_tests::reset();
+        let result = match match plan {
+            super::ProbedPlan::Unified => unified_region(polygons),
+            super::ProbedPlan::Chunked(chunk) => chunked_region(polygons, chunk),
+            super::ProbedPlan::PerInstance(ends) => grouped_region(polygons, ends),
+            super::ProbedPlan::BuildOnlyChunked(_) => {
+                return Err("BuildOnlyChunked has no union to compare".to_owned());
+            }
+        } {
+            Ok(planned) => match unified_region_sequential(polygons) {
+                Ok(sequential) => {
+                    let equal = regions_equal(&planned, &sequential);
+                    drop(planned);
+                    drop(sequential);
+                    equal
+                }
+                Err(error) => {
+                    drop(planned);
+                    Err(error)
+                }
+            },
+            Err(error) => Err(error),
+        };
+        assert_eq!(
+            region_tests::live_regions(),
+            0,
+            "Probe equivalence leaked an owned region: {plan:?}"
+        );
+        result
     }
 
     /// Resolve a winit window to its Win32 `HWND`.
@@ -568,7 +903,7 @@ mod win32 {
         polygons: &[Vec<[i32; 2]>],
     ) -> Result<(), String> {
         let window = overlay_hwnd(overlay)?;
-        let region = unified_region(polygons)?;
+        let region = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
         // SAFETY: `window` is this live window's `HWND`, kept valid for the
         // call by the caller's borrow of `overlay`, and `region` is a valid
         // `HRGN` this call owns. On success the system takes over the region;
@@ -648,7 +983,15 @@ mod win32 {
             STATE.with(|state| *state.borrow())
         }
 
-        fn reset() {
+        pub(super) fn call_count(call: Call) -> usize {
+            state().calls[call as usize]
+        }
+
+        pub(super) fn live_regions() -> usize {
+            state().live
+        }
+
+        pub(super) fn reset() {
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 assert_eq!(state.live, 0, "Previous build leaked an owned region");
@@ -682,7 +1025,13 @@ mod win32 {
         }
 
         #[test]
-        fn balanced_union_matches_sequential_oracle() {
+        fn production_union_matches_sequential_oracle() {
+            // Exercises the production path through the same hook the app
+            // tests use (`hit_region_matches_sequential_oracle` builds
+            // `chunked_region(.., REGION_CHUNK_POLYGONS)`); every case here
+            // fits in one batch, so this covers the production leaf and fold,
+            // while `chunked_union_matches_sequential_oracle` covers
+            // multi-batch unions.
             let square = rectangle(0, 0, 10, 10);
             let concave = vec![
                 [0, 0],
@@ -708,9 +1057,18 @@ mod win32 {
                     vec![[1, 0], [2, 30], [1, 30]],
                 ],
                 vec![vec![[0, 0], [1, 1], [2, 2]], vec![[0, 0], [0, 0], [0, 0]]],
+                // Both GDI coordinate range corners, one corner per case: a
+                // single multi-polygon batch rejects the full-range y-spread
+                // of mixing both corners (measured, fail-closed), so each
+                // pair keeps its batch-local spread small while still
+                // covering the extreme coordinates.
                 vec![
                     rectangle(GDI_MIN_COORD, GDI_MIN_COORD, 16, 16),
+                    rectangle(GDI_MIN_COORD + 32, GDI_MIN_COORD + 32, 16, 16),
+                ],
+                vec![
                     rectangle(GDI_MAX_COORD - 16, GDI_MAX_COORD - 16, 16, 16),
+                    rectangle(GDI_MAX_COORD - 32, GDI_MAX_COORD - 32, 16, 16),
                 ],
             ];
             for mut polygons in cases {
@@ -727,6 +1085,166 @@ mod win32 {
                 assert!(hit_region_matches_sequential_oracle(&polygons).unwrap());
                 assert_eq!(state().live, 0);
             }
+        }
+
+        #[test]
+        fn chunked_union_matches_sequential_oracle() {
+            let square = rectangle(0, 0, 10, 10);
+            let concave = vec![
+                [0, 0],
+                [10, 0],
+                [10, 30],
+                [30, 30],
+                [30, 0],
+                [40, 0],
+                [40, 40],
+                [0, 40],
+            ];
+            let mut mixed_winding = rectangle(5, 5, 10, 10);
+            mixed_winding.reverse();
+            let cases = vec![
+                vec![],
+                vec![square.clone()],
+                vec![square.clone(), square.clone(), rectangle(5, 5, 10, 10)],
+                vec![concave, rectangle(50, 50, 10, 10)],
+                vec![
+                    vec![[0, 0], [1, 30], [0, 30]],
+                    vec![[1, 0], [2, 30], [1, 30]],
+                ],
+                vec![vec![[0, 0], [1, 1], [2, 2]], vec![[0, 0], [0, 0], [0, 0]]],
+                vec![square.clone(), mixed_winding],
+                // Core multi-batch shapes: 7 polygons over chunks < 41 spans
+                // several batches in every rotation, with two overlapping
+                // neighbours crossing batch boundaries in the base order.
+                (0..7)
+                    .map(|index| rectangle(index * 4, (index % 3) * 4, 10, 10))
+                    .collect(),
+            ];
+            for chunk in [1_usize, 2, 3, 5, 10_512] {
+                for mut polygons in cases.clone() {
+                    reset();
+                    let balanced = chunked_region(&polygons, chunk).unwrap();
+                    let sequential = unified_region_sequential(&polygons).unwrap();
+                    assert!(
+                        regions_equal(&balanced, &sequential).unwrap(),
+                        "chunk={chunk} raw arrangement differs"
+                    );
+                    drop(balanced);
+                    drop(sequential);
+                    assert_eq!(state().live, 0);
+                    if !polygons.is_empty() {
+                        polygons.rotate_left(1);
+                        assert!(
+                            probe_region_equivalence(
+                                &polygons,
+                                super::super::ProbedPlan::Chunked(chunk)
+                            )
+                            .unwrap(),
+                            "chunk={chunk} rotated arrangement differs"
+                        );
+                    }
+                    polygons.reverse();
+                    for polygon in &mut polygons {
+                        polygon.reverse();
+                    }
+                    assert!(
+                        probe_region_equivalence(
+                            &polygons,
+                            super::super::ProbedPlan::Chunked(chunk)
+                        )
+                        .unwrap(),
+                        "chunk={chunk} reversed arrangement differs"
+                    );
+                    assert_eq!(state().live, 0);
+                }
+            }
+        }
+
+        #[test]
+        fn chunked_union_has_bounded_peak_and_exact_stress_equivalence() {
+            let mut seed = 7_u32;
+            let polygons: Vec<_> = (0..10_512)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let x = (seed % 640) as i32 - 32;
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let y = (seed % 440) as i32 - 24;
+                    rectangle(x, y, 5, 4)
+                })
+                .collect();
+            let chunk = REGION_CHUNK_POLYGONS;
+            for count in [0_usize, 1, 40, 41, 42, 81, 82, 83, 10_512] {
+                reset();
+                let region = chunked_region(&polygons[..count], chunk).unwrap();
+                let stats = state();
+                let batches = count.div_ceil(chunk);
+                let bound = if batches < 2 {
+                    1
+                } else {
+                    (usize::BITS - batches.leading_zeros()) as usize + 1
+                };
+                assert_eq!(stats.live, 1);
+                assert!(
+                    stats.peak <= bound,
+                    "N={count}: peak {} > {bound}",
+                    stats.peak
+                );
+                assert_eq!(stats.calls[Call::Polygon as usize], 0);
+                assert_eq!(stats.calls[Call::PolyPoly as usize], batches);
+                assert_eq!(stats.calls[Call::Union as usize], batches.saturating_sub(1));
+                assert_eq!(
+                    stats.calls[Call::Empty as usize],
+                    if count == 0 { 1 } else { batches - 1 }
+                );
+                drop(region);
+                assert_eq!(state().live, 0);
+            }
+            assert!(hit_region_matches_sequential_oracle(&polygons).unwrap());
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn chunked_rejects_invalid_polygon_without_leaking() {
+            // The invalid polygon sits in the third batch: the first two
+            // batches are built, the third is rejected during validation
+            // before any native call, and nothing stays owned.
+            let mut polygons: Vec<_> = (0..100).map(|x| rectangle(x * 12, 0, 8, 8)).collect();
+            polygons[82] = vec![[0, 0], [1, 1]];
+            reset();
+            assert!(chunked_region(&polygons, 41).is_err());
+            let stats = state();
+            assert_eq!(stats.calls[Call::Polygon as usize], 0);
+            assert_eq!(stats.calls[Call::PolyPoly as usize], 2);
+            // The first two batches merged before the third was rejected.
+            assert_eq!(stats.calls[Call::Union as usize], 1);
+            assert_eq!(stats.live, 0);
+        }
+
+        #[test]
+        fn chunked_injected_native_failures_release_all_owned_regions() {
+            // 9 polygons in 3 batches of 3: each batch folds immediately, so
+            // the failures land on PolyPoly calls 1..=3, Union calls 1..=2
+            // and the Empty destination allocations inside those unions.
+            let polygons: Vec<_> = (0..9).map(|x| rectangle(x * 12, 0, 8, 8)).collect();
+            for (call, ordinals) in [
+                (Call::PolyPoly, &[1, 2, 3][..]),
+                (Call::Empty, &[1, 2][..]),
+                (Call::Union, &[1, 2][..]),
+            ] {
+                for &ordinal in ordinals {
+                    {
+                        let _failure = FailureGuard::new(call, ordinal);
+                        assert!(chunked_region(&polygons, 3).is_err(), "{call:?} #{ordinal}");
+                        assert_eq!(state().calls[call as usize], ordinal);
+                        assert_eq!(state().live, 0, "{call:?} #{ordinal}");
+                    }
+                    assert!(chunked_region(&polygons, 3).is_ok());
+                    assert_eq!(state().live, 0);
+                }
+            }
+            let _failure = FailureGuard::new(Call::Empty, 1);
+            assert!(chunked_region(&[], 3).is_err());
+            assert_eq!(state().live, 0);
         }
 
         #[test]
@@ -837,7 +1355,7 @@ mod win32 {
         }
 
         /// Phase-0 decision-gate probe for the batched (single-call) region
-        /// install.
+        /// install, on the synthetic clustered fixture.
         ///
         /// Run explicitly, in release, with output:
         /// `cargo test --release --locked --offline --lib platform -- --ignored --nocapture`
@@ -850,10 +1368,14 @@ mod win32 {
         /// fold with exact equivalence. Boundaries observed: multi-polygon
         /// batches reject a y-spread >= 2^24 (fail-closed), and ~10512
         /// simultaneously live regions exceed the process GDI handle quota.
-        /// The probe stays as the reproduction harness for the per-instance
-        /// follow-up; it never rides along with the regular suite (ignored),
-        /// asserts only the exactness of the batch (hard failure), and prints
-        /// the timing evidence for the decision made outside the test.
+        /// Follow-up (2026-10-16, `region_batch_gate_probe` in the app tests,
+        /// evidence `.artifacts/perf-perbatch-20261016-015856/`): on real
+        /// benchmark geometry the registered optimum was 41-polygon chunks at
+        /// 0.332x, adopted as the production `REGION_CHUNK_POLYGONS`; this
+        /// probe stays as the synthetic-fixture reproduction harness. It never
+        /// rides along with the regular suite (ignored), asserts only the
+        /// exactness of the batch (hard failure), and prints the timing
+        /// evidence for the decision made outside the test.
         #[test]
         #[ignore = "phase-0 micro-benchmark; run explicitly with --ignored"]
         fn poly_poly_batch_probe() {
