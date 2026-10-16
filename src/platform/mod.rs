@@ -1,3 +1,7 @@
+pub mod tray;
+
+pub use tray::{TrayAction, TrayIcon};
+
 use winit::window::{Window, WindowAttributes, WindowLevel};
 
 pub fn overlay_attributes(attributes: WindowAttributes) -> WindowAttributes {
