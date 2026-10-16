@@ -6,13 +6,13 @@ use delicium::{
     model::{
         LoadLimits, ModelData, ModelKind, load_model_bytes, try_deform_layer, try_sample_parameters,
     },
-    renderer::InstanceDraw,
+    renderer::{InstanceDraw, RenderFrame},
     simulation::{
-        FIXED_DT, Simulation, WANDER_EDGE_MARGIN, WANDER_IDLE_MAX_SECONDS, WANDER_IDLE_MIN_SECONDS,
-        WanderEvent, WorldXBounds,
+        FIXED_DT, POKE_HOP_AMPLITUDE, Simulation, WANDER_EDGE_MARGIN, WANDER_IDLE_MAX_SECONDS,
+        WANDER_IDLE_MIN_SECONDS, WanderEvent, WorldXBounds,
     },
 };
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use serde_json::json;
 
 #[test]
@@ -674,4 +674,368 @@ fn wander_rejects_invalid_bounds_and_keeps_the_previous_ones() {
         );
     }
     assert_eq!(first.wander_bounds(), Some(walkable_bounds()));
+}
+
+// -- poke reactions -------------------------------------------------------
+
+/// One sprite with the poke-friendly interaction binding at `start_x`, ticked
+/// a few times so the pose ring is warm; no wander bounds, so it never walks.
+fn poke_simulation(start_x: f32) -> (Simulation, u64) {
+    let mut sprite = common::sprite_document();
+    sprite["interaction"] = json!({"gaze_parameter": "sway"});
+    let mut simulation = Simulation::new();
+    let asset = simulation.insert_asset(common::load(&sprite)).unwrap();
+    let instance = simulation
+        .spawn(asset, Vec3::new(start_x, 0.15, 0.0))
+        .unwrap();
+    simulation.advance(Duration::from_millis(60)).unwrap();
+    (simulation, instance)
+}
+
+/// The transform of the single drawing in `frame`.
+fn transform_of(frame: &RenderFrame, instance: u64) -> Mat4 {
+    frame
+        .instances
+        .iter()
+        .find_map(|draw| match draw {
+            InstanceDraw::Sprite2d {
+                instance: id,
+                transform,
+                ..
+            }
+            | InstanceDraw::Skeleton3d {
+                instance: id,
+                transform,
+                ..
+            } if *id == instance => Some(*transform),
+            _ => None,
+        })
+        .expect("instance not found in the frame")
+}
+
+/// The sprite's layer vertices of the instance in `frame`.
+fn layer_of(frame: &RenderFrame, instance: u64) -> Vec<[f32; 2]> {
+    frame
+        .instances
+        .iter()
+        .find_map(|draw| match draw {
+            InstanceDraw::Sprite2d {
+                instance: id,
+                layers,
+                ..
+            } if *id == instance => Some(layers[0].clone()),
+            _ => None,
+        })
+        .expect("sprite draw not found")
+}
+
+/// The sprite's layer vertices mapped through the instance transform, i.e.
+/// what the renderer would draw.
+fn world_layer(frame: &RenderFrame, instance: u64) -> Vec<[f32; 2]> {
+    let (transform, vertices) = frame
+        .instances
+        .iter()
+        .find_map(|draw| match draw {
+            InstanceDraw::Sprite2d {
+                instance: id,
+                transform,
+                layers,
+                ..
+            } if *id == instance => Some((transform, &layers[0])),
+            _ => None,
+        })
+        .expect("sprite draw not found");
+    vertices
+        .iter()
+        .map(|vertex| {
+            [
+                transform.x_axis.x * vertex[0]
+                    + transform.y_axis.x * vertex[1]
+                    + transform.w_axis.x,
+                transform.x_axis.y * vertex[0]
+                    + transform.y_axis.y * vertex[1]
+                    + transform.w_axis.y,
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn poke_turns_gaze_toward_the_click_point() {
+    // The same sprite poked from the left and from the right must end up
+    // turned; the walk is off (no bounds), so only the poke can change the
+    // pose, and an un-poked twin is the control.
+    let (mut left, left_id) = poke_simulation(0.0);
+    let (mut right, right_id) = poke_simulation(0.0);
+    let (mut control, control_id) = poke_simulation(0.0);
+    left.poke_reaction(left_id, Vec3::new(-2.0, 0.5, 0.0))
+        .unwrap();
+    right
+        .poke_reaction(right_id, Vec3::new(2.0, 0.5, 0.0))
+        .unwrap();
+    // Half a second in, the envelope is past its rise, so the turn is
+    // strongly applied.
+    step(&mut left, 30);
+    step(&mut right, 30);
+    step(&mut control, 30);
+    let left_frame = left.render_frame().unwrap();
+    let right_frame = right.render_frame().unwrap();
+    let control_frame = control.render_frame().unwrap();
+    let left_local = layer_of(&left_frame, left_id);
+    let right_local = layer_of(&right_frame, right_id);
+    let control_local = layer_of(&control_frame, control_id);
+    // The rotation deformer's bottom edge reads out the turn: its y
+    // difference is sin(angle), so a poke must increase it well past the
+    // un-poked sway.
+    let turn = |vertices: &[[f32; 2]]| vertices[1][1] - vertices[0][1];
+    assert!(
+        turn(&left_local) > turn(&control_local) + 0.05,
+        "a poke did not turn the gaze: {} vs {}",
+        turn(&left_local),
+        turn(&control_local)
+    );
+    // The poke point's side and the mirror facing cancel: both pokes drive
+    // the same local pose, and only the facing differs. The world-space
+    // poses are therefore exact x-mirrors across the instance centre.
+    assert_eq!(left_local, right_local);
+    let left_world = world_layer(&left_frame, left_id);
+    let right_world = world_layer(&right_frame, right_id);
+    for (left_vertex, right_vertex) in left_world.iter().zip(right_world.iter()) {
+        assert!(
+            (left_vertex[0] + right_vertex[0]).abs() < 1e-4
+                && (left_vertex[1] - right_vertex[1]).abs() < 1e-4,
+            "poke sides are not mirrored: {left_vertex:?} vs {right_vertex:?}"
+        );
+    }
+}
+
+#[test]
+fn poke_flips_sprite_facing_only_for_2d() {
+    // 2D: the mirror sign of the root transform follows the poke direction.
+    let (mut simulation, instance) = poke_simulation(0.0);
+    let before = transform_of(&simulation.render_frame().unwrap(), instance);
+    assert_eq!(before.x_axis.x, 1.0);
+    simulation
+        .poke_reaction(instance, Vec3::new(-2.0, 0.5, 0.0))
+        .unwrap();
+    step(&mut simulation, 2);
+    let turned = transform_of(&simulation.render_frame().unwrap(), instance);
+    assert_eq!(turned.x_axis.x, -1.0);
+    simulation
+        .poke_reaction(instance, Vec3::new(2.0, 0.5, 0.0))
+        .unwrap();
+    step(&mut simulation, 2);
+    let turned_back = transform_of(&simulation.render_frame().unwrap(), instance);
+    assert_eq!(turned_back.x_axis.x, 1.0);
+    // 3D: the turn happens through the head yaw instead; the root keeps its
+    // facing. Compare the skin matrices against an un-poked twin.
+    let mut skeleton = common::skeleton_document();
+    skeleton["interaction"] = json!({"head_joint": "head"});
+    let mut posed = Simulation::new();
+    let asset = posed.insert_asset(common::load(&skeleton)).unwrap();
+    let id = posed.spawn(asset, Vec3::ZERO).unwrap();
+    let mut control = Simulation::new();
+    let asset = control.insert_asset(common::load(&skeleton)).unwrap();
+    control.spawn(asset, Vec3::ZERO).unwrap();
+    posed.poke_reaction(id, Vec3::new(-2.0, 1.0, 0.0)).unwrap();
+    step(&mut posed, 10);
+    step(&mut control, 10);
+    let posed_frame = posed.render_frame().unwrap();
+    let control_frame = control.render_frame().unwrap();
+    assert_eq!(
+        transform_of(&posed_frame, id).x_axis.x,
+        1.0,
+        "3D root facing must not flip"
+    );
+    let InstanceDraw::Skeleton3d {
+        skin_matrices: posed_skins,
+        ..
+    } = posed_frame.instances[0].clone()
+    else {
+        panic!("expected 3D draw");
+    };
+    let InstanceDraw::Skeleton3d {
+        skin_matrices: control_skins,
+        ..
+    } = control_frame.instances[0].clone()
+    else {
+        panic!("expected 3D draw");
+    };
+    assert_ne!(posed_skins, control_skins, "3D head yaw did not react");
+}
+
+#[test]
+fn poked_walk_pauses_for_the_reaction_and_resumes_after() {
+    let (mut simulation, instance) = wandering_simulation(0.0, 0);
+    // Wait for a walk to start, then poke the walker.
+    let mut walking = false;
+    for _ in 0..600 {
+        step(&mut simulation, 1);
+        if simulation
+            .drain_wander_events()
+            .iter()
+            .any(|event| matches!(event, WanderEvent::Start { .. }))
+        {
+            walking = true;
+            break;
+        }
+    }
+    assert!(walking, "no walk started within the idle window");
+    simulation
+        .poke_reaction(instance, Vec3::new(-2.0, 0.15, 0.0))
+        .unwrap();
+    let poked = simulation.instance(instance).unwrap().position;
+    // The pause lasts one reaction second, i.e. about 60 ticks (f32
+    // accumulation can shift the exact resume tick by one): the first 58
+    // ticks definitely stay still and silent.
+    for tick in 0..58 {
+        step(&mut simulation, 1);
+        let position = simulation.instance(instance).unwrap().position;
+        assert_eq!(
+            position,
+            poked,
+            "instance moved {} ticks into the reaction",
+            tick + 1
+        );
+    }
+    assert!(
+        simulation.drain_wander_events().is_empty(),
+        "a paused walk must not emit events"
+    );
+    // The walk then resumes within a few ticks, from the same spot: the
+    // phase kept its target and position, so the first moving tick continues
+    // the old walk rather than starting a new one.
+    let mut resumed = false;
+    for _ in 0..5 {
+        step(&mut simulation, 1);
+        if simulation.instance(instance).unwrap().position != poked {
+            resumed = true;
+            break;
+        }
+    }
+    assert!(resumed, "the walk did not resume after the reaction");
+}
+
+#[test]
+fn poke_hop_does_not_move_the_simulation_position() {
+    let (mut simulation, instance) = poke_simulation(0.0);
+    simulation
+        .poke_reaction(instance, Vec3::new(2.0, 0.15, 0.0))
+        .unwrap();
+    let base = transform_of(&simulation.render_frame().unwrap(), instance);
+    // The hop is a presentation offset: the transform rises, the simulation
+    // position never changes.
+    let mut peak = 0.0f32;
+    let reaction_ticks = (1.0 / FIXED_DT.as_secs_f64()).round() as u32;
+    for _ in 0..reaction_ticks {
+        step(&mut simulation, 1);
+        let transform = transform_of(&simulation.render_frame().unwrap(), instance);
+        let rise = transform.w_axis.y - base.w_axis.y;
+        assert!(rise >= -1e-6, "the hop went below the base line");
+        peak = peak.max(rise);
+        assert_eq!(simulation.instance(instance).unwrap().position.y, 0.15);
+    }
+    assert!(
+        (peak - POKE_HOP_AMPLITUDE).abs() < 0.005,
+        "hop peak {peak} is not near {POKE_HOP_AMPLITUDE}"
+    );
+    // After the reaction the hop is back to zero: the transform returns to
+    // the exact base line.
+    step(&mut simulation, 1);
+    let settled = transform_of(&simulation.render_frame().unwrap(), instance);
+    assert!((settled.w_axis.y - base.w_axis.y).abs() < 1e-6);
+}
+
+#[test]
+fn poke_reaction_restarts_and_is_deterministic() {
+    // Two identical simulations, poked at the same ticks, must agree frame
+    // for frame including the reaction phase.
+    let (mut first, first_id) = poke_simulation(0.0);
+    let (mut second, second_id) = poke_simulation(0.0);
+    for (simulation, id) in [(&mut first, first_id), (&mut second, second_id)] {
+        simulation
+            .poke_reaction(id, Vec3::new(-1.5, 0.5, 0.0))
+            .unwrap();
+    }
+    for tick in 0..90 {
+        step(&mut first, 1);
+        step(&mut second, 1);
+        // Re-poke midway: the reaction must restart without diverging.
+        if tick == 30 {
+            for (simulation, id) in [(&mut first, first_id), (&mut second, second_id)] {
+                simulation
+                    .poke_reaction(id, Vec3::new(1.5, 0.5, 0.0))
+                    .unwrap();
+            }
+        }
+        let first_frame = first.render_frame().unwrap();
+        let second_frame = second.render_frame().unwrap();
+        first_frame
+            .instances
+            .iter()
+            .zip(second_frame.instances.iter())
+            .for_each(|(a, b)| {
+                let (
+                    InstanceDraw::Sprite2d { layers: a, .. },
+                    InstanceDraw::Sprite2d { layers: b, .. },
+                ) = (a, b)
+                else {
+                    panic!("expected sprite draws");
+                };
+                assert_eq!(a, b, "frames diverged at tick {tick}");
+            });
+    }
+    // A poke after all of the above still restarts the reaction and turns
+    // the sprite: the restart path works even after the previous reaction
+    // ended mid-sequence.
+    first
+        .poke_reaction(first_id, Vec3::new(-1.0, 0.5, 0.0))
+        .unwrap();
+    step(&mut first, 2);
+    assert_eq!(
+        transform_of(&first.render_frame().unwrap(), first_id)
+            .x_axis
+            .x,
+        -1.0,
+        "the sprite did not turn toward the re-poke"
+    );
+}
+
+#[test]
+fn poke_rejects_invalid_points_and_unknown_ids() {
+    let (mut simulation, instance) = poke_simulation(0.0);
+    for invalid in [
+        Vec3::new(f32::NAN, 0.0, 0.0),
+        Vec3::new(0.0, f32::INFINITY, 0.0),
+        Vec3::new(20_001.0, 0.0, 0.0),
+    ] {
+        assert!(simulation.poke_reaction(instance, invalid).is_err());
+    }
+    assert!(simulation.poke_reaction(9999, Vec3::ZERO).is_err());
+    // A rejected poke changes nothing: the transform stays the base one.
+    let transform = transform_of(&simulation.render_frame().unwrap(), instance);
+    assert_eq!(transform.w_axis.y, 0.15);
+}
+
+#[test]
+fn poke_on_the_instance_center_hops_without_turning() {
+    // A poke inside the direction dead zone hops but never turns: the gaze
+    // parameter and the facing both stay at their defaults.
+    let (mut centred, centred_id) = poke_simulation(1.0);
+    let (mut control, control_id) = poke_simulation(1.0);
+    centred
+        .poke_reaction(centred_id, Vec3::new(1.01, 0.15, 0.0))
+        .unwrap();
+    step(&mut centred, 20);
+    step(&mut control, 20);
+    let centred_frame = centred.render_frame().unwrap();
+    let control_frame = control.render_frame().unwrap();
+    assert_eq!(
+        layer_of(&centred_frame, centred_id),
+        layer_of(&control_frame, control_id),
+        "a centred poke must not turn the gaze"
+    );
+    assert_eq!(transform_of(&centred_frame, centred_id).x_axis.x, 1.0);
+    // The hop still happens.
+    assert!(transform_of(&centred_frame, centred_id).w_axis.y > 0.15);
 }

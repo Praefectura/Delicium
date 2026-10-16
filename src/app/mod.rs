@@ -2034,6 +2034,70 @@ mod tests {
     }
 
     #[test]
+    fn click_classification_uses_a_strict_tolerance() {
+        // No travel at all.
+        assert!(is_click_press([100.0, 200.0], [100.0, 200.0]));
+        // Just inside the tolerance on one axis.
+        assert!(is_click_press([100.0, 200.0], [103.9, 200.0]));
+        // Exactly at the tolerance is already a drag.
+        assert!(!is_click_press([100.0, 200.0], [104.0, 200.0]));
+        // Vertical travel counts the same as horizontal.
+        assert!(!is_click_press([100.0, 200.0], [100.0, 204.0]));
+        assert!(is_click_press([100.0, 200.0], [100.0, 203.9]));
+        // Diagonal travel compares the true distance: 2.8^2 + 2.8^2 < 16.
+        assert!(is_click_press([100.0, 200.0], [102.8, 202.8]));
+        assert!(!is_click_press([100.0, 200.0], [103.0, 203.0]));
+    }
+
+    #[test]
+    fn capture_config_sorts_by_id_and_skips_unpersistable_instances() {
+        let mut app = Application::new(Options::default()).unwrap();
+        let model = load_model_bytes(
+            include_bytes!("../../assets/examples/puppet2d.dmodel.json"),
+            &LoadLimits::default(),
+        )
+        .unwrap();
+        let asset = app.simulation.insert_asset(model).unwrap();
+        let first = app
+            .simulation
+            .spawn(asset, Vec3::new(1.0, 0.15, 0.0))
+            .unwrap();
+        let second = app
+            .simulation
+            .spawn(asset, Vec3::new(-2.0, 0.15, 0.0))
+            .unwrap();
+        let probe = app
+            .simulation
+            .spawn(asset, Vec3::new(3.0, 0.15, 0.0))
+            .unwrap();
+        app.sources.insert(first, LoadSource::TexturedExample2d);
+        app.sources
+            .insert(second, LoadSource::File(PathBuf::from("model.dmodel.json")));
+        app.sources.insert(probe, LoadSource::ValidationProbe);
+        app.ui.pixel_hittest = false;
+        let config = app.capture_config();
+        assert_eq!(config.version, config::VERSION);
+        assert!(!config.pixel_hittest);
+        // One entry per persistable instance, ordered by instance id, with
+        // the probe and its position left out; the ids are assigned in spawn
+        // order, so the earlier spawn leads the list even though the sources
+        // map is unordered.
+        assert_eq!(config.instances.len(), 2);
+        assert_eq!(
+            config.instances[0].source,
+            config::EntrySource::TexturedExample2d
+        );
+        assert_eq!(config.instances[0].position, [1.0, 0.15, 0.0]);
+        assert_eq!(
+            config.instances[1].source,
+            config::EntrySource::File {
+                path: PathBuf::from("model.dmodel.json")
+            }
+        );
+        assert_eq!(config.instances[1].position, [-2.0, 0.15, 0.0]);
+    }
+
+    #[test]
     fn collection_keeps_all_four_example_slots_without_mixing_assets() {
         let mut app = Application::new(Options::default()).unwrap();
         let examples = [
