@@ -44,6 +44,19 @@ use self::{
 const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 const MAX_PENDING_LOADS: usize = loader::QUEUE_CAPACITY;
 
+/// Largest pointer travel, in physical pixels, for a press and release on the
+/// same character to count as a click (a poke) instead of a drag. Strictly
+/// below this distance the gesture is a click.
+const CLICK_TOLERANCE_PX: f32 = 4.0;
+
+/// Whether a press at `press` released at `release` was a click: the pointer
+/// stayed inside [`CLICK_TOLERANCE_PX`] of where it went down.
+fn is_click_press(press: [f32; 2], release: [f32; 2]) -> bool {
+    let dx = release[0] - press[0];
+    let dy = release[1] - press[1];
+    dx * dx + dy * dy < CLICK_TOLERANCE_PX * CLICK_TOLERANCE_PX
+}
+
 pub fn run() -> Result<(), String> {
     let options = match cli::parse_args(std::env::args_os().skip(1))? {
         ParseResult::Help => {
@@ -250,6 +263,9 @@ struct Application {
     examples: [Option<AssetId>; 4],
     next_request: u64,
     cursor: [f32; 2],
+    /// Cursor position where the current drag gesture went down; only set
+    /// while a drag is live. Release uses it to tell a click from a drag.
+    press_cursor: Option<[f32; 2]>,
     dragging: Option<(InstanceId, Vec3)>,
     /// The region mode a drag suspended (`Pixel`), restored on the first
     /// frame after the drag ends.
@@ -282,6 +298,7 @@ impl Application {
             examples: [None; 4],
             next_request: 1,
             cursor: [0.0; 2],
+            press_cursor: None,
             dragging: None,
             drag_region: None,
             hit_region: HitRegionCache {
@@ -1386,6 +1403,10 @@ impl Application {
     /// dragged character reports no error. Every other case resumes with a
     /// fresh idle pause, so a released character never leaves immediately.
     fn end_drag(&mut self) {
+        // Every drag-terminating path (release, cursor leaving the overlay,
+        // focus loss, mode switch, removal) goes through here, so the press
+        // origin must be dropped as well.
+        self.press_cursor = None;
         let Some((instance, _)) = self.dragging.take() else {
             return;
         };
@@ -1394,6 +1415,32 @@ impl Application {
         }
         if let Err(error) = self.simulation.resume_wander(instance) {
             self.report_error(error.to_string());
+        }
+    }
+
+    /// Reacts to a click on a character: turns it toward the cursor and
+    /// starts the short surprise hop. Logged like the drag markers so GUI
+    /// scripts can assert on the exact instance and point.
+    fn poke_character(&mut self, instance: InstanceId) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let size = runtime.overlay.inner_size();
+        let point =
+            screen_to_world_with(self.cursor, [size.width, size.height], runtime.scene_view);
+        let target = Vec3::new(point[0], point[1], 0.0);
+        match self.simulation.poke_reaction(instance, target) {
+            Ok(()) => {
+                if let Some(info) = self.simulation.instance(instance) {
+                    log::info!(
+                        "poke instance={} x={:.3} y={:.3}",
+                        instance,
+                        info.position.x,
+                        info.position.y
+                    );
+                }
+            }
+            Err(error) => self.report_error(error.to_string()),
         }
     }
 
@@ -1659,6 +1706,7 @@ impl ApplicationHandler for Application {
                 let pick_allowed =
                     self.hit_region.mode != RegionMode::Fallback || self.dragging.is_some();
                 if state == ElementState::Released {
+                    let press = self.press_cursor.take();
                     if let Some((instance, _)) = self.dragging
                         && let Some(info) = self.simulation.instance(instance)
                     {
@@ -1669,7 +1717,16 @@ impl ApplicationHandler for Application {
                             info.position.y
                         );
                     }
+                    // A press and release on the same character with almost
+                    // no travel is a click (a poke), not a drag; classify
+                    // before ending the drag, which clears the state.
+                    let clicked = self.dragging.is_some()
+                        && press.is_some_and(|press| is_click_press(press, self.cursor));
+                    let released = self.dragging;
                     self.end_drag();
+                    if clicked && let Some((instance, _)) = released {
+                        self.poke_character(instance);
+                    }
                 } else if pick_allowed
                     && let Some(instance) = self.pick_character()
                     && let Some(info) = self.simulation.instance(instance)
@@ -1691,6 +1748,7 @@ impl ApplicationHandler for Application {
                     let point = screen_to_world_with(self.cursor, [size.width, size.height], view);
                     self.dragging =
                         Some((instance, info.position - Vec3::new(point[0], point[1], 0.0)));
+                    self.press_cursor = Some(self.cursor);
                     self.ui.selected = Some(instance);
                     // Park the character: a press must not let it walk away
                     // from under the pointer, even if the pointer holds still
