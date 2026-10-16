@@ -1,5 +1,6 @@
 mod benchmark;
 pub mod cli;
+mod config;
 mod hit_region;
 mod loader;
 mod ui;
@@ -65,8 +66,12 @@ pub fn run() -> Result<(), String> {
         }
         ParseResult::Run(options) => options,
     };
+    let config_enabled = config::enabled(&options);
+    let loaded = config_enabled.then(config::load).flatten();
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let mut application = Application::new(options)?;
+    application.pending_pixel_hittest = loaded.as_ref().map(|config| config.pixel_hittest);
+    application.config = loaded;
     if let Err(error) = event_loop.run_app(&mut application) {
         let error = error.to_string();
         if let Some(benchmark) = &mut application.benchmark {
@@ -79,6 +84,11 @@ pub fn run() -> Result<(), String> {
     }
     if let Some(error) = application.fatal {
         return Err(error);
+    }
+    // The smoke test and benchmarks never reach this point with persistence
+    // enabled; a clean exit captures the scene and the hit-test preference.
+    if config_enabled && let Err(error) = config::save(&application.capture_config()) {
+        log::warn!("Cannot save the configuration: {error}");
     }
     if application.options.smoke_test && !application.smoke.passed {
         return Err(format!(
@@ -281,6 +291,15 @@ struct Application {
     /// benchmark is running, in which case closing the control window quits
     /// as before.
     tray: Option<platform::TrayIcon>,
+    /// The loaded configuration, kept unchanged until a clean exit rewrites
+    /// it; `None` when persistence is disabled or the file was unusable.
+    config: Option<config::Config>,
+    /// Configured instances not yet submitted; drained by `poll_loads` in
+    /// order, respecting the loader queue.
+    initial_config: VecDeque<config::InstanceEntry>,
+    /// A configured hit-test preference waiting for the runtime; applied
+    /// through the normal command path once the windows exist.
+    pending_pixel_hittest: Option<bool>,
     scene_sample: Option<SceneSample>,
     fatal: Option<String>,
 }
@@ -320,6 +339,9 @@ impl Application {
             smoke: SmokeState::default(),
             benchmark,
             tray: None,
+            config: None,
+            initial_config: VecDeque::new(),
+            pending_pixel_hittest: None,
             scene_sample: None,
             fatal: None,
         })
@@ -501,6 +523,11 @@ impl Application {
         self.started = Instant::now();
         self.last_frame = self.started;
         self.next_frame = self.started;
+        // A configured hit-test preference goes through the normal command
+        // path, so it gets the same fallback handling as a checkbox click.
+        if self.pending_pixel_hittest.take() == Some(false) {
+            self.apply_command(UiCommand::PixelHitTest(false), event_loop)?;
+        }
         if let Some(options) = self.options.bench.clone() {
             let runtime = self.runtime.as_ref().unwrap();
             self.benchmark.as_mut().unwrap().configure(
@@ -525,7 +552,16 @@ impl Application {
                     positions: benchmark::positions(options.instances, ModelKind::Skeleton3d),
                 },
             )?;
-        } else if self.options.models.is_empty() {
+        } else if !self.options.models.is_empty() {
+            // Explicit `--model` arguments replace the configured scene
+            // entirely, exactly as they replaced the default scene before.
+            self.initial_models
+                .extend(self.options.models.iter().cloned());
+        } else if let Some(config) = &self.config {
+            // The configuration owns the scene once the file exists: an
+            // empty instance list means an empty scene, not the defaults.
+            self.initial_config.extend(config.instances.iter().cloned());
+        } else {
             self.submit_load(
                 LoadSource::TexturedExample2d,
                 Operation::Spawn {
@@ -538,9 +574,6 @@ impl Application {
                     positions: vec![Vec3::new(0.8, 0.15, 0.0), Vec3::new(2.4, 0.15, 0.0)],
                 },
             )?;
-        } else {
-            self.initial_models
-                .extend(self.options.models.iter().cloned());
         }
         Ok(())
     }
@@ -588,8 +621,76 @@ impl Application {
                 self.report_error(error);
             }
         }
-        self.ui.pending = self.pending.len() + self.initial_models.len();
+        while self.pending.len() < MAX_PENDING_LOADS {
+            let Some(entry) = self.initial_config.pop_front() else {
+                break;
+            };
+            let position = Vec3::from_array(entry.position);
+            let source = entry.source.into_load_source();
+            // A configured bundled example that is already in the cache
+            // spawns immediately; everything else goes through the loader
+            // queue like any other load.
+            if let Some(index) = source.example_index()
+                && let Some(asset) = self.examples[index]
+            {
+                match self.simulation.spawn(asset, position) {
+                    Ok(instance) => {
+                        self.sources.insert(instance, source);
+                        if self.ui.selected.is_none() {
+                            self.ui.selected = Some(instance);
+                        }
+                        if let Some(info) = self.simulation.instance(instance) {
+                            log::info!(
+                                "spawn instance={instance} asset={asset} kind={}",
+                                info.kind
+                            );
+                        }
+                    }
+                    Err(error) => self.report_error(error.to_string()),
+                }
+                continue;
+            }
+            if let Err(error) = self.submit_load(
+                source,
+                Operation::Spawn {
+                    positions: vec![position],
+                },
+            ) {
+                self.report_error(error);
+            }
+        }
+        self.ui.pending =
+            self.pending.len() + self.initial_models.len() + self.initial_config.len();
         Ok(())
+    }
+
+    /// Captures the current scene and preferences for persistence on a clean
+    /// exit. Instances without a persistable source (loaded in this session
+    /// from nowhere, or smoke-test probes) are skipped; the order is by
+    /// instance id so the file is stable across runs.
+    fn capture_config(&self) -> config::Config {
+        let mut instances: Vec<_> = self
+            .simulation
+            .instances()
+            .into_iter()
+            .filter_map(|info| {
+                let source = self.sources.get(&info.id)?;
+                let source = config::EntrySource::from_load_source(source)?;
+                Some((
+                    info.id,
+                    config::InstanceEntry {
+                        source,
+                        position: info.position.to_array(),
+                    },
+                ))
+            })
+            .collect();
+        instances.sort_by_key(|(id, _)| *id);
+        config::Config {
+            version: config::VERSION,
+            pixel_hittest: self.ui.pixel_hittest,
+            instances: instances.into_iter().map(|(_, entry)| entry).collect(),
+        }
     }
 
     fn finish_load(&mut self, completed: CompletedLoad) {
