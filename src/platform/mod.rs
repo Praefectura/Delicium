@@ -1,5 +1,7 @@
+pub mod desktop;
 pub mod tray;
 
+pub use desktop::{TASKBAR_GAP_PX, TaskbarEdge, desktop_scene_rect, taskbar_edge};
 pub use tray::{TrayAction, TrayIcon};
 
 use winit::window::{Window, WindowAttributes, WindowLevel};

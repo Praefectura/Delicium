@@ -24,14 +24,17 @@ using System.Threading;
 using System.Windows.Forms;
 
 public static class PixelHitNative {
-    // Fail closed if the scene silently grew to the full primary monitor:
-    // this capture harness must never turn into a whole-desktop screenshot.
+    // Fail closed if the scene silently grew to (nearly) the full primary
+    // monitor: this capture harness must never turn into a whole-desktop
+    // screenshot. The desktop-span scene itself leaves a 2-pixel taskbar gap,
+    // so the guard accepts up to 8 pixels of inset on each axis.
     public static bool SpansPrimaryMonitor(Rectangle rectangle) {
         var primary = Screen.PrimaryScreen;
         if (primary == null) return false;
         var bounds = primary.Bounds;
-        return rectangle.Left == bounds.Left && rectangle.Top == bounds.Top
-            && rectangle.Width == bounds.Width && rectangle.Height == bounds.Height;
+        return rectangle.Left >= bounds.Left - 4 && rectangle.Left <= bounds.Left + 4
+            && rectangle.Top >= bounds.Top - 4 && rectangle.Top <= bounds.Top + 4
+            && rectangle.Width >= bounds.Width - 8 && rectangle.Height >= bounds.Height - 8;
     }
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
@@ -123,7 +126,7 @@ public static class PixelHitNative {
         GetWindowThreadProcessId(backdrop, out owner);
         if (owner != (uint)System.Diagnostics.Process.GetCurrentProcess().Id) throw new Exception("Capture aborted: backdrop owner changed");
         var rectangle = Client(scene);
-        if (SpansPrimaryMonitor(rectangle)) throw new Exception("Capture aborted: scene client equals the primary-monitor rectangle (desktop-span mode must not be captured)");
+        if (SpansPrimaryMonitor(rectangle)) throw new Exception("Capture aborted: scene client covers the primary monitor (desktop-span mode must not be captured)");
         for (int y=2; y<rectangle.Height; y=Math.Min(y+32, rectangle.Height-1)) {
             for (int x=2; x<rectangle.Width; x=Math.Min(x+32, rectangle.Width-1)) {
                 var hit = Hit(rectangle.Left+x, rectangle.Top+y);

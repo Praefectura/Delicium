@@ -373,6 +373,26 @@ impl Application {
         let overlay = Arc::new(if desktop_scene {
             let monitor = monitor.as_ref().unwrap();
             let size = monitor.size();
+            // The scene must not cover the monitor exactly: a topmost window
+            // with the monitor's own rect reads as fullscreen to the shell,
+            // which then suppresses the auto-hide taskbar reveal. Leave a
+            // small gap on the taskbar's edge (bottom if the shell query
+            // fails, the common docking edge).
+            let edge = platform::taskbar_edge().unwrap_or(platform::TaskbarEdge::Bottom);
+            let (position, scene_size) = platform::desktop_scene_rect(
+                monitor.position(),
+                size,
+                edge,
+                platform::TASKBAR_GAP_PX,
+            );
+            log::info!(
+                "desktop scene edge={:?} position=({}, {}) size={}x{}",
+                edge,
+                position.x,
+                position.y,
+                scene_size.width,
+                scene_size.height
+            );
             event_loop
                 .create_window(platform::overlay_attributes(
                     Window::default_attributes()
@@ -381,8 +401,8 @@ impl Application {
                         .with_decorations(false)
                         .with_transparent(true)
                         .with_window_level(WindowLevel::AlwaysOnTop)
-                        .with_inner_size(PhysicalSize::new(size.width, size.height))
-                        .with_position(monitor.position()),
+                        .with_inner_size(scene_size)
+                        .with_position(position),
                 ))
                 .map_err(|error| error.to_string())?
         } else {

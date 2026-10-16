@@ -26,14 +26,17 @@ using System.Threading;
 using System.Windows.Forms;
 
 public static class DeliciumWindowTest {
-    // Fail closed if the scene silently grew to the full primary monitor:
-    // this capture harness must never turn into a whole-desktop screenshot.
+    // Fail closed if the scene silently grew to (nearly) the full primary
+    // monitor: this capture harness must never turn into a whole-desktop
+    // screenshot. The desktop-span scene itself leaves a 2-pixel taskbar gap,
+    // so the guard accepts up to 8 pixels of inset on each axis.
     public static bool SpansPrimaryMonitor(Rectangle rectangle) {
         var primary = Screen.PrimaryScreen;
         if (primary == null) return false;
         var bounds = primary.Bounds;
-        return rectangle.Left == bounds.Left && rectangle.Top == bounds.Top
-            && rectangle.Width == bounds.Width && rectangle.Height == bounds.Height;
+        return rectangle.Left >= bounds.Left - 4 && rectangle.Left <= bounds.Left + 4
+            && rectangle.Top >= bounds.Top - 4 && rectangle.Top <= bounds.Top + 4
+            && rectangle.Width >= bounds.Width - 8 && rectangle.Height >= bounds.Height - 8;
     }
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
@@ -127,7 +130,7 @@ public static class DeliciumWindowTest {
     }
     public static void Capture(IntPtr scene, IntPtr controls, IntPtr backdrop, string path) {
         var rectangle = Client(scene);
-        if (SpansPrimaryMonitor(rectangle)) throw new Exception("Capture aborted: scene client equals the primary-monitor rectangle (desktop-span mode must not be captured)");
+        if (SpansPrimaryMonitor(rectangle)) throw new Exception("Capture aborted: scene client covers the primary monitor (desktop-span mode must not be captured)");
         foreach (var point in new [] { new Point {X=rectangle.Left+2,Y=rectangle.Top+2}, new Point {X=rectangle.Right-3,Y=rectangle.Bottom-3} }) {
             var hit = Hit(point.X, point.Y);
             if (hit != scene && hit != controls && hit != backdrop) {

@@ -4,10 +4,13 @@ param(
 )
 
 # Desktop-span acceptance: ordinary launch (no --overlay-size) must place the
-# scene client exactly on the primary-monitor physical rectangle, keep the
-# controls inside the monitor, and support dragging past the old bounded
-# window edge. This harness never takes screenshots: it defines no Capture or
-# EmptyArea helper at all, so a whole-desktop capture cannot happen here.
+# scene client on the primary-monitor physical rectangle minus a 2-pixel gap
+# on the taskbar edge (a topmost window with the exact monitor rect reads as
+# fullscreen to the shell, which suppresses the auto-hide taskbar reveal),
+# keep the controls inside the monitor, and support dragging past the old
+# bounded window edge. This harness never takes screenshots: it defines no
+# Capture or EmptyArea helper at all, so a whole-desktop capture cannot
+# happen here.
 $ErrorActionPreference = 'Stop'
 $project = Split-Path $PSScriptRoot -Parent
 $run = Join-Path $project ('.artifacts/windows-desktop-' + [DateTime]::Now.ToString('yyyyMMdd-HHmmss-ffff'))
@@ -56,6 +59,9 @@ public static class DesktopSpanNative {
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr region);
     [DllImport("gdi32.dll")] private static extern int GetRgnBox(IntPtr region, out Rect box);
     [DllImport("user32.dll")] private static extern int GetWindowRgn(IntPtr window, IntPtr region);
+
+    [StructLayout(LayoutKind.Sequential)] public struct AppBarData { public uint CbSize; public IntPtr HWnd; public uint CallbackMessage; public uint Edge; public Rect Rc; public IntPtr LParam; }
+    [DllImport("shell32.dll")] private static extern UIntPtr SHAppBarMessage(uint message, ref AppBarData data);
 
     public static IntPtr Find(uint process, string title) {
         IntPtr result = IntPtr.Zero;
@@ -118,6 +124,11 @@ public static class DesktopSpanNative {
             if (GetRgnBox(region, out box) == 0) throw new Exception("Cannot inspect region box");
             return Rectangle.FromLTRB(box.Left, box.Top, box.Right, box.Bottom);
         } finally { DeleteObject(region); }
+    }
+    public static int TaskbarEdge() {
+        var data = new AppBarData { CbSize = (uint)Marshal.SizeOf(typeof(AppBarData)) };
+        if (SHAppBarMessage(5, ref data) == UIntPtr.Zero) return -1;
+        return (int)data.Edge;
     }
 }
 
@@ -203,8 +214,23 @@ try {
 
     $monitor = [DesktopSpanNative]::Primary()
     $rectangle = [DesktopSpanNative]::Client($scene)
-    Assert-Test ($rectangle.Left -eq $monitor.Left -and $rectangle.Top -eq $monitor.Top) 'Scene client origin equals the primary-monitor origin exactly'
-    Assert-Test ($rectangle.Width -eq $monitor.Width -and $rectangle.Height -eq $monitor.Height) 'Scene client size equals the primary-monitor physical size exactly'
+    # The scene leaves a 2-physical-pixel gap on the taskbar's edge; the shell
+    # query that picks the edge must agree with the geometry the application
+    # produced. A window covering the monitor exactly would suppress the
+    # auto-hide taskbar reveal.
+    $taskbarEdge = [DesktopSpanNative]::TaskbarEdge()
+    Assert-Test ($taskbarEdge -ge 0) 'Shell reports the main taskbar edge via SHAppBarMessage'
+    $gap = 2
+    switch ($taskbarEdge) {
+        0 { $expectedRectangle = [System.Drawing.Rectangle]::new($monitor.Left + $gap, $monitor.Top, $monitor.Width - $gap, $monitor.Height) }
+        1 { $expectedRectangle = [System.Drawing.Rectangle]::new($monitor.Left, $monitor.Top + $gap, $monitor.Width, $monitor.Height - $gap) }
+        2 { $expectedRectangle = [System.Drawing.Rectangle]::new($monitor.Left, $monitor.Top, $monitor.Width - $gap, $monitor.Height) }
+        3 { $expectedRectangle = [System.Drawing.Rectangle]::new($monitor.Left, $monitor.Top, $monitor.Width, $monitor.Height - $gap) }
+        default { throw ('Unknown taskbar edge from the shell: ' + $taskbarEdge) }
+    }
+    Assert-Test ($rectangle.Left -eq $expectedRectangle.Left -and $rectangle.Top -eq $expectedRectangle.Top) 'Scene client origin matches the monitor rect inset by the taskbar gap'
+    Assert-Test ($rectangle.Width -eq $expectedRectangle.Width -and $rectangle.Height -eq $expectedRectangle.Height) 'Scene client size matches the monitor rect inset by the taskbar gap'
+    Assert-Test (-not ($rectangle.Width -eq $monitor.Width -and $rectangle.Height -eq $monitor.Height)) 'Scene client never covers the monitor exactly'
     Assert-Test ([DesktopSpanNative]::Undecorated($scene)) 'Client and window coordinates have the same origin and extent'
     Assert-Test ([DesktopSpanNative]::HasRegion($scene)) 'Default mode installs a native window region'
     Assert-Test (-not [DesktopSpanNative]::PassesThrough($scene)) 'Default mode is not whole-window pass-through'
