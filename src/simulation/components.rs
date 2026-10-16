@@ -61,6 +61,33 @@ pub(crate) struct InteractionState {
 #[derive(Resource, Default)]
 pub(crate) struct InteractionsRes(pub Vec<InteractionEdge>);
 
+/// Short-lived reaction to a pointer poke (a press and release on the
+/// instance without a drag).
+///
+/// Owned by the instance; `elapsed` counts fixed steps from the poke and
+/// `direction` is the unit horizontal vector from the instance to the poke
+/// point (or exactly zero for a poke on the centre, which keeps the facing).
+/// A pristine instance starts out with no reaction: `elapsed` sits at the
+/// sentinel [`POKE_REACTION_SECONDS`](super::POKE_REACTION_SECONDS), so a
+/// freshly spawned instance is never treated as mid-reaction.
+#[derive(Component)]
+pub(crate) struct PokeReaction {
+    /// Unit direction to the poke point, or `Vec3::ZERO` when dead-zone'd.
+    pub direction: Vec3,
+    /// Seconds since the poke; the reaction is over at
+    /// [`POKE_REACTION_SECONDS`](super::POKE_REACTION_SECONDS).
+    pub elapsed: f32,
+}
+
+impl Default for PokeReaction {
+    fn default() -> Self {
+        Self {
+            direction: Vec3::ZERO,
+            elapsed: super::POKE_REACTION_SECONDS,
+        }
+    }
+}
+
 /// Autonomous walking state of one instance.
 ///
 /// The position is only ever written by the wander system (and by external

@@ -8,14 +8,16 @@
 //! # Ticks
 //!
 //! [`Simulation::advance`] consumes whole [`FIXED_DT`] steps, at most
-//! [`MAX_SUBSTEPS`] per call. One tick runs three systems in a fixed order:
+//! [`MAX_SUBSTEPS`] per call. One tick runs four systems in a fixed order:
 //!
 //! 1. the wander step: every instance advances its idle/walk state machine
 //!    inside [`Simulation::wander_bounds`] and may write its own position;
 //! 2. an interaction snapshot: every instance finds its nearest neighbour
 //!    inside [`INTERACTION_RADIUS`] and eases its reaction weight;
-//! 3. the pose evaluation: animation sampling (2D parameters or 3D joint
-//!    locals) plus the interaction drive.
+//! 3. the poke reaction step: every active poke reaction ages by one step
+//!    and turns its instance toward the poke point;
+//! 4. the pose evaluation: animation sampling (2D parameters or 3D joint
+//!    locals) plus the interaction or poke drive.
 //!
 //! The walk runs first so the snapshot and the same frame's render agree on
 //! where every instance is.
@@ -56,8 +58,8 @@ use crate::{
 };
 
 use components::{
-    InstanceTag, InteractionState, InteractionsRes, ModelHandle, PoseState, Position, TickStatus,
-    TimeState, WanderBoundsRes, WanderEventsRes, WanderState,
+    InstanceTag, InteractionState, InteractionsRes, ModelHandle, PokeReaction, PoseState, Position,
+    TickStatus, TimeState, WanderBoundsRes, WanderEventsRes, WanderState,
 };
 use pose::{DriveInput, Pose, clamp, interpolated_locals, interpolated_parameters, sample_pose};
 
@@ -126,6 +128,26 @@ pub const WANDER_SEED_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 /// dropped; they are pure observations the simulation never reads back, so
 /// dropping cannot change any state.
 pub const WANDER_EVENT_CAP: usize = 4096;
+
+/// How long a poke reaction (turn plus hop) lasts, in seconds. While a
+/// reaction is active the instance stands still and keeps looking at the
+/// poke point.
+pub const POKE_REACTION_SECONDS: f32 = 1.0;
+
+/// Peak height of the poke hop, in world units. Small enough to stay well
+/// inside the 0.1 geometric hit-region tolerance, so the hop never changes
+/// which pixels hit the instance.
+pub const POKE_HOP_AMPLITUDE: f32 = 0.07;
+
+/// Fraction of the reaction spent ramping the turn up from zero.
+const POKE_RISE_FRACTION: f32 = 0.15;
+
+/// Duration of the hop parabola, in seconds.
+const POKE_HOP_SECONDS: f32 = 0.45;
+
+/// Horizontal distance below which a poke counts as on-centre: no turn is
+/// applied (the direction is undecidable), only the hop.
+const POKE_DIRECTION_DEAD_ZONE: f32 = 0.05;
 
 /// Largest accepted coordinate of any instance position, on any axis.
 const MAX_COORDINATE: f32 = 10_000.0;
@@ -300,6 +322,7 @@ impl Simulation {
         world.register_component::<PoseState>();
         world.register_component::<InteractionState>();
         world.register_component::<WanderState>();
+        world.register_component::<PokeReaction>();
         Self {
             world,
             schedule: systems::build_schedule(),
@@ -406,6 +429,7 @@ impl Simulation {
                 },
                 InteractionState::default(),
                 systems::initial_wander_state(id),
+                PokeReaction::default(),
             ))
             .id();
         self.entities.insert(id, entity);
@@ -524,6 +548,40 @@ impl Simulation {
             .ok_or(SimError::UnknownInstance(id))?;
         wander.suspended = false;
         systems::reset_to_idle(&mut wander);
+        Ok(())
+    }
+
+    /// Starts (or restarts) a poke reaction on an instance: it stops
+    /// walking, turns toward `point` for [`POKE_REACTION_SECONDS`] and hops
+    /// once. A repeat poke resets the reaction.
+    ///
+    /// The point is validated like any other world position; a point inside
+    /// the horizontal dead zone around the instance turns the reaction into a
+    /// hop without a turn. The position itself never moves.
+    pub fn poke_reaction(&mut self, id: InstanceId, point: Vec3) -> Result<(), SimError> {
+        validate_position(point)?;
+        let entity = *self
+            .entities
+            .get(&id)
+            .ok_or(SimError::UnknownInstance(id))?;
+        let position = self
+            .world
+            .get::<Position>(entity)
+            .ok_or(SimError::UnknownInstance(id))?
+            .0;
+        let delta = point - position;
+        let horizontal = Vec3::new(delta.x, delta.y, 0.0);
+        let direction = if horizontal.length() < POKE_DIRECTION_DEAD_ZONE {
+            Vec3::ZERO
+        } else {
+            horizontal.normalize()
+        };
+        let mut reaction = self
+            .world
+            .get_mut::<PokeReaction>(entity)
+            .ok_or(SimError::UnknownInstance(id))?;
+        reaction.direction = direction;
+        reaction.elapsed = 0.0;
         Ok(())
     }
 
@@ -740,8 +798,14 @@ impl Simulation {
                 .world
                 .get::<WanderState>(entity)
                 .map_or(1.0, |wander| wander.facing);
-            let transform =
-                Mat4::from_translation(position) * Mat4::from_scale(Vec3::new(facing, 1.0, 1.0));
+            // The poke hop is a presentation-only vertical offset; the
+            // instance position itself never moves.
+            let hop = self
+                .world
+                .get::<PokeReaction>(entity)
+                .map_or(0.0, |reaction| systems::poke_hop(reaction.elapsed));
+            let transform = Mat4::from_translation(position + Vec3::new(0.0, hop, 0.0))
+                * Mat4::from_scale(Vec3::new(facing, 1.0, 1.0));
             match &handle.model.data {
                 ModelData::Sprite2d(sprite) => {
                     let parameters =

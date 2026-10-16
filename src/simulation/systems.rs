@@ -1,6 +1,6 @@
 //! Schedule and systems that advance the simulation world one fixed step.
 //!
-//! One tick runs three systems, in this order:
+//! One tick runs four systems, in this order:
 //!
 //! 1. [`wander_step`]: every instance advances its idle/walk state machine
 //!    inside the current wander bounds and may move horizontally;
@@ -9,7 +9,9 @@
 //!    [`INTERACTION_RADIUS`](super::INTERACTION_RADIUS) for each instance and
 //!    eases the reaction weights; it runs after the walk so the snapshot and
 //!    the same frame's render agree on where every instance is;
-//! 3. [`advance_poses`]: a parallel-query system that samples animation
+//! 3. [`reaction_step`]: ages every poke reaction by one step and turns 2D
+//!    instances toward their poke point while one is active;
+//! 4. [`advance_poses`]: a parallel-query system that samples animation
 //!    parameters or joint locals for every instance and advances the pose
 //!    ring (`prev <- curr <- sampled`).
 //!
@@ -29,14 +31,17 @@ use bevy_ecs::{
 use bevy_tasks::{ComputeTaskPool, TaskPoolBuilder};
 use glam::Vec3;
 
+use crate::model::ModelKind;
+
 use super::components::{
-    InstanceTag, InteractionState, InteractionsRes, ModelHandle, PoseState, Position, TickStatus,
-    TimeState, WanderBoundsRes, WanderEventsRes, WanderPhase, WanderState,
+    InstanceTag, InteractionState, InteractionsRes, ModelHandle, PokeReaction, PoseState, Position,
+    TickStatus, TimeState, WanderBoundsRes, WanderEventsRes, WanderPhase, WanderState,
 };
 use super::pose::{DriveInput, sample_pose};
 use super::{
     FIXED_DT_SECONDS, INTERACTION_EASE_PER_SECOND, INTERACTION_RADIUS, InstanceId, InteractionEdge,
-    MAX_SIM_THREADS, SimError, WANDER_ARRIVE_EPSILON, WANDER_EDGE_MARGIN, WANDER_EVENT_CAP,
+    MAX_SIM_THREADS, POKE_HOP_AMPLITUDE, POKE_HOP_SECONDS, POKE_REACTION_SECONDS,
+    POKE_RISE_FRACTION, SimError, WANDER_ARRIVE_EPSILON, WANDER_EDGE_MARGIN, WANDER_EVENT_CAP,
     WANDER_IDLE_MAX_SECONDS, WANDER_IDLE_MIN_SECONDS, WANDER_MIN_TARGET_DISTANCE, WANDER_SEED_STEP,
     WANDER_SPEED, WanderEvent,
 };
@@ -122,13 +127,22 @@ pub fn initialize_task_pool() {
     });
 }
 
-/// Builds the fixed-step schedule: wander first, snapshot second, poses last.
+/// Builds the fixed-step schedule: wander, snapshot, poke reactions, poses.
 ///
 /// The walk runs before the interaction snapshot so both the snapshot and the
-/// same frame's render describe the same (already-walked) position.
+/// same frame's render describe the same (already-walked) position; the
+/// reaction step ages the poke reactions before the pose pass reads them.
 pub fn build_schedule() -> Schedule {
     let mut schedule = Schedule::default();
-    schedule.add_systems((wander_step, interaction_snapshot, advance_poses).chain());
+    schedule.add_systems(
+        (
+            wander_step,
+            interaction_snapshot,
+            reaction_step,
+            advance_poses,
+        )
+            .chain(),
+    );
     schedule
 }
 
@@ -137,13 +151,16 @@ pub fn build_schedule() -> Schedule {
 /// Deterministic by construction: every instance owns its state and its
 /// random stream, and each phase change draws exactly one value, so neither
 /// the query order nor the bounds geometry can change the sequence. A
-/// suspended instance is completely frozen; without bounds nothing moves.
+/// suspended instance is completely frozen; an instance with an active poke
+/// reaction stands still too (it looks at the poke point for
+/// [`POKE_REACTION_SECONDS`](super::POKE_REACTION_SECONDS)) and resumes
+/// exactly where it left off; without bounds nothing moves.
 ///
 /// An instance found outside the walkable range (an external placement, or
 /// bounds that shrank) walks back in immediately instead of waiting out its
 /// idle pause, so it can never sit off-screen for a whole idle period.
 pub fn wander_step(
-    mut query: Query<(&InstanceTag, &mut Position, &mut WanderState)>,
+    mut query: Query<(&InstanceTag, &mut Position, &mut WanderState, &PokeReaction)>,
     bounds: Res<WanderBoundsRes>,
     mut events: ResMut<WanderEventsRes>,
 ) {
@@ -161,8 +178,8 @@ pub fn wander_step(
         (lo, hi)
     };
 
-    for (tag, mut position, mut wander) in query.iter_mut() {
-        if wander.suspended {
+    for (tag, mut position, mut wander, reaction) in query.iter_mut() {
+        if wander.suspended || reaction.elapsed < POKE_REACTION_SECONDS {
             continue;
         }
         let id = tag.0;
@@ -251,6 +268,63 @@ fn push_event(events: &mut WanderEventsRes, event: WanderEvent) {
     if events.0.len() < WANDER_EVENT_CAP {
         events.0.push(event);
     }
+}
+
+/// Ages every poke reaction by one fixed step.
+///
+/// While the reaction is active and the poke direction is not dead-zone'd, a
+/// 2D instance is turned to face the poke point by flipping its mirror
+/// `facing`; 3D instances turn through the pose drive instead. Once
+/// `elapsed` reaches [`POKE_REACTION_SECONDS`](super::POKE_REACTION_SECONDS)
+/// the direction is cleared, so the pose pass falls back to the interaction
+/// drive on the very next step.
+pub fn reaction_step(mut query: Query<(&ModelHandle, &mut WanderState, &mut PokeReaction)>) {
+    for (handle, mut wander, mut reaction) in query.iter_mut() {
+        if reaction.elapsed >= POKE_REACTION_SECONDS {
+            continue;
+        }
+        reaction.elapsed = (reaction.elapsed + FIXED_DT_SECONDS as f32).min(POKE_REACTION_SECONDS);
+        if reaction.elapsed >= POKE_REACTION_SECONDS {
+            reaction.direction = Vec3::ZERO;
+            continue;
+        }
+        if reaction.direction.x != 0.0 && handle.model.kind() == ModelKind::Sprite2d {
+            wander.facing = if reaction.direction.x >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
+        }
+    }
+}
+
+/// Turn strength of a poke reaction at `elapsed` seconds: a fast linear rise
+/// over the first [`POKE_RISE_FRACTION`](super::POKE_RISE_FRACTION) of the
+/// reaction, then a quadratic fall to zero at
+/// [`POKE_REACTION_SECONDS`](super::POKE_REACTION_SECONDS).
+pub(crate) fn poke_envelope(elapsed: f32) -> f32 {
+    if elapsed < 0.0 || elapsed >= POKE_REACTION_SECONDS {
+        return 0.0;
+    }
+    let rise = POKE_REACTION_SECONDS * POKE_RISE_FRACTION;
+    if elapsed < rise {
+        elapsed / rise
+    } else {
+        let remaining = 1.0 - (elapsed - rise) / (POKE_REACTION_SECONDS - rise);
+        remaining * remaining
+    }
+}
+
+/// Vertical offset of the poke hop at `elapsed` seconds: one parabola
+/// peaking at [`POKE_HOP_AMPLITUDE`](super::POKE_HOP_AMPLITUDE) halfway
+/// through [`POKE_HOP_SECONDS`](super::POKE_HOP_SECONDS), zero everywhere
+/// else. Presentation only; the instance position never moves.
+pub(crate) fn poke_hop(elapsed: f32) -> f32 {
+    if elapsed < 0.0 || elapsed >= POKE_HOP_SECONDS {
+        return 0.0;
+    }
+    let progress = elapsed / POKE_HOP_SECONDS;
+    4.0 * progress * (1.0 - progress) * POKE_HOP_AMPLITUDE
 }
 
 /// Resolves the nearest neighbour of every instance and eases reactions.
@@ -365,6 +439,7 @@ pub fn advance_poses(
         &ModelHandle,
         &InteractionState,
         &WanderState,
+        &PokeReaction,
         &mut TimeState,
         &mut PoseState,
     )>,
@@ -374,10 +449,16 @@ pub fn advance_poses(
     let worker_slot = Arc::clone(&slot);
 
     query.par_iter_mut().for_each(
-        move |(tag, handle, interaction, wander, mut time, mut pose)| {
+        move |(tag, handle, interaction, wander, reaction, mut time, mut pose)| {
             let id = tag.0;
             let next_time = time.time + FIXED_DT_SECONDS;
-            let drive = DriveInput::from_state(interaction, wander.facing);
+            // An active poke reaction wins over the neighbour reaction; once
+            // it ends this falls back to the interaction drive.
+            let drive = if reaction.elapsed < POKE_REACTION_SECONDS {
+                DriveInput::from_reaction(reaction, wander.facing)
+            } else {
+                DriveInput::from_state(interaction, wander.facing)
+            };
             match sample_pose(&handle.model, next_time, &drive, id) {
                 Ok(next) => {
                     time.time = next_time;
@@ -412,6 +493,58 @@ mod tests {
     use super::*;
     use crate::model::{LoadLimits, ModelData, load_model_bytes, try_sample_parameters};
     use bevy_ecs::entity::Entity;
+
+    #[test]
+    fn poke_envelope_rises_and_decays() {
+        // Outside the window the envelope is exactly zero.
+        assert_eq!(poke_envelope(-0.01), 0.0);
+        assert_eq!(poke_envelope(POKE_REACTION_SECONDS), 0.0);
+        assert_eq!(poke_envelope(POKE_REACTION_SECONDS + 0.5), 0.0);
+        // Start at zero, reach the peak at the end of the rise, decay to
+        // zero at the end of the reaction.
+        assert_eq!(poke_envelope(0.0), 0.0);
+        let rise = POKE_REACTION_SECONDS * POKE_RISE_FRACTION;
+        assert!((poke_envelope(rise) - 1.0).abs() < 1e-6);
+        assert!(poke_envelope(rise + 1e-4) < 1.0);
+        let midpoint = rise + (POKE_REACTION_SECONDS - rise) * 0.5;
+        let expected = 0.25; // (1 - 0.5)^2
+        assert!((poke_envelope(midpoint) - expected).abs() < 1e-6);
+        // Monotone rise, then monotone decay.
+        let mut previous = 0.0;
+        for step in 1..=10 {
+            let value = poke_envelope(rise * step as f32 / 10.0);
+            assert!(value >= previous, "envelope is not rising");
+            previous = value;
+        }
+        let mut previous = poke_envelope(rise);
+        for step in 1..=10 {
+            let t = rise + (POKE_REACTION_SECONDS - rise) * step as f32 / 10.0;
+            let value = poke_envelope(t);
+            assert!(value <= previous, "envelope is not decaying");
+            previous = value;
+        }
+    }
+
+    #[test]
+    fn poke_hop_is_a_single_parabola() {
+        assert_eq!(poke_hop(-0.01), 0.0);
+        assert_eq!(poke_hop(0.0), 0.0);
+        assert_eq!(poke_hop(POKE_HOP_SECONDS), 0.0);
+        assert_eq!(poke_hop(POKE_HOP_SECONDS + 1.0), 0.0);
+        // Peak at half duration, symmetric around it.
+        let peak = poke_hop(POKE_HOP_SECONDS * 0.5);
+        assert!((peak - POKE_HOP_AMPLITUDE).abs() < 1e-6);
+        let quarter = poke_hop(POKE_HOP_SECONDS * 0.25);
+        let three_quarters = poke_hop(POKE_HOP_SECONDS * 0.75);
+        // 4*s*(1-s) at s = 0.25 and 0.75 both give 0.75 * amplitude.
+        assert!((quarter - 0.75 * POKE_HOP_AMPLITUDE).abs() < 1e-6);
+        assert!((three_quarters - quarter).abs() < 1e-6);
+        // Never negative and never above the amplitude.
+        for step in 0..=20 {
+            let value = poke_hop(POKE_HOP_SECONDS * step as f32 / 20.0);
+            assert!((0.0..=POKE_HOP_AMPLITUDE + 1e-6).contains(&value));
+        }
+    }
 
     #[test]
     fn long_running_ticks_keep_full_precision_until_clip_sampling() {

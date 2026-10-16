@@ -7,7 +7,7 @@ use crate::model::{
     try_sample_joints, try_sample_parameters,
 };
 
-use super::components::InteractionState;
+use super::components::{InteractionState, PokeReaction};
 use super::{HEAD_YAW_LIMIT, InstanceId, SimError};
 
 /// Kind-independent evaluation state of one instance.
@@ -64,6 +64,18 @@ impl DriveInput {
                 facing,
                 ..Self::none()
             },
+        }
+    }
+
+    /// Reads the turn from a poke reaction under the instance's current
+    /// mirror facing. The weight follows the poke envelope, so the turn
+    /// fades in and out on its own; a dead-zone'd direction (a poke on the
+    /// centre) yields no turn at all.
+    pub fn from_reaction(reaction: &PokeReaction, facing: f32) -> Self {
+        Self {
+            direction: reaction.direction,
+            weight: super::systems::poke_envelope(reaction.elapsed).clamp(0.0, 1.0),
+            facing,
         }
     }
 }
@@ -396,6 +408,30 @@ mod tests {
             mirrored[head].rotation,
             expected
         );
+    }
+
+    #[test]
+    fn reaction_drive_follows_the_envelope_and_dead_zone() {
+        let mut reaction = PokeReaction {
+            direction: Vec3::new(1.0, 0.0, 0.0),
+            elapsed: 0.0,
+        };
+        // A fresh poke has an all-but-zero weight, the peak is 1 and the end
+        // of the reaction is exactly zero again.
+        assert!(DriveInput::from_reaction(&reaction, 1.0).weight < 1e-6);
+        reaction.elapsed = super::super::POKE_REACTION_SECONDS * 0.15;
+        let active = DriveInput::from_reaction(&reaction, 1.0);
+        assert!((active.weight - 1.0).abs() < 1e-6);
+        assert_eq!(active.direction, Vec3::new(1.0, 0.0, 0.0));
+        reaction.elapsed = super::super::POKE_REACTION_SECONDS;
+        assert_eq!(DriveInput::from_reaction(&reaction, 1.0).weight, 0.0);
+        // A dead-zone'd direction never carries a turn, even at full weight:
+        // the pose gate refuses it.
+        reaction.elapsed = super::super::POKE_REACTION_SECONDS * 0.15;
+        reaction.direction = Vec3::ZERO;
+        let centred = DriveInput::from_reaction(&reaction, 1.0);
+        assert!(centred.weight > 0.0);
+        assert!(!active_direction(&centred));
     }
 
     #[test]
