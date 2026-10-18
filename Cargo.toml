@@ -3,6 +3,7 @@ name = "delicium"
 version = "0.1.0"
 edition = "2024"
 description = "A Windows desktop character runtime with native 2D and 3D models"
+license = "MIT"
 
 [dependencies]
 base64 = "=0.22.1"
