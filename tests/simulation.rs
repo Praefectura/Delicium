@@ -9,11 +9,143 @@ use delicium::{
     renderer::{InstanceDraw, RenderFrame},
     simulation::{
         FIXED_DT, POKE_HOP_AMPLITUDE, Simulation, WANDER_EDGE_MARGIN, WANDER_IDLE_MAX_SECONDS,
-        WANDER_IDLE_MIN_SECONDS, WanderEvent, WorldXBounds,
+        WANDER_IDLE_MIN_SECONDS, WanderEvent, WorldRect, WorldXBounds,
     },
 };
 use glam::{Mat4, Vec3};
 use serde_json::json;
+
+fn action_sprite() -> Arc<delicium::model::CompiledModel> {
+    let mut document = common::sprite_document();
+    document["format_version"] = json!("0.2");
+    document["actions"] = json!({"idle":"idle", "walk":"walk", "reaction":"reaction"});
+    document["sprite2d"]["animations"] = json!([
+        {"name":"idle", "duration":1.0, "channels":[{"parameter":"sway", "keys":[
+            {"time":0.0,"value":0.0}, {"time":1.0,"value":0.0}
+        ]}]},
+        {"name":"walk", "duration":1.0, "channels":[{"parameter":"sway", "keys":[
+            {"time":0.0,"value":-0.8}, {"time":1.0,"value":-0.8}
+        ]}]},
+        {"name":"reaction", "duration":1.0, "channels":[{"parameter":"sway", "keys":[
+            {"time":0.0,"value":0.8}, {"time":1.0,"value":0.8}
+        ]}]}
+    ]);
+    common::load(&document)
+}
+
+#[test]
+fn bound_actions_follow_a_real_walk_then_return_to_idle_and_drain_once() {
+    use delicium::simulation::ActionKind;
+
+    let mut simulation = Simulation::new();
+    let asset = simulation.insert_asset(action_sprite()).unwrap();
+    let id = simulation.spawn(asset, Vec3::ZERO).unwrap();
+    assert_eq!(
+        simulation.instance(id).unwrap().action,
+        Some(ActionKind::Idle)
+    );
+    let events = simulation.drain_action_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action, ActionKind::Idle);
+    assert!(simulation.drain_action_events().is_empty());
+    simulation
+        .set_wander_bounds(Some(WorldXBounds {
+            left: -2.0,
+            right: 2.0,
+        }))
+        .unwrap();
+    let mut walked = false;
+    let mut arrived = false;
+    for _ in 0..600 {
+        let previous = simulation.instance(id).unwrap().position;
+        simulation.advance(FIXED_DT).unwrap();
+        let instance = simulation.instance(id).unwrap();
+        if instance.action == Some(ActionKind::Walk) {
+            assert_ne!(previous.x, instance.position.x);
+            walked = true;
+        } else if walked && previous == instance.position {
+            arrived = true;
+            break;
+        }
+    }
+    assert!(walked && arrived);
+    let events = simulation.drain_action_events();
+    assert_eq!(
+        events.iter().map(|event| event.action).collect::<Vec<_>>(),
+        [ActionKind::Walk, ActionKind::Idle]
+    );
+    simulation.advance(Duration::ZERO).unwrap();
+    assert!(simulation.drain_action_events().is_empty());
+}
+
+#[test]
+fn click_priority_repeat_drag_and_resume_are_visible_through_public_state() {
+    use delicium::simulation::ActionKind;
+
+    let mut simulation = Simulation::new();
+    let asset = simulation.insert_asset(action_sprite()).unwrap();
+    let id = simulation.spawn(asset, Vec3::ZERO).unwrap();
+    simulation
+        .set_wander_bounds(Some(WorldXBounds {
+            left: -3.0,
+            right: 3.0,
+        }))
+        .unwrap();
+    for _ in 0..300 {
+        simulation.advance(FIXED_DT).unwrap();
+        if simulation.instance(id).unwrap().action == Some(ActionKind::Walk) {
+            break;
+        }
+    }
+    assert_eq!(
+        simulation.instance(id).unwrap().action,
+        Some(ActionKind::Walk)
+    );
+    let position = simulation.instance(id).unwrap().position;
+    simulation.drain_action_events();
+    simulation.poke_reaction(id, position + Vec3::X).unwrap();
+    step(&mut simulation, 12);
+    assert_eq!(
+        simulation.instance(id).unwrap().action,
+        Some(ActionKind::Reaction)
+    );
+    assert_eq!(simulation.instance(id).unwrap().position, position);
+    simulation.drain_action_events();
+    simulation.poke_reaction(id, position + Vec3::X).unwrap();
+    simulation.advance(FIXED_DT).unwrap();
+    let events = simulation.drain_action_events();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].restarted);
+    simulation.suspend_wander(id).unwrap();
+    step(&mut simulation, 61);
+    assert_eq!(
+        simulation.instance(id).unwrap().action,
+        Some(ActionKind::Idle)
+    );
+    assert_eq!(simulation.instance(id).unwrap().position, position);
+    step(&mut simulation, 300);
+    assert_eq!(
+        simulation.instance(id).unwrap().action,
+        Some(ActionKind::Idle)
+    );
+    simulation.resume_wander(id).unwrap();
+    simulation.advance(FIXED_DT).unwrap();
+    assert_eq!(
+        simulation.instance(id).unwrap().action,
+        Some(ActionKind::Idle)
+    );
+    for _ in 0..300 {
+        simulation.advance(FIXED_DT).unwrap();
+        if simulation.instance(id).unwrap().action == Some(ActionKind::Walk) {
+            break;
+        }
+    }
+    assert_eq!(
+        simulation.instance(id).unwrap().action,
+        Some(ActionKind::Walk)
+    );
+    assert_ne!(simulation.instance(id).unwrap().position, position);
+}
 
 #[test]
 fn fixed_step_is_bounded_and_residual_is_interpolated() {
@@ -360,6 +492,179 @@ fn wandering_simulation(start_x: f32, ticks: u32) -> (Simulation, u64) {
 }
 
 #[test]
+fn adjacent_regions_preserve_the_bounds_only_position_and_rng_stream() {
+    let (mut original, id) = wandering_simulation(0.0, 0);
+    let (mut desktop, other_id) = wandering_simulation(0.0, 0);
+    desktop
+        .set_wander_regions(Some(vec![
+            WorldRect {
+                left: -3.375,
+                right: 0.0,
+                bottom: -1.0,
+                top: 1.0,
+            },
+            WorldRect {
+                left: 0.0,
+                right: 3.375,
+                bottom: -1.0,
+                top: 1.0,
+            },
+        ]))
+        .unwrap();
+    let mut left = false;
+    let mut right = false;
+    for _ in 0..1800 {
+        step(&mut original, 1);
+        step(&mut desktop, 1);
+        let position = desktop.instance(other_id).unwrap().position;
+        assert_eq!(original.instance(id).unwrap().position, position);
+        assert_eq!(
+            original.drain_wander_events(),
+            desktop.drain_wander_events()
+        );
+        left |= position.x < -0.5;
+        right |= position.x > 0.5;
+    }
+    assert!(
+        left || right,
+        "the equivalence check must exercise walking, not only idle ticks"
+    );
+    desktop.set_wander_regions(None).unwrap();
+    for _ in 0..120 {
+        step(&mut original, 1);
+        step(&mut desktop, 1);
+        assert_eq!(
+            original.instance(id).unwrap().position,
+            desktop.instance(other_id).unwrap().position
+        );
+        assert_eq!(
+            original.drain_wander_events(),
+            desktop.drain_wander_events()
+        );
+    }
+}
+
+#[test]
+fn staggered_and_disconnected_regions_do_not_walk_through_invisible_space() {
+    let bounds = WorldXBounds {
+        left: -6.0,
+        right: 13.5,
+    };
+    let regions = vec![
+        WorldRect {
+            left: -6.0,
+            right: 6.0,
+            bottom: -0.9,
+            top: 6.6,
+        },
+        WorldRect {
+            left: 6.0,
+            right: 13.5,
+            bottom: -3.0046875,
+            top: 8.995313,
+        },
+    ];
+    for y in [-2.0, 8.0] {
+        let (mut simulation, id) = wandering_simulation(9.0, 0);
+        simulation.set_wander_bounds(Some(bounds)).unwrap();
+        simulation
+            .set_wander_regions(Some(regions.clone()))
+            .unwrap();
+        simulation.set_position(id, Vec3::new(9.0, y, 0.0)).unwrap();
+        let mut moved = false;
+        for _ in 0..900 {
+            step(&mut simulation, 1);
+            let p = simulation.instance(id).unwrap().position;
+            assert!(p.x >= 7.2 - 1e-5 && p.x <= 12.3 + 1e-5);
+            assert_eq!(p.y, y);
+            moved |= (p.x - 9.0).abs() > 0.1;
+        }
+        assert!(moved);
+        simulation.set_position(id, Vec3::new(0.0, y, 0.0)).unwrap();
+        step(&mut simulation, 180);
+        assert_eq!(
+            simulation.instance(id).unwrap().position,
+            Vec3::new(0.0, y, 0.0)
+        );
+    }
+    let (mut simulation, id) = wandering_simulation(-3.0, 0);
+    simulation
+        .set_wander_bounds(Some(WorldXBounds {
+            left: -6.0,
+            right: 6.0,
+        }))
+        .unwrap();
+    simulation
+        .set_wander_regions(Some(vec![
+            WorldRect {
+                left: -6.0,
+                right: -1.0,
+                bottom: -1.0,
+                top: 1.0,
+            },
+            WorldRect {
+                left: 1.0,
+                right: 6.0,
+                bottom: -1.0,
+                top: 1.0,
+            },
+        ]))
+        .unwrap();
+    for _ in 0..900 {
+        step(&mut simulation, 1);
+        assert!(simulation.instance(id).unwrap().position.x <= -2.2 + 1e-5);
+    }
+}
+
+#[test]
+fn visible_regions_validate_atomically_and_resume_after_pause_or_replacement() {
+    let (mut simulation, id) = wandering_simulation(0.0, 0);
+    let narrow = WorldRect {
+        left: -0.5,
+        right: 0.5,
+        bottom: -1.0,
+        top: 1.0,
+    };
+    simulation.set_wander_regions(Some(vec![narrow])).unwrap();
+    for bad in [
+        WorldRect {
+            left: f32::NAN,
+            ..narrow
+        },
+        WorldRect {
+            right: -0.5,
+            ..narrow
+        },
+        WorldRect {
+            top: -1.0,
+            ..narrow
+        },
+    ] {
+        assert!(simulation.set_wander_regions(Some(vec![bad])).is_err());
+    }
+    step(&mut simulation, 180);
+    assert_eq!(simulation.instance(id).unwrap().position.x, 0.0);
+    simulation.set_wander_regions(Some(vec![])).unwrap();
+    simulation
+        .set_position(id, Vec3::new(0.3, 0.15, 0.0))
+        .unwrap();
+    step(&mut simulation, 180);
+    assert_eq!(simulation.instance(id).unwrap().position.x, 0.3);
+    simulation.set_wander_regions(Some(vec![narrow])).unwrap();
+    simulation.suspend_wander(id).unwrap();
+    step(&mut simulation, 180);
+    assert_eq!(simulation.instance(id).unwrap().position.x, 0.3);
+    simulation.resume_wander(id).unwrap();
+    simulation
+        .poke_reaction(id, Vec3::new(0.5, 0.15, 0.0))
+        .unwrap();
+    step(&mut simulation, 30);
+    assert_eq!(simulation.instance(id).unwrap().position.x, 0.3);
+    step(&mut simulation, 240);
+    assert_eq!(simulation.instance(id).unwrap().position.x, 0.0);
+}
+
+#[test]
 fn wander_without_bounds_keeps_positions_and_stays_silent() {
     let mut simulation = Simulation::new();
     let asset = simulation.insert_asset(common::sprite()).unwrap();
@@ -582,6 +887,120 @@ fn wander_facing_flips_the_mirror_sign_in_render_transforms() {
         }
     }
     panic!("no walk started within 600 ticks");
+}
+
+#[test]
+fn skeleton_walking_left_turns_the_body_without_mirroring_it() {
+    let mut simulation = Simulation::new();
+    let asset = simulation
+        .insert_asset(common::load(&common::turned_skeleton_document()))
+        .unwrap();
+    let instance = simulation.spawn(asset, Vec3::new(0.0, 0.15, 0.0)).unwrap();
+    // Bounds entirely left of the spawn: the recovery walk is deterministically
+    // leftward without depending on the instance's random stream.
+    simulation
+        .set_wander_bounds(Some(WorldXBounds {
+            left: -3.0,
+            right: 0.0,
+        }))
+        .unwrap();
+    let mut moved_left = false;
+    let mut settled_at = None;
+    for step_index in 0..40 {
+        let before = simulation.instance(instance).unwrap().position.x;
+        step(&mut simulation, 1);
+        let after = simulation.instance(instance).unwrap().position.x;
+        moved_left |= after < before;
+        let frame = simulation.render_frame().unwrap();
+        let InstanceDraw::Skeleton3d {
+            transform,
+            skin_matrices,
+            ..
+        } = &frame.instances[0]
+        else {
+            panic!("expected a skeleton draw");
+        };
+        // The root is never mirrored, so asymmetric prints stay readable.
+        assert_eq!(
+            transform.x_axis.x, 1.0,
+            "a 3D root must stay unmirrored while walking left"
+        );
+        assert_eq!(transform.x_axis.y, 0.0);
+        assert_eq!(transform.x_axis.z, 0.0);
+        // The body turns toward the walk direction: the root's forward rotates
+        // to -X. The fixture holds the bundled asset's 25 degrees toward +X, so
+        // an unturned walk would keep it positive and read as walking backwards.
+        // The turn is eased, not snapped, so convergence gets a few ticks.
+        let forward = transform.transform_vector3(skin_matrices[0].transform_vector3(Vec3::Z));
+        assert!(forward.y.abs() < 1e-4, "turn must stay purely horizontal");
+        if forward.x < -0.1 {
+            settled_at.get_or_insert(step_index);
+        } else if let Some(settled) = settled_at {
+            panic!("step {step_index}: the turn regressed after settling at {settled}");
+        }
+    }
+    let settled_at = settled_at.expect("the leftward walk never turned the body");
+    assert!(
+        settled_at <= 12,
+        "the eased turn took {settled_at} ticks to face left"
+    );
+    assert!(moved_left, "the fixture must actually walk left");
+    // Arriving keeps the turned orientation instead of snapping back.
+    step(&mut simulation, 400);
+    let frame = simulation.render_frame().unwrap();
+    let InstanceDraw::Skeleton3d {
+        transform,
+        skin_matrices,
+        ..
+    } = &frame.instances[0]
+    else {
+        panic!("expected a skeleton draw");
+    };
+    assert_eq!(transform.x_axis.x, 1.0, "3D facing must never mirror");
+    let forward = transform.transform_vector3(skin_matrices[0].transform_vector3(Vec3::Z));
+    assert!(
+        forward.x < -0.1,
+        "the turn must be kept while idling after the walk: {forward:?}"
+    );
+}
+
+#[test]
+fn skeleton_walking_right_keeps_the_authored_orientation() {
+    let mut simulation = Simulation::new();
+    let asset = simulation
+        .insert_asset(common::load(&common::turned_skeleton_document()))
+        .unwrap();
+    let instance = simulation.spawn(asset, Vec3::new(0.0, 0.15, 0.0)).unwrap();
+    // Bounds entirely right of the spawn: a deterministic rightward recovery.
+    simulation
+        .set_wander_bounds(Some(WorldXBounds {
+            left: 0.0,
+            right: 3.0,
+        }))
+        .unwrap();
+    let mut moved_right = false;
+    for _ in 0..40 {
+        let before = simulation.instance(instance).unwrap().position.x;
+        step(&mut simulation, 1);
+        let after = simulation.instance(instance).unwrap().position.x;
+        moved_right |= after > before;
+        let frame = simulation.render_frame().unwrap();
+        let InstanceDraw::Skeleton3d {
+            transform,
+            skin_matrices,
+            ..
+        } = &frame.instances[0]
+        else {
+            panic!("expected a skeleton draw");
+        };
+        assert_eq!(transform.x_axis.x, 1.0);
+        let forward = transform.transform_vector3(skin_matrices[0].transform_vector3(Vec3::Z));
+        assert!(
+            forward.x > 0.1,
+            "walking right must keep the authored three-quarter stance: {forward:?}"
+        );
+    }
+    assert!(moved_right, "the fixture must actually walk right");
 }
 
 #[test]

@@ -59,6 +59,43 @@ pub fn skeleton_document() -> Value {
     })
 }
 
+/// A skeleton shaped like the bundled Eous asset: a neutral bind pose, an
+/// authored three-quarter yaw that lives in the animation, and a head joint
+/// stacked above the root.
+///
+/// The yaw must sit in the clip rather than in the bind pose, because the skin
+/// matrix is `world * inverse_bind`: a bind-pose yaw cancels itself out and
+/// would make the turn invisible to the render transform.
+pub fn turned_skeleton_document() -> Value {
+    let yaw = std::f32::consts::PI / 7.2; // 25 degrees
+    let (sin, cos) = (yaw * 0.5).sin_cos();
+    let yawed = [0.0, sin, 0.0, cos];
+    json!({
+        "format": "delicium.model", "format_version": "0.1", "name": "Turned skeleton",
+        "kind": "skeleton3d",
+        "interaction": {"head_joint": "head"},
+        "skeleton3d": {
+            "vertices": [
+                {"position": [-0.5, 1.0, 0.0], "normal": [0.0, 0.0, 1.0], "color": [0.1, 0.8, 0.2, 1.0], "joints": [0, 0, 0, 0], "weights": [1.0, 0.0, 0.0, 0.0]},
+                {"position": [0.5, 1.0, 0.0], "normal": [0.0, 0.0, 1.0], "color": [0.1, 0.8, 0.2, 1.0], "joints": [0, 0, 0, 0], "weights": [1.0, 0.0, 0.0, 0.0]},
+                {"position": [0.0, 2.0, 0.0], "normal": [0.0, 0.0, 1.0], "color": [0.1, 0.8, 0.2, 1.0], "joints": [1, 1, 1, 1], "weights": [1.0, 0.0, 0.0, 0.0]}
+            ],
+            "indices": [0, 1, 2],
+            "joints": [
+                {"name": "root", "translation": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]},
+                {"name": "head", "parent": "root", "translation": [0.0, 1.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}
+            ],
+            "animations": [{
+                "name": "walk", "duration": 2.0,
+                "channels": [{"joint": "root", "rotation": [
+                    {"time": 0.0, "value": yawed},
+                    {"time": 2.0, "value": yawed}
+                ]}]
+            }]
+        }
+    })
+}
+
 pub fn load(document: &Value) -> Arc<CompiledModel> {
     load_model_bytes(
         &serde_json::to_vec(document).unwrap(),
