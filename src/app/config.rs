@@ -7,6 +7,11 @@
 //! benchmarks never touch the user's file, and `DELICIUM_NO_CONFIG` disables
 //! both sides as an escape hatch.
 //!
+//! The launcher's settings page writes the same file while the pet runs, so
+//! a scaled-back reader ([`read_preferences`]) re-reads only the preferences
+//! when the file's modification time changes; the scene is applied once at
+//! startup and is never restarted mid-run.
+//!
 //! Writes go through a temporary file plus an atomic rename, so a crash or a
 //! full disk cannot leave a half-written file behind. A file that exists but
 //! cannot be parsed is left in place and the defaults take over.
@@ -89,8 +94,8 @@ impl EntrySource {
     }
 }
 
-/// Whether configuration may be read and written for these options. The
-/// smoke test and benchmarks must stay deterministic and operate on their
+/// Whether scene configuration may be read and written for these options.
+/// The smoke test and benchmarks must stay deterministic and operate on their
 /// own scenes; `--bangboo` likewise owns its fixed pet scene and must not
 /// read or overwrite the user's saved scene. `DELICIUM_NO_CONFIG` set to
 /// anything but the empty string or `0` disables persistence explicitly.
@@ -98,15 +103,66 @@ pub(super) fn enabled(options: &Options) -> bool {
     if options.smoke_test || options.bench.is_some() || options.bangboo {
         return false;
     }
-    let disabled = std::env::var_os("DELICIUM_NO_CONFIG")
-        .is_some_and(|value| !value.is_empty() && value != "0");
-    !disabled
+    !disabled_by_env()
+}
+
+/// Whether the preference fields may be read and followed.
+///
+/// The pet owns its scene but not its preferences: the launcher's settings
+/// page writes `pixel_hittest` into this same file while the pet runs, and a
+/// checkbox that does nothing would be a lie. Bounded runs stay deterministic
+/// and still ignore the file entirely.
+pub(super) fn preferences_enabled(options: &Options) -> bool {
+    if options.smoke_test || options.bench.is_some() {
+        return false;
+    }
+    !disabled_by_env()
+}
+
+/// `DELICIUM_NO_CONFIG` set to anything but the empty string or `0`.
+fn disabled_by_env() -> bool {
+    std::env::var_os("DELICIUM_NO_CONFIG").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// `%APPDATA%\Delicium\config.json`; `None` without an `APPDATA` variable.
 pub(super) fn config_path() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     Some(PathBuf::from(appdata).join("Delicium").join("config.json"))
+}
+
+/// The preference fields of the configuration file, as last read.
+///
+/// Only what the running pet can change from the outside: the scene comes
+/// from the same file but is applied at startup, so a live change to it is
+/// ignored rather than silently dropped instances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Preferences {
+    pub pixel_hittest: bool,
+}
+
+/// `(modified, length)` of the configuration file, or `None` when it does not
+/// exist. The pair is enough to notice a rewrite: the launcher writes a new
+/// file and renames it into place, so both change on every write.
+pub(super) fn stamp() -> Option<(std::time::SystemTime, u64)> {
+    let path = config_path()?;
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    Some((modified, metadata.len()))
+}
+
+/// The preferences in the file as it is now; a missing, unreadable or
+/// unknown-version file yields `None` and changes nothing.
+pub(super) fn read_preferences() -> Option<Preferences> {
+    let text = std::fs::read_to_string(config_path()?).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let object = value.as_object()?;
+    if object.get("version").and_then(serde_json::Value::as_u64) != Some(VERSION as u64) {
+        return None;
+    }
+    let pixel_hittest = object
+        .get("pixel_hittest")
+        .and_then(serde_json::Value::as_bool)?;
+    Some(Preferences { pixel_hittest })
 }
 
 /// Loads the saved configuration, if any.

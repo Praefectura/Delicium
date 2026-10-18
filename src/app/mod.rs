@@ -73,6 +73,28 @@ pub fn run() -> Result<(), String> {
     let mut application = Application::new(options)?;
     application.pending_pixel_hittest = loaded.as_ref().map(|config| config.pixel_hittest);
     application.config = loaded;
+    // A live pet follows the settings page; a bounded run must stay
+    // reproducible, and the scenes that ignore the file ignore it here too.
+    if config::preferences_enabled(&application.options)
+        && application.config.is_none()
+        // The pet has no saved scene, but it still honours the preference:
+        // only `false` needs a command, since `true` is the default.
+        && application.pending_pixel_hittest.is_none()
+    {
+        application.pending_pixel_hittest = config::read_preferences().map(|p| p.pixel_hittest);
+    }
+    if config::preferences_enabled(&application.options)
+        && let Some((modified, length)) = config::stamp()
+    {
+        // The pet owns its scene, so its preference baseline comes from the
+        // file rather than from `application.config`; before the first
+        // write there is no file and nothing to follow.
+        application.config_watch = config::read_preferences().map(|preferences| ConfigWatch {
+            modified,
+            length,
+            preferences,
+        });
+    }
     if let Err(error) = event_loop.run_app(&mut application) {
         let error = error.to_string();
         if let Some(benchmark) = &mut application.benchmark {
@@ -101,6 +123,14 @@ pub fn run() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The live configuration watch: where the file stood when its preferences
+/// were last applied.
+struct ConfigWatch {
+    modified: std::time::SystemTime,
+    length: u64,
+    preferences: config::Preferences,
 }
 
 struct Runtime {
@@ -421,6 +451,11 @@ struct Application {
     /// A configured hit-test preference waiting for the runtime; applied
     /// through the normal command path once the windows exist.
     pending_pixel_hittest: Option<bool>,
+    /// When the configuration file was last read for live preference changes,
+    /// and the preferences applied from it; `None` disables the watch (the
+    /// smoke test, benchmarks, `--bangboo`, `DELICIUM_NO_CONFIG`, and any run
+    /// where the file did not load).
+    config_watch: Option<ConfigWatch>,
     scene_sample: Option<SceneSample>,
     fatal: Option<String>,
 }
@@ -468,6 +503,7 @@ impl Application {
             config: None,
             initial_config: VecDeque::new(),
             pending_pixel_hittest: None,
+            config_watch: None,
             scene_sample: None,
             fatal: None,
         })
@@ -1939,6 +1975,47 @@ impl Application {
         }
     }
 
+    /// Applies preference changes the settings page wrote while the pet runs.
+    ///
+    /// The file is re-read only when its modification time or size changed;
+    /// a scene whose loader would have to change is left alone, because
+    /// restarting the scene mid-run would drop whatever the user was doing.
+    fn poll_config(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        // The watch is off for bounded runs, `--bangboo`, the smoke test and
+        // `DELICIUM_NO_CONFIG`; this runs every frame, so it must not touch
+        // the filesystem when nothing is watching.
+        if self.config_watch.is_none() {
+            return Ok(());
+        }
+        let Some((modified, length)) = config::stamp() else {
+            return Ok(());
+        };
+        let Some(watch) = self.config_watch.as_mut() else {
+            return Ok(());
+        };
+        if watch.modified == modified && watch.length == length {
+            return Ok(());
+        }
+        watch.modified = modified;
+        watch.length = length;
+        let Some(preferences) = config::read_preferences() else {
+            return Ok(());
+        };
+        let changed = preferences.pixel_hittest != watch.preferences.pixel_hittest;
+        watch.preferences = preferences;
+        if changed {
+            log::info!(
+                "applying the configured hit-test preference: pixel_hittest={}",
+                preferences.pixel_hittest
+            );
+            self.apply_command(
+                UiCommand::PixelHitTest(preferences.pixel_hittest),
+                event_loop,
+            )?;
+        }
+        Ok(())
+    }
+
     fn fail(&mut self, error: String, event_loop: &ActiveEventLoop) {
         log::error!("{error}");
         if let Some(benchmark) = &mut self.benchmark {
@@ -2282,6 +2359,10 @@ impl ApplicationHandler for Application {
                         event_loop.exit();
                         return;
                     }
+                    platform::TrayAction::Settings => match platform::tray::open_settings() {
+                        Ok(()) => log::info!("tray settings handed to the launcher"),
+                        Err(error) => log::warn!("tray settings failed: {error}"),
+                    },
                     platform::TrayAction::Reinstall => match tray.reinstall_icon() {
                         Ok(()) => log::info!("tray icon reinstalled"),
                         Err(error) => log::warn!("tray reinstall failed: {error}"),
@@ -2290,7 +2371,8 @@ impl ApplicationHandler for Application {
             }
         }
         if let Err(error) = self
-            .poll_loads()
+            .poll_config(event_loop)
+            .and_then(|()| self.poll_loads())
             .and_then(|()| self.advance_smoke(event_loop))
             .and_then(|()| self.advance_benchmark(event_loop))
         {

@@ -19,6 +19,9 @@ pub enum TrayAction {
     Quit,
     /// Explorer restarted; the icon must be added again.
     Reinstall,
+    /// The "Settings..." menu entry; present only when a launcher owns this
+    /// engine.
+    Settings,
 }
 
 /// An installed tray icon; removing it happens on drop.
@@ -36,10 +39,25 @@ pub fn install() -> Result<TrayIcon, String> {
     win32::install().map(|window| TrayIcon { window })
 }
 
+/// Asks the launcher that started this engine to show its settings page.
+///
+/// Fails when no launcher is running; the menu entry is only offered when
+/// one is, so a failure here means the launcher went away between the menu
+/// opening and the click.
+#[cfg(target_os = "windows")]
+pub fn open_settings() -> Result<(), String> {
+    win32::open_settings()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn open_settings() -> Result<(), String> {
+    Err("The system tray is not supported on this platform".to_owned())
+}
+
 #[cfg(target_os = "windows")]
 impl TrayIcon {
     /// Takes the next pending tray action, in priority order: toggle, quit,
-    /// reinstall. Consumes at most one action per call.
+    /// settings, reinstall. Consumes at most one action per call.
     pub fn take_action(&self) -> Option<TrayAction> {
         win32::take_action()
     }
@@ -124,6 +142,7 @@ mod win32 {
     const ACTION_TOGGLE: u32 = 1;
     const ACTION_QUIT: u32 = 2;
     const ACTION_REINSTALL: u32 = 4;
+    const ACTION_SETTINGS: u32 = 8;
     /// The window procedure's atomic mailbox; the application polls it.
     static ACTIONS: AtomicU32 = AtomicU32::new(0);
     /// `RegisterWindowMessageW("TaskbarCreated")`, set once at install.
@@ -149,9 +168,10 @@ mod win32 {
     const TPM_RIGHTBUTTON: u32 = 0x0002;
     const TPM_NONOTIFY: u32 = 0x0080;
     const TPM_RETURNCMD: u32 = 0x0100;
-    /// The two context-menu command ids.
+    /// The context-menu command ids.
     const MENU_SHOW_HIDE: i32 = 1;
     const MENU_QUIT: i32 = 2;
+    const MENU_SETTINGS: i32 = 3;
 
     /// `CreateDIBSection` usage: the colour table holds literal RGB values.
     const DIB_RGB_COLORS: u32 = 0;
@@ -312,6 +332,12 @@ mod win32 {
         fn SetForegroundWindow(window: Hwnd) -> i32;
         fn GetCursorPos(point: *mut Point) -> i32;
         fn PostMessageW(window: Hwnd, message: u32, wparam: Wparam, lparam: Lparam) -> i32;
+        fn FindWindowExW(
+            parent: Hwnd,
+            after: Hwnd,
+            class_name: *const u16,
+            window_name: *const u16,
+        ) -> Hwnd;
         fn CreateIconIndirect(info: *const IconInfo) -> Hicon;
         fn DestroyIcon(icon: Hicon) -> i32;
     }
@@ -561,6 +587,42 @@ mod win32 {
         }
     }
 
+    /// The parent that makes a window message-only.
+    const HWND_MESSAGE: Hwnd = -3isize as Hwnd;
+
+    /// The launcher's message-only window, when a launcher is running.
+    ///
+    /// The launcher's class and title come from the shared contract, so the
+    /// two binaries cannot disagree about them.
+    fn launcher_window() -> Option<Hwnd> {
+        let class_name = wide(crate::launcher::contract::WINDOW_CLASS);
+        let title = wide(crate::launcher::contract::WINDOW_TITLE);
+        // SAFETY: both strings are null-terminated and live for the call; the
+        // search only reads the window list.
+        let window = unsafe {
+            FindWindowExW(
+                HWND_MESSAGE,
+                ptr::null_mut(),
+                class_name.as_ptr(),
+                title.as_ptr(),
+            )
+        };
+        (!window.is_null()).then_some(window)
+    }
+
+    /// Posts the settings request to the launcher.
+    pub(super) fn open_settings() -> Result<(), String> {
+        let window = launcher_window().ok_or_else(|| "The launcher is not running".to_owned())?;
+        // SAFETY: the handle belongs to another process's live window;
+        // posting only enqueues a message.
+        let posted =
+            unsafe { PostMessageW(window, crate::launcher::contract::WM_OPEN_SETTINGS, 0, 0) };
+        if posted == 0 {
+            return Err("PostMessageW failed to reach the launcher".to_owned());
+        }
+        Ok(())
+    }
+
     /// Installs the hidden window and registers the icon with the shell.
     pub(super) fn install() -> Result<TrayWindow, String> {
         // SAFETY: a null name asks for the process module, which always
@@ -635,11 +697,12 @@ mod win32 {
     }
 
     /// Takes the next pending action, in priority order: toggle, quit,
-    /// reinstall.
+    /// settings, reinstall.
     pub(super) fn take_action() -> Option<TrayAction> {
-        const FLAGS: [(u32, TrayAction); 3] = [
+        const FLAGS: [(u32, TrayAction); 4] = [
             (ACTION_TOGGLE, TrayAction::ToggleControls),
             (ACTION_QUIT, TrayAction::Quit),
+            (ACTION_SETTINGS, TrayAction::Settings),
             (ACTION_REINSTALL, TrayAction::Reinstall),
         ];
         for (flag, action) in FLAGS {
@@ -694,6 +757,12 @@ mod win32 {
             let show_hide = wide("Show/Hide controls");
             let quit = wide("Quit");
             AppendMenuW(menu, MF_STRING, MENU_SHOW_HIDE as usize, show_hide.as_ptr());
+            // Only a launcher can show a settings page; a bare engine run
+            // (acceptance scripts, `cargo run`) has nowhere to send it.
+            if launcher_window().is_some() {
+                let settings = wide("Settings...");
+                AppendMenuW(menu, MF_STRING, MENU_SETTINGS as usize, settings.as_ptr());
+            }
             AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr());
             let mut point = Point { x: 0, y: 0 };
             if GetCursorPos(&mut point) == 0 {
@@ -718,6 +787,9 @@ mod win32 {
             match command {
                 MENU_SHOW_HIDE => {
                     ACTIONS.fetch_or(ACTION_TOGGLE, Ordering::SeqCst);
+                }
+                MENU_SETTINGS => {
+                    ACTIONS.fetch_or(ACTION_SETTINGS, Ordering::SeqCst);
                 }
                 MENU_QUIT => {
                     ACTIONS.fetch_or(ACTION_QUIT, Ordering::SeqCst);
@@ -810,11 +882,12 @@ mod win32 {
         #[test]
         fn take_action_reports_and_clears_in_priority_order() {
             ACTIONS.store(
-                ACTION_TOGGLE | ACTION_QUIT | ACTION_REINSTALL,
+                ACTION_TOGGLE | ACTION_QUIT | ACTION_SETTINGS | ACTION_REINSTALL,
                 Ordering::SeqCst,
             );
             assert_eq!(take_action(), Some(TrayAction::ToggleControls));
             assert_eq!(take_action(), Some(TrayAction::Quit));
+            assert_eq!(take_action(), Some(TrayAction::Settings));
             assert_eq!(take_action(), Some(TrayAction::Reinstall));
             assert_eq!(take_action(), None);
             ACTIONS.store(ACTION_QUIT, Ordering::SeqCst);
