@@ -367,6 +367,7 @@ fn wholly_transparent_textures_and_discarded_materials_do_not_intercept() {
 }
 
 #[test]
+#[ignore = "explicit hardware GPU coverage; run release explicitly with --ignored"]
 fn frozen_gpu_frames_are_fully_covered_by_current_and_cached_native_regions() {
     let mut simulation = animated_scene();
     let mut gpu = CoverageGpu::new(&simulation);
@@ -476,6 +477,7 @@ fn frozen_gpu_frames_are_fully_covered_by_current_and_cached_native_regions() {
 }
 
 #[test]
+#[ignore = "explicit hardware GPU coverage; run release explicitly with --ignored"]
 fn bound_actions_and_crossfades_share_gpu_and_native_hit_geometry() {
     use crate::simulation::{ActionKind, FIXED_DT, WorldXBounds};
 
@@ -542,6 +544,7 @@ fn bound_actions_and_crossfades_share_gpu_and_native_hit_geometry() {
 }
 
 #[test]
+#[ignore = "explicit hardware GPU coverage; run release explicitly with --ignored"]
 fn bangboo_social_poses_share_gpu_and_native_hit_geometry() {
     use crate::simulation::{ActionKind, FIXED_DT, WorldXBounds};
     let mut simulation = Simulation::new();

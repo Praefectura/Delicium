@@ -57,6 +57,7 @@ pub(super) fn eous_scene() -> Simulation {
 }
 
 #[test]
+#[ignore = "explicit hardware GPU coverage; run release explicitly with --ignored"]
 fn installed_region_covers_ten_pixel_jump_under_k4() {
     let size = [1280, 720];
     let view = desktop_view_at(720, 1.5, 0.0, 0.0);
@@ -110,6 +111,7 @@ fn installed_region_covers_ten_pixel_jump_under_k4() {
 }
 
 #[test]
+#[ignore = "explicit hardware GPU coverage; run release explicitly with --ignored"]
 fn eous_desktop_installed_region_covers_current_animation() {
     let size = [2560, 1440];
     let view = desktop_view_at(1440, 1.5, 0.0, 0.0);
@@ -173,6 +175,7 @@ fn eous_desktop_installed_region_covers_current_animation() {
 /// 240-frame GPU sweep at this size costs minutes for little extra signal
 /// over the 1440 case that already runs every frame.
 #[test]
+#[ignore = "explicit hardware GPU coverage; run release explicitly with --ignored"]
 fn eous_tall_view_installed_region_covers_selected_frames() {
     let size = [2560, 1600];
     let view = desktop_view_at(1600, 1.5, 0.0, 0.0);
