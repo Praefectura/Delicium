@@ -1,7 +1,8 @@
+pub mod attention;
 pub mod desktop;
 pub mod tray;
 
-pub use desktop::{TASKBAR_GAP_PX, TaskbarEdge, desktop_scene_rect, taskbar_edge};
+pub use desktop::{DesktopRect, desktop_bounding_rect, mark_non_fullscreen};
 pub use tray::{TrayAction, TrayIcon};
 
 use winit::window::{Window, WindowAttributes, WindowLevel};
@@ -138,6 +139,65 @@ pub(crate) fn probe_region_equivalence(
     win32::probe_region_equivalence(polygons, plan)
 }
 
+/// Scanline prototype (P0, test only): the exact integer fill and one
+/// `ExtCreateRegion` call, without touching the production dispatcher.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) mod scan_probe {
+    pub(crate) use super::win32::scan::{
+        MAX_SCAN_POLYGON_POINTS, MIN_SCAN_POLYGONS, NotApplicable, Scan, applicable,
+        is_strictly_convex_simple, scanline_matches_chunked, scanline_matches_sequential,
+        try_region,
+    };
+
+    /// The fill rule measured from GDI on this machine.
+    pub(crate) fn measured_rule() -> super::win32::scan::FillRule {
+        super::win32::scan::MEASURED_RULE
+    }
+
+    /// Build statistics for one scanned frame: exact rectangle count,
+    /// pixel area, and the scan work bound actually consumed. Only call it
+    /// on geometry the fast path accepted.
+    pub(crate) fn build_stats(polygons: &[Vec<[i32; 2]>]) -> Result<(Scan, f64), String> {
+        let bounds = super::win32::scan::applicable_bounds(polygons)
+            .map_err(|decline| decline.reason().to_owned())?;
+        let start = std::time::Instant::now();
+        let scan = super::win32::scan::scan_convex_polygons(polygons, measured_rule(), bounds)
+            .map_err(super::win32::scan::ScanError::into_message)?;
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        Ok((scan, elapsed))
+    }
+
+    /// The fast path's decision for one frame, or the region it built.
+    pub(crate) fn classify_frame(
+        polygons: &[Vec<[i32; 2]>],
+    ) -> Result<Result<super::win32::GdiRegion, NotApplicable>, String> {
+        try_region(polygons, measured_rule())
+    }
+
+    /// Per-stage timings in milliseconds for one frame: applicability,
+    /// the fill, the RGNDATA packing and `ExtCreateRegion`.
+    pub(crate) fn stage_stats(polygons: &[Vec<[i32; 2]>]) -> Result<[f64; 4], String> {
+        let rule = measured_rule();
+        let start = std::time::Instant::now();
+        let decision = super::win32::scan::applicable_bounds(polygons);
+        let apply_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let bounds = match decision {
+            Ok(bounds) => bounds,
+            Err(decline) => return Err(format!("declined: {}", decline.reason())),
+        };
+        let start = std::time::Instant::now();
+        let scan = super::win32::scan::scan_convex_polygons(polygons, rule, bounds)
+            .map_err(super::win32::scan::ScanError::into_message)?;
+        let fill_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = std::time::Instant::now();
+        let region = super::win32::scan::region_from_scan(&scan)
+            .map_err(super::win32::scan::ScanError::into_message)?;
+        let pack_ms = start.elapsed().as_secs_f64() * 1000.0;
+        drop(region);
+        Ok([apply_ms, fill_ms, pack_ms, 0.0])
+    }
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::hit_region_contains;
@@ -211,6 +271,37 @@ mod win32 {
         y: i32,
     }
 
+    /// Win32 `RECT`: left/top/right/bottom, `right` and `bottom` exclusive.
+    #[cfg(test)]
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    /// Win32 `RGNDATAHEADER`; `rgn_size` counts only the RECT payload, while
+    /// the byte count passed to `ExtCreateRegion` includes this header.
+    #[cfg(test)]
+    #[repr(C)]
+    struct RgndataHeader {
+        size: u32,
+        kind: u32,
+        count: u32,
+        rgn_size: u32,
+        bound: Rect,
+    }
+
+    #[cfg(test)]
+    const _: () = assert!(core::mem::size_of::<Rect>() == 16);
+    #[cfg(test)]
+    const _: () = assert!(core::mem::size_of::<RgndataHeader>() == 32);
+
+    /// `RGNDATAHEADER.dwType`: the data is an array of rectangles.
+    const RDH_RECTANGLES: u32 = 1;
+
     /// `CombineRgn` mode: destination = source1 union source2.
     const RGN_OR: i32 = 2;
     /// `CombineRgn` failure return value.
@@ -244,16 +335,71 @@ mod win32 {
         fn DeleteObject(object: *mut c_void) -> i32;
         #[cfg(test)]
         fn PtInRegion(region: Hrgn, x: i32, y: i32) -> i32;
+        /// One region from an `RGNDATA` rectangle array (or the documented
+        /// `RGNDATA` forms). `bytes` is the whole buffer length.
+        fn ExtCreateRegion(xform: *const c_void, bytes: u32, data: *const c_void) -> Hrgn;
+        /// Fills a caller buffer with the region's `RGNDATA`; a null buffer
+        /// or zero size returns the required byte count.
+        #[cfg(test)]
+        fn GetRegionData(region: Hrgn, bytes: u32, data: *mut c_void) -> u32;
     }
 
     #[link(name = "user32")]
     unsafe extern "system" {
         fn SetWindowRgn(window: Hwnd, region: Hrgn, redraw: i32) -> i32;
+        /// GDI object count for a process (`GR_GDIOBJECTS`). The region
+        /// accounting tests compare this against Windows' own count so a
+        /// missed `DeleteObject` cannot hide behind a self-maintained
+        /// counter that was never incremented.
+        #[cfg(test)]
+        fn GetGuiResources(process: Hwnd, flags: u32) -> u32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[cfg(test)]
+        fn GetCurrentProcess() -> Hwnd;
+        #[cfg(test)]
+        fn GetLastError() -> u32;
+    }
+
+    /// `GR_GDIOBJECTS`, the flag [`GetGuiResources`] takes for GDI objects.
+    #[cfg(test)]
+    const GR_GDIOBJECTS: u32 = 0;
+
+    /// The process's own GDI object count, as Windows reports it. Used by the
+    /// leak tests: the self-maintained region counter proves we call
+    /// `DeleteObject`, this proves GDI agrees nothing is left behind.
+    ///
+    /// Returns the Win32 error when the query itself fails, because
+    /// `GetGuiResources` reports failure as `0` — indistinguishable from a
+    /// process that genuinely owns no GDI objects.
+    #[cfg(test)]
+    fn gdi_object_count() -> Result<u32, u32> {
+        // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no
+        // cleanup, and `GetGuiResources` only reads a per-process counter.
+        unsafe {
+            SetLastError(0);
+            let count = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+            if count == 0 {
+                let error = GetLastError();
+                if error != 0 {
+                    return Err(error);
+                }
+            }
+            Ok(count)
+        }
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[cfg(test)]
+        fn SetLastError(error: u32);
     }
 
     /// Owns a GDI region until it is dropped (deleted here) or handed to a
     /// window through `SetWindowRgn`.
-    struct GdiRegion(Hrgn);
+    pub(crate) struct GdiRegion(Hrgn);
 
     impl GdiRegion {
         /// Take ownership of a freshly created region; a null handle means the
@@ -677,12 +823,29 @@ mod win32 {
         }
     }
 
+    /// The production region build for `polygons`.
+    ///
+    /// Dense frames whose polygons are all small, strictly convex and simple
+    /// take the exact integer scanline fill and a single `ExtCreateRegion`;
+    /// every other input — low density, non-convex, self-intersecting and any
+    /// resource-cap overrun — keeps the batched GDI build unchanged. A budget
+    /// decline is decided before any region is created, so falling back never
+    /// leaks a partially built region, and a real error (malformed input,
+    /// overflow, allocation or `ExtCreateRegion` failure) stays an error
+    /// instead of being hidden as a fallback.
+    fn region_for_polygons(polygons: &[Vec<[i32; 2]>]) -> Result<GdiRegion, String> {
+        match scan::try_region(polygons, scan::MEASURED_RULE)? {
+            Ok(region) => Ok(region),
+            Err(_decline) => chunked_region(polygons, REGION_CHUNK_POLYGONS),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn hit_region_contains(
         polygons: &[Vec<[i32; 2]>],
         points: &[[i32; 2]],
     ) -> Result<Vec<bool>, String> {
-        let region = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
+        let region = region_for_polygons(polygons)?;
         Ok(points
             .iter()
             .map(|point| {
@@ -737,11 +900,14 @@ mod win32 {
     pub(super) fn hit_region_matches_sequential_oracle(
         polygons: &[Vec<[i32; 2]>],
     ) -> Result<bool, String> {
-        // The production path: the hook mirrors what `set_hit_region`
-        // installs, so the test entry point tracks production exactly.
-        let production = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
+        // The production dispatcher, so this hook tracks what
+        // `set_hit_region` installs rather than a fixed plan.
+        let production = region_for_polygons(polygons)?;
         let sequential = unified_region_sequential(polygons)?;
-        regions_equal(&production, &sequential)
+        let equal = regions_equal(&production, &sequential);
+        drop(production);
+        drop(sequential);
+        equal
     }
 
     /// One batch per `chunk` consecutive polygons, each built and dropped
@@ -909,7 +1075,7 @@ mod win32 {
         polygons: &[Vec<[i32; 2]>],
     ) -> Result<(), String> {
         let window = overlay_hwnd(overlay)?;
-        let region = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
+        let region = region_for_polygons(polygons)?;
         // SAFETY: `window` is this live window's `HWND`, kept valid for the
         // call by the caller's borrow of `overlay`, and `region` is a valid
         // `HRGN` this call owns. On success the system takes over the region;
@@ -936,6 +1102,1425 @@ mod win32 {
         Ok(())
     }
 
+    /// Exact CPU scanline fill of integer polygons into a rectangle list, and
+    /// one `ExtCreateRegion` to turn that list into a region.
+    ///
+    /// This is the production fast path for dense strictly convex input; the
+    /// P0 gate (`.artifacts/eous-region-native-*`) established pixel-exact
+    /// equivalence with `chunked_region` and the sequential oracle on real
+    /// Eous frames before it was wired in. The general winding fill here also
+    /// serves the calibration battery, which re-derives GDI's fill rule from
+    /// GDI itself on every test run.
+    pub(super) mod scan {
+        use super::*;
+
+        /// Fail-fast caps for the prototype; a real frame uses ~35.8k
+        /// polygons inside a <= 2560x1600 window.
+        pub(crate) const MAX_SCAN_POLYGONS: usize = 1 << 18;
+        pub(crate) const MAX_SCAN_POINTS: usize = 1 << 22;
+        pub(crate) const MAX_SCAN_SPAN: i32 = 16_384;
+        pub(crate) const MAX_SCAN_PIXELS: u64 = 64_000_000;
+        pub(crate) const MAX_SCAN_WORK: u64 = 64_000_000;
+        pub(crate) const MAX_SCAN_RECTS: usize = 262_144;
+        /// RGNDATA budget: 4 MiB of RECT payload plus the 32-byte header.
+        ///
+        /// This equals `MAX_SCAN_RECTS * 16 + 32`, so inside the scan loop the
+        /// rectangle count always rejects first and this bound is never the
+        /// one that fires. It is still enforced in [`region_from_scan`],
+        /// because that function takes a `Scan` from its caller and is the
+        /// point where the buffer is actually sized: the check has to hold for
+        /// whatever list it is handed, not just for the one the scan produces.
+        pub(crate) const MAX_SCAN_BYTES: usize = MAX_SCAN_RECTS * 16 + 32;
+
+        /// How a scanline crossing maps to pixel indices: where inside a pixel
+        /// the sample point sits (top-left corner or center, independently on
+        /// each axis), whether a sample exactly on a boundary counts as
+        /// inside, and whether every polygon's fill is OR-ed independently.
+        /// GDI's own rule is measured by `calibrate_fill_rule`, never assumed.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) struct FillRule {
+            /// `0` samples the pixel's left edge, `1` its center, in
+            /// half-pixel units.
+            pub(super) sample_half: i64,
+            /// `0` samples the pixel's top edge, `1` its center, in
+            /// half-pixel units.
+            pub(super) sample_y_half: i64,
+            pub(super) left_inclusive: bool,
+            pub(super) right_inclusive: bool,
+        }
+
+        /// Every rule the calibration considers over the two sampling axes
+        /// and both endpoint conventions; exactly one must reproduce GDI on
+        /// the calibration battery.
+        #[cfg(test)]
+        pub(crate) const CANDIDATE_RULES: [FillRule; 16] = {
+            let mut rules = [FillRule {
+                sample_half: 0,
+                sample_y_half: 0,
+                left_inclusive: true,
+                right_inclusive: false,
+            }; 16];
+            let mut index = 0;
+            while index < 16 {
+                rules[index] = FillRule {
+                    sample_half: (index & 1) as i64,
+                    sample_y_half: ((index >> 1) & 1) as i64,
+                    left_inclusive: index & 4 == 0,
+                    right_inclusive: index & 8 == 0,
+                };
+                index += 1;
+            }
+            rules
+        };
+
+        /// Rule identified by measurement on this machine; see
+        /// `gdi_fill_rule_is_calibrated_by_measurement`, which re-derives it
+        /// from GDI output every run.
+        pub(crate) const MEASURED_RULE: FillRule = FillRule {
+            sample_half: 0,
+            sample_y_half: 0,
+            left_inclusive: true,
+            right_inclusive: false,
+        };
+
+        pub(crate) struct Scan {
+            /// Half-open `[left, top, right, bottom)` rectangles, sorted by
+            /// top then left, pairwise disjoint.
+            pub(crate) rects: Vec<[i32; 4]>,
+            /// Filled pixel count, recorded as gate evidence. Production only
+            /// needs `rects`; the probe reads these two to report the resource
+            /// envelope actually consumed.
+            #[allow(dead_code)]
+            pub(crate) pixels: u64,
+            /// Scan work consumed against `MAX_SCAN_WORK`, recorded for the
+            /// same reason.
+            #[allow(dead_code)]
+            pub(crate) work: u64,
+        }
+
+        /// Why the fast path declined an input. Every variant is a fallback
+        /// to the production chunk-41 path, never an error.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum NotApplicable {
+            TooFewPolygons,
+            NonConvex,
+            PolygonTooLarge,
+            TooManyPoints,
+            TooManyPolygons,
+            SpanTooLarge,
+            TooManyPixels,
+            TooMuchWork,
+            TooManyRects,
+            TooManyBytes,
+        }
+
+        impl NotApplicable {
+            #[cfg(test)]
+            pub(crate) fn reason(self) -> &'static str {
+                match self {
+                    Self::TooFewPolygons => "too_few_polygons",
+                    Self::NonConvex => "non_convex",
+                    Self::PolygonTooLarge => "polygon_too_large",
+                    Self::TooManyPoints => "too_many_points",
+                    Self::TooManyPolygons => "too_many_polygons",
+                    Self::SpanTooLarge => "span_too_large",
+                    Self::TooManyPixels => "too_many_pixels",
+                    Self::TooMuchWork => "too_much_work",
+                    Self::TooManyRects => "too_many_rects",
+                    Self::TooManyBytes => "too_many_bytes",
+                }
+            }
+        }
+
+        /// A scan failure split by what the caller must do with it. Budget
+        /// overruns decline to the old path; malformed input, overflow and
+        /// allocation failure are real errors that must not be hidden as a
+        /// fallback.
+        #[derive(Clone, Debug)]
+        pub(crate) enum ScanError {
+            Invalid(String),
+            Over(NotApplicable),
+        }
+
+        impl ScanError {
+            #[cfg(test)]
+            pub(crate) fn into_message(self) -> String {
+                match self {
+                    Self::Invalid(message) => message,
+                    Self::Over(decline) => {
+                        format!("scanline fast path declined: {}", decline.reason())
+                    }
+                }
+            }
+        }
+
+        /// Minimum polygon count for the fast path. The real Eous frame has
+        /// ~35.8k polygons; the archived 10.5k c64 bench stays on the old
+        /// path, which measured 0.332x the per-polygon fold there.
+        pub(crate) const MIN_SCAN_POLYGONS: usize = 16_384;
+
+        /// Largest polygon the fast path accepts. Production hulls of padded,
+        /// clipped triangles stay well inside this; the probe records the
+        /// actual maximum so the cap is checked against real geometry.
+        pub(crate) const MAX_SCAN_POLYGON_POINTS: usize = 32;
+
+        /// True only for a strictly convex, simple polygon: no repeated
+        /// vertex, no collinear triple, every turn the same sign, and the
+        /// edges winding exactly once around the origin.
+        ///
+        /// The local-sign test alone is not enough: a pentagram over a convex
+        /// pentagon's own vertices turns the same positive way at every
+        /// vertex. Turning number separates them without a sort, a hull build
+        /// or a rotation search: a simple closed polygon's turning number is
+        /// `+1` or `-1` in the direction it is wound, while the pentagram
+        /// winds twice (`+2`). Counting how often the edge direction crosses
+        /// a fixed ray gives that number in one pass with no trigonometry.
+        #[cfg(test)]
+        pub(crate) fn is_strictly_convex_simple(polygon: &[[i32; 2]]) -> bool {
+            strictly_convex(polygon)
+        }
+
+        /// One turn of the edge direction past this many quadrants would be a
+        /// second winding, so the count `strictly_convex` accumulates is a
+        /// direct read of the turning number. Any ray direction works; `+x` is
+        /// the cheapest to test.
+        ///
+        /// True only for a strictly convex, simple polygon: no repeated
+        /// vertex, no collinear triple, all turns the same sign, and exactly
+        /// one full turn of the edge direction. That combination is exactly
+        /// simplicity plus strict convexity for a closed chain, so it is
+        /// strict on hostile input (the pentagram declines on its `+2`) and
+        /// complete on real geometry, without allocating or sorting.
+        fn strictly_convex(polygon: &[[i32; 2]]) -> bool {
+            let count = polygon.len();
+            if count < 3 {
+                return false;
+            }
+            // Rolling triple over the cyclic vertex sequence: no modulo (a
+            // hardware division) on this per-vertex path.
+            let mut previous = polygon[count - 1];
+            let mut current = polygon[0];
+            let mut sign = 0_i64;
+            // Edge directions, kept as the previous one and the current one,
+            // so the turning number can be counted while the turns are checked.
+            let mut first = (0_i64, 0_i64);
+            let mut first_cross = 0_i64;
+            let mut edge = (0_i64, 0_i64);
+            let mut turns = 0_i32;
+            for index in 0..count {
+                let next = polygon[if index + 1 == count { 0 } else { index + 1 }];
+                let direction = (
+                    i64::from(next[0]) - i64::from(current[0]),
+                    i64::from(next[1]) - i64::from(current[1]),
+                );
+                // The turn at this vertex and the ray crossing of the same
+                // direction step are the same cross product, so it is formed
+                // once and handed to both.
+                let cross = if index == 0 {
+                    let dx = i64::from(current[0]) - i64::from(previous[0]);
+                    let dy = i64::from(current[1]) - i64::from(previous[1]);
+                    dx * direction.1 - dy * direction.0
+                } else {
+                    edge.0 * direction.1 - edge.1 * direction.0
+                };
+                if cross == 0 {
+                    // Collinear or repeated vertices: the fast path's
+                    // scanline argument does not cover them.
+                    return false;
+                }
+                let step = if cross > 0 { 1 } else { -1 };
+                if sign == 0 {
+                    sign = step;
+                } else if sign != step {
+                    return false;
+                }
+                if index == 0 {
+                    first = direction;
+                    first_cross = cross;
+                } else {
+                    turns += ray_crossings(edge, direction, cross);
+                }
+                edge = direction;
+                previous = current;
+                current = next;
+            }
+            turns += ray_crossings(edge, first, first_cross);
+            // A closed chain whose turns are all one sign is simple and convex
+            // exactly when its edge direction winds once around the origin
+            // (the turning-tangent theorem). A doubly wound chain such as a
+            // pentagram winds twice and declines here.
+            turns == sign as i32
+        }
+
+        /// Winding number of the closed direction curve around the origin,
+        /// contributed by the step `from -> to`, whose cross product the
+        /// caller already formed. This is the textbook crossing count for a
+        /// ray along `+x`: no trigonometry, no division, and the sign
+        /// convention is the same as the local turns'.
+        #[inline]
+        fn ray_crossings(from: (i64, i64), to: (i64, i64), side: i64) -> i32 {
+            if from.1 <= 0 {
+                if to.1 > 0 && side > 0 { 1 } else { 0 }
+            } else if to.1 <= 0 && side < 0 {
+                -1
+            } else {
+                0
+            }
+        }
+
+        /// [`is_strictly_convex_simple`] without the test-only wrapper. The
+        /// scratch vectors the hull builder needed are gone: this is a single
+        /// O(n) pass with no allocation, so a scan of tens of thousands of
+        /// polygons costs nothing per polygon beyond the walk itself.
+        ///
+        /// Callers must have checked every coordinate against the GDI range
+        /// first (as `applicable` and `validate_polygon` do): the cross
+        /// products below are formed in i64 and only stay in range because a
+        /// coordinate difference is bounded by 2^27.
+        fn strictly_convex_with(polygon: &[[i32; 2]]) -> bool {
+            strictly_convex(polygon)
+        }
+
+        /// The frame's bounding box, which `applicable` already folded out of
+        /// the same walk that proves convexity, handed to the scan so the
+        /// production path does not walk 35k polygons a second and third time.
+        pub(crate) type Bounds = [i32; 4];
+
+        /// Whether the fast path may take `polygons`, discarding the bounding
+        /// box it proves on the way. The scan entry needs that box, so
+        /// production calls [`applicable_bounds`] directly and this stays for
+        /// the tests that only assert the decision.
+        #[cfg(test)]
+        pub(crate) fn applicable(polygons: &[Vec<[i32; 2]>]) -> Result<(), NotApplicable> {
+            applicable_bounds(polygons).map(|_| ())
+        }
+
+        /// Whether the fast path may take `polygons`: enough polygons, every
+        /// one a small strictly convex simple polygon, and every resource cap
+        /// satisfied at the cheap (pre-allocation) level.
+        ///
+        /// Returns the frame's `[min_x, min_y, max_x, max_y]`.
+        pub(crate) fn applicable_bounds(
+            polygons: &[Vec<[i32; 2]>],
+        ) -> Result<Bounds, NotApplicable> {
+            if polygons.len() < MIN_SCAN_POLYGONS {
+                return Err(NotApplicable::TooFewPolygons);
+            }
+            if polygons.len() > MAX_SCAN_POLYGONS {
+                return Err(NotApplicable::TooManyPolygons);
+            }
+            let mut points = 0_usize;
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+            // One pass over the geometry: the coordinate range, the bounding
+            // box and the convexity argument are all cheap per point, and the
+            // polygon list is 35k separate allocations, so a second walk costs
+            // real cache misses.
+            //
+            // The range check is what makes the cross products safe. Within
+            // one polygon two coordinates can differ by 2^32 when hostile i32
+            // input is fed straight in, and their product would overflow an
+            // i64; once every coordinate is inside the GDI range (2^26 in
+            // magnitude) the differences fit in 2^27 and the products in
+            // 2^54. It is the same bound `validate_polygon` enforces, so a
+            // frame that fails it declines here and still surfaces the
+            // validation error from the fallback build.
+            for polygon in polygons {
+                if polygon.len() > MAX_SCAN_POLYGON_POINTS {
+                    return Err(NotApplicable::PolygonTooLarge);
+                }
+                let mut inside = true;
+                for &[x, y] in polygon {
+                    if !(GDI_MIN_COORD..=GDI_MAX_COORD).contains(&x)
+                        || !(GDI_MIN_COORD..=GDI_MAX_COORD).contains(&y)
+                    {
+                        inside = false;
+                    }
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+                if !inside {
+                    return Err(NotApplicable::NonConvex);
+                }
+                if !strictly_convex_with(polygon) {
+                    return Err(NotApplicable::NonConvex);
+                }
+                points = points.saturating_add(polygon.len());
+            }
+            if points > MAX_SCAN_POINTS {
+                return Err(NotApplicable::TooManyPoints);
+            }
+            let width = max_x.saturating_sub(min_x);
+            let height = max_y.saturating_sub(min_y);
+            if width > MAX_SCAN_SPAN || height > MAX_SCAN_SPAN {
+                return Err(NotApplicable::SpanTooLarge);
+            }
+            let area = u64::from(width.max(0) as u32) * u64::from(height.max(0) as u32);
+            if area > MAX_SCAN_PIXELS {
+                return Err(NotApplicable::TooManyPixels);
+            }
+            Ok([min_x, min_y, max_x, max_y])
+        }
+
+        /// Maps a scan failure onto the fallback reason it represents. A
+        /// budget overrun is `NotApplicable` (fall back); a validation or
+        /// arithmetic error is a real failure and stays an `Err`.
+        fn classify(error: ScanError) -> Result<NotApplicable, String> {
+            match error {
+                ScanError::Over(decline) => Ok(decline),
+                ScanError::Invalid(message) => Err(message),
+            }
+        }
+
+        /// One region from `polygons` through the fast path, or the reason it
+        /// declined. Declining must happen before any region is created, and
+        /// only budget overruns may decline; malformed input stays an error.
+        pub(crate) fn try_region(
+            polygons: &[Vec<[i32; 2]>],
+            rule: FillRule,
+        ) -> Result<Result<GdiRegion, NotApplicable>, String> {
+            let bounds = match applicable_bounds(polygons) {
+                Ok(bounds) => bounds,
+                Err(decline) => return Ok(Err(decline)),
+            };
+            // `applicable` already proved every polygon strictly convex and
+            // simple, so the scan does not repeat that check.
+            let scan = match scan_convex_polygons(polygons, rule, bounds) {
+                Ok(scan) => scan,
+                Err(error) => return classify(error).map(Err),
+            };
+            match region_from_scan(&scan) {
+                Ok(region) => Ok(Ok(region)),
+                Err(error) => classify(error).map(Err),
+            }
+        }
+
+        fn ceil_div(num: i64, den: i64) -> i64 {
+            debug_assert!(den > 0);
+            let quotient = num.div_euclid(den);
+            if num.rem_euclid(den) == 0 {
+                quotient
+            } else {
+                quotient + 1
+            }
+        }
+
+        fn floor_div(num: i64, den: i64) -> i64 {
+            debug_assert!(den > 0);
+            num.div_euclid(den)
+        }
+
+        /// First pixel whose sample is not left of `num / den` (inclusive) or
+        /// strictly right of it (exclusive). The sample position is given in
+        /// half-pixels by [`FillRule::sample_half`].
+        fn left_bound(num: i64, den: i64, rule: FillRule) -> i64 {
+            // sample = index + sample_half / 2; compare against num / den.
+            let numerator = 2 * num - rule.sample_half * den;
+            let denominator = 2 * den;
+            if rule.left_inclusive {
+                ceil_div(numerator, denominator)
+            } else {
+                floor_div(numerator, denominator) + 1
+            }
+        }
+
+        /// Exclusive end of the pixel run: samples strictly left of
+        /// `num / den` (exclusive) or at-or-left (inclusive).
+        fn right_bound(num: i64, den: i64, rule: FillRule) -> i64 {
+            let numerator = 2 * num - rule.sample_half * den;
+            let denominator = 2 * den;
+            if rule.right_inclusive {
+                floor_div(numerator, denominator) + 1
+            } else {
+                ceil_div(numerator, denominator)
+            }
+        }
+
+        /// One non-horizontal edge of a convex polygon, normalized to rise
+        /// from its lower endpoint, with the exact DDA terms already derived.
+        struct ConvexEdge {
+            low_row: u32,
+            high_row: u32,
+            low_x: i32,
+            quotient: i64,
+            slope: i64,
+            dy: i64,
+        }
+
+        /// Reused edge list for [`fill_convex`]: both y-monotone chains of the
+        /// current polygon in one vector, the second starting at `split`.
+        /// Cleared and refilled per polygon, so a frame of tens of thousands
+        /// of polygons allocates nothing after the first.
+        struct ConvexScratch {
+            edges: Vec<ConvexEdge>,
+            split: usize,
+        }
+
+        impl ConvexScratch {
+            fn new() -> Result<Self, ScanError> {
+                let mut edges: Vec<ConvexEdge> = Vec::new();
+                // At most `MAX_SCAN_POLYGON_POINTS` edges per polygon, and a
+                // polygon over that cap never reaches the span fill, so the
+                // vector is reserved once and never grows afterwards.
+                edges
+                    .try_reserve_exact(MAX_SCAN_POLYGON_POINTS)
+                    .map_err(|_| {
+                        ScanError::Invalid("Scanline edge slot allocation failed".to_owned())
+                    })?;
+                Ok(Self { edges, split: 0 })
+            }
+        }
+
+        /// Walk state for one monotone chain: which edge is active, the row
+        /// its DDA state is valid for, and the exact crossing there.
+        struct ConvexCursor {
+            index: usize,
+            row: u32,
+            integer: i64,
+            fraction: i64,
+        }
+
+        impl ConvexCursor {
+            /// Starts on the chain's first edge, whose lower endpoint is the
+            /// polygon's lowest row.
+            fn new(chain: &[ConvexEdge]) -> Self {
+                let mut cursor = Self {
+                    index: 0,
+                    row: 0,
+                    integer: 0,
+                    fraction: 0,
+                };
+                if let Some(edge) = chain.first() {
+                    cursor.row = edge.low_row;
+                    cursor.integer = i64::from(edge.low_x);
+                }
+                cursor
+            }
+
+            /// Advances to the edge active on `row`, or `None` once the chain
+            /// is spent. A monotone chain's next edge starts exactly where the
+            /// previous one ended, so the DDA restarts at that row's crossing.
+            #[inline]
+            fn seek<'a>(&mut self, chain: &'a [ConvexEdge], row: u32) -> Option<&'a ConvexEdge> {
+                loop {
+                    let edge = chain.get(self.index)?;
+                    if edge.high_row > row {
+                        while self.row < row {
+                            self.step(edge);
+                        }
+                        return Some(edge);
+                    }
+                    self.index += 1;
+                    if let Some(next) = chain.get(self.index) {
+                        self.row = next.low_row;
+                        self.integer = i64::from(next.low_x);
+                        self.fraction = 0;
+                    }
+                }
+            }
+
+            /// Exact `ceil(low_x + dx*t/dy)`: the rational is
+            /// `integer + fraction/dy` with `0 <= fraction < dy`.
+            #[inline]
+            fn crossing(&self) -> i64 {
+                self.integer + i64::from(self.fraction != 0)
+            }
+
+            #[inline]
+            fn step(&mut self, edge: &ConvexEdge) {
+                self.fraction += edge.slope;
+                if self.fraction >= edge.dy {
+                    self.fraction -= edge.dy;
+                    self.integer += edge.quotient + 1;
+                } else {
+                    self.integer += edge.quotient;
+                }
+                self.row += 1;
+            }
+        }
+
+        /// Appends one edge of a monotone chain, returning the rows it covers
+        /// as its work charge. Horizontal edges cover no sampled row and are
+        /// skipped.
+        fn push_convex_edge(
+            edges: &mut Vec<ConvexEdge>,
+            from: [i32; 2],
+            to: [i32; 2],
+            min_y: i32,
+        ) -> u64 {
+            let [x0, y0] = from;
+            let [x1, y1] = to;
+            if y0 == y1 {
+                return 0;
+            }
+            let (low_y, high_y, low_x, high_x) = if y0 < y1 {
+                (y0, y1, x0, x1)
+            } else {
+                (y1, y0, x1, x0)
+            };
+            let dy = i64::from(high_y - low_y);
+            let dx = i64::from(high_x - low_x);
+            // `dx == quotient*dy + slope` with `0 <= slope < dy`, so the
+            // integer part advances by `quotient` and the fraction is an
+            // exact Bresenham accumulator that stays in `[0, dy)`.
+            //
+            // Nearly vertical edges — the common case on a dense mesh — fit
+            // `|dx| < dy`, where the quotient is 0 or -1 and no division is
+            // needed at all. `div_euclid` would also run a second hardware
+            // division for the remainder; deriving it from the quotient costs
+            // one multiply.
+            let (quotient, slope) = if dx >= 0 {
+                if dx < dy {
+                    (0, dx)
+                } else {
+                    let quotient = dx / dy;
+                    (quotient, dx - quotient * dy)
+                }
+            } else if -dx < dy {
+                (-1, dx + dy)
+            } else {
+                let quotient = dx.div_euclid(dy);
+                (quotient, dx - quotient * dy)
+            };
+            debug_assert!((0..dy).contains(&slope));
+            edges.push(ConvexEdge {
+                low_row: (low_y - min_y) as u32,
+                high_row: (high_y - min_y) as u32,
+                low_x,
+                quotient,
+                slope,
+                dy,
+            });
+            u64::from((high_y - low_y) as u32)
+        }
+
+        /// The frame grid both fills write into: the bitset, its row stride,
+        /// the translation from world coordinates into it, and the running
+        /// work charge the caller checks against [`MAX_SCAN_WORK`].
+        struct Grid<'a> {
+            bits: &'a mut [u64],
+            words_per_row: usize,
+            min_x: i32,
+            min_y: i32,
+            width: i32,
+            /// Conservative row-visit and word-write count. Checked once per
+            /// polygon instead of once per row: every term is non-negative,
+            /// one polygon contributes at most `32 * 16384` row visits plus
+            /// the words its spans touch, and a frame holds at most `2^18`
+            /// polygons, so the total cannot approach `u64::MAX` and the
+            /// per-polygon granularity still fails closed long before any
+            /// large amount of work is done.
+            work: u64,
+        }
+
+        impl Grid<'_> {
+            fn charge(&mut self, units: u64) {
+                self.work += units;
+            }
+
+            fn exhausted(&self) -> bool {
+                self.work > MAX_SCAN_WORK
+            }
+
+            /// Sets `[left, right)` for `row`; both bounds are already exact
+            /// and are only clamped to the frame here.
+            fn paint(&mut self, row: u32, left: i64, right: i64) {
+                let left = left.max(0);
+                let right = right.min(i64::from(self.width));
+                if left >= right {
+                    return;
+                }
+                self.work += ((right - left) / 64 + 2) as u64;
+                self.paint_words(row, left as usize, right as usize);
+            }
+
+            /// [`Grid::paint`] for the convex span fill, whose crossings are
+            /// exact and provably inside `[0, width]` because every vertex is.
+            #[inline]
+            fn paint_inside(&mut self, row: u32, left: i64, right: i64) {
+                if left >= right {
+                    return;
+                }
+                // Charged exactly as `paint` does: an upper bound of one word
+                // per `64` pixels plus the two edge words. `right > left` here,
+                // so the shift is the same as the division without the sign
+                // correction the compiler must emit for a signed denominator.
+                self.work += (((right - left) as u64) >> 6) + 2;
+                self.paint_words(row, left as usize, right as usize);
+            }
+
+            /// ORs the bits of `[left, right)` in `row`. `64` is a power of
+            /// two, so the word index and offset are a shift and a mask.
+            #[inline]
+            fn paint_words(&mut self, row: u32, left: usize, right: usize) {
+                let row_base = row as usize * self.words_per_row;
+                let mut word = row_base + (left >> 6);
+                let mut bit = left & 63;
+                let mut remaining = right - left;
+                while remaining > 0 {
+                    let take = remaining.min(64 - bit);
+                    let mask = if take == 64 {
+                        u64::MAX
+                    } else {
+                        ((1_u64 << take) - 1) << bit
+                    };
+                    self.bits[word] |= mask;
+                    remaining -= take;
+                    word += 1;
+                    bit = 0;
+                }
+            }
+        }
+
+        /// Exact span fill for one strictly convex, simple polygon under the
+        /// measured GDI rule. A convex polygon's boundary is two y-monotone
+        /// chains from its lowest vertex to its highest, so every sampled row
+        /// has exactly one active edge per chain and the span can be painted
+        /// in a single pass: no per-row scratch array, no event list, no sort
+        /// and no winding accumulation. Each crossing is an exact integer DDA
+        /// (`x = x0 + q*t + (s*t)/dy` with `q = dx div dy`, `s = dx rem dy`),
+        /// so the only per-row work is an add and a conditional subtract,
+        /// never a division or a float.
+        fn fill_convex(
+            polygon: &[[i32; 2]],
+            grid: &mut Grid<'_>,
+            scratch: &mut ConvexScratch,
+        ) -> Result<(), ScanError> {
+            let min_x = grid.min_x;
+            let min_y = grid.min_y;
+            let count = polygon.len();
+            // The lowest and highest vertices, tie-broken by x so each is
+            // unique even when the polygon has a horizontal bottom or top
+            // edge. Strict convexity makes y unimodal around the boundary, so
+            // these two vertices split the ring into the two chains.
+            let mut bottom_index = 0;
+            let mut top_index = 0;
+            for index in 1..count {
+                let [x, y] = polygon[index];
+                let [low_x, low_y] = polygon[bottom_index];
+                if y < low_y || (y == low_y && x < low_x) {
+                    bottom_index = index;
+                }
+                let [high_x, high_y] = polygon[top_index];
+                if y > high_y || (y == high_y && x > high_x) {
+                    top_index = index;
+                }
+            }
+            let bottom_row = (polygon[bottom_index][1] - min_y) as u32;
+            let top_row = (polygon[top_index][1] - min_y) as u32;
+            if top_row <= bottom_row {
+                // Every vertex on one row: no sampled row, nothing to fill.
+                return Ok(());
+            }
+            scratch.edges.clear();
+            let mut work = 0_u64;
+            let mut index = bottom_index;
+            while index != top_index {
+                let next = if index + 1 == count { 0 } else { index + 1 };
+                work += push_convex_edge(&mut scratch.edges, polygon[index], polygon[next], min_y);
+                index = next;
+            }
+            scratch.split = scratch.edges.len();
+            let mut index = bottom_index;
+            while index != top_index {
+                let next = if index == 0 { count - 1 } else { index - 1 };
+                work += push_convex_edge(&mut scratch.edges, polygon[index], polygon[next], min_y);
+                index = next;
+            }
+            // One charge per polygon rather than one per row keeps the hot
+            // row loop down to the accumulator add. A fast-path polygon has
+            // at most `MAX_SCAN_POLYGON_POINTS` edges spanning at most
+            // `MAX_SCAN_SPAN` rows, so one polygon adds at most ~512k work
+            // units; the caller checks the cap after every polygon, which
+            // fails closed within far less than the budget.
+            grid.charge(work);
+            let (left_chain, right_chain) = scratch.edges.split_at(scratch.split);
+            let mut left = ConvexCursor::new(left_chain);
+            let mut right = ConvexCursor::new(right_chain);
+            let shift = i64::from(min_x);
+            for row in bottom_row..top_row {
+                // Both chains span this whole row range, so the only way to
+                // get here without an active edge would be a polygon that is
+                // not convex; the fills that reach this point were all proved
+                // convex, and stopping is still the honest answer if not.
+                let (Some(left_edge), Some(right_edge)) =
+                    (left.seek(left_chain, row), right.seek(right_chain, row))
+                else {
+                    break;
+                };
+                let left_x = left.crossing() - shift;
+                let right_x = right.crossing() - shift;
+                // Every vertex is inside the frame box and a sampled crossing
+                // lies between two vertices' x values, so `ceil` of it lands
+                // in `0..=width` and no clamp is needed here.
+                if left_x <= right_x {
+                    grid.paint_inside(row, left_x, right_x);
+                } else {
+                    grid.paint_inside(row, right_x, left_x);
+                }
+                left.step(left_edge);
+                right.step(right_edge);
+            }
+            Ok(())
+        }
+
+        /// Pushes onto a scratch list without ever aborting the process.
+        ///
+        /// The scan runs inside the per-frame install callback, so a bare
+        /// `Vec::push` that fails to allocate calls `handle_alloc_error` and
+        /// takes the application down; a scan error instead surfaces as a real
+        /// error through [`classify`] and the caller keeps its old region. The
+        /// list is only grown when it is already full, and `try_reserve` grows
+        /// geometrically, so a real frame — a few hundred rectangles — never
+        /// resizes more than a handful of times and never reserves the caps.
+        fn push_checked<T>(list: &mut Vec<T>, value: T) -> Result<(), ScanError> {
+            if list.len() == list.capacity() {
+                list.try_reserve(1).map_err(|_| {
+                    ScanError::Invalid("Scanline scratch list allocation failed".to_owned())
+                })?;
+            }
+            list.push(value);
+            Ok(())
+        }
+
+        /// General exact fill: one event per edge crossing per row, sorted by
+        /// row then crossing, then nonzero-winding spans. Used for every
+        /// non-convex or self-intersecting input and for every fill rule the
+        /// calibration battery still explores.
+        fn fill_winding(
+            polygon: &[[i32; 2]],
+            grid: &mut Grid<'_>,
+            rule: FillRule,
+            events: &mut Vec<(u32, i64, i64, i32)>,
+        ) -> Result<(), ScanError> {
+            let min_x = grid.min_x;
+            let min_y = grid.min_y;
+            events.clear();
+            for (index, &[x0, y0]) in polygon.iter().enumerate() {
+                let [x1, y1] = polygon[(index + 1) % polygon.len()];
+                if y0 == y1 {
+                    continue;
+                }
+                let ascending = y0 < y1;
+                let (low_y, high_y, low_x, high_x) = if ascending {
+                    (y0, y1, x0, x1)
+                } else {
+                    (y1, y0, x1, x0)
+                };
+                let direction = if ascending { 1_i32 } else { -1 };
+                let first_row = (low_y - min_y) as u32;
+                let end_row = (high_y - min_y) as u32;
+                let dy = i64::from(high_y - low_y);
+                let denominator = 2 * dy;
+                let dx = i64::from(high_x - low_x);
+                grid.charge(u64::from(end_row - first_row));
+                if grid.exhausted() {
+                    return Err(ScanError::Over(NotApplicable::TooMuchWork));
+                }
+                for row in first_row..end_row {
+                    // Scanline y = row + sample_y_half / 2; scanning a
+                    // row only when the polygon covers that sample keeps
+                    // horizontal edges from crossing.
+                    let sample_y = 2 * i64::from(row) + rule.sample_y_half;
+                    let rose = sample_y - 2 * i64::from(low_y - min_y);
+                    if rose < 0 || rose >= 2 * i64::from(high_y - low_y) {
+                        continue;
+                    }
+                    let numerator = i64::from(low_x - min_x) * denominator + dx * rose;
+                    push_checked(events, (row, numerator, denominator, direction))?;
+                }
+            }
+            events.sort_unstable_by(|a, b| {
+                a.0.cmp(&b.0).then_with(|| {
+                    (i128::from(a.1) * i128::from(b.2)).cmp(&(i128::from(b.1) * i128::from(a.2)))
+                })
+            });
+            let mut index = 0_usize;
+            while index < events.len() {
+                let row = events[index].0;
+                let mut end = index;
+                while end < events.len() && events[end].0 == row {
+                    end += 1;
+                }
+                let mut winding = 0_i32;
+                let mut previous: Option<(i64, i64)> = None;
+                for &(_, numerator, denominator, direction) in &events[index..end] {
+                    if winding != 0
+                        && let Some((from_num, from_den)) = previous
+                    {
+                        let left = left_bound(from_num, from_den, rule);
+                        let right = right_bound(numerator, denominator, rule);
+                        grid.paint(row, left, right);
+                    }
+                    winding += direction;
+                    previous = Some((numerator, denominator));
+                }
+                index = end;
+            }
+            Ok(())
+        }
+
+        /// Fills the exact nonzero-winding union of `polygons` on the integer
+        /// pixel grid. All coordinates are validated and translated into the
+        /// bounding box first; translations by whole pixels preserve the
+        /// half-integer scanline grid. Test-only entry: production reaches the
+        /// same fill through [`scan_convex_polygons`], which skips the
+        /// convexity re-check `applicable` already performed.
+        #[cfg(test)]
+        pub(crate) fn scan_polygons(
+            polygons: &[Vec<[i32; 2]>],
+            rule: FillRule,
+        ) -> Result<Scan, ScanError> {
+            scan_polygons_inner(polygons, rule, false, None)
+        }
+
+        /// [`scan_convex_polygons`] for the test entry points, which reach the
+        /// fill without having run [`applicable_bounds`]: the box is measured
+        /// here. Unlike `applicable`, this does not demand the fast path's
+        /// production thresholds (polygon count, per-polygon point cap), so a
+        /// test can exercise the exact fill on a handful of polygons.
+        #[cfg(test)]
+        pub(crate) fn scan_convex_measured(
+            polygons: &[Vec<[i32; 2]>],
+            rule: FillRule,
+        ) -> Result<Scan, ScanError> {
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+            for polygon in polygons {
+                validate_polygon(polygon).map_err(ScanError::Invalid)?;
+                for &[x, y] in polygon {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+            scan_convex_polygons(polygons, rule, [min_x, min_y, max_x, max_y])
+        }
+
+        /// [`scan_polygons`] for a caller that has already proven every
+        /// polygon strictly convex and simple (`applicable`), which is the
+        /// production decision path. `bounds` is the box that same walk
+        /// produced, so the 35k-polygon list is not walked again to
+        /// re-validate and re-measure what was just checked.
+        pub(crate) fn scan_convex_polygons(
+            polygons: &[Vec<[i32; 2]>],
+            rule: FillRule,
+            bounds: Bounds,
+        ) -> Result<Scan, ScanError> {
+            scan_polygons_inner(polygons, rule, true, Some(bounds))
+        }
+
+        fn scan_polygons_inner(
+            polygons: &[Vec<[i32; 2]>],
+            rule: FillRule,
+            convex_input: bool,
+            proven_bounds: Option<Bounds>,
+        ) -> Result<Scan, ScanError> {
+            if polygons.len() > MAX_SCAN_POLYGONS {
+                return Err(ScanError::Over(NotApplicable::TooManyPolygons));
+            }
+            let mut points = 0_usize;
+            let [min_x, min_y, max_x, max_y] = match proven_bounds {
+                // `applicable` validated every coordinate, capped the point
+                // count and capped the box, so this walk is only the point
+                // total the packing budget still needs.
+                Some(bounds) => {
+                    for polygon in polygons {
+                        points = points.checked_add(polygon.len()).ok_or_else(|| {
+                            ScanError::Invalid("Scanline region point count overflowed".to_owned())
+                        })?;
+                    }
+                    bounds
+                }
+                None => {
+                    // Validation and the bounding box in one walk: the test
+                    // entry point reaches the fill without `applicable`, so it
+                    // has to prove the input itself.
+                    let mut min_x = i32::MAX;
+                    let mut min_y = i32::MAX;
+                    let mut max_x = i32::MIN;
+                    let mut max_y = i32::MIN;
+                    for polygon in polygons {
+                        validate_polygon(polygon).map_err(ScanError::Invalid)?;
+                        for &[x, y] in polygon {
+                            min_x = min_x.min(x);
+                            min_y = min_y.min(y);
+                            max_x = max_x.max(x);
+                            max_y = max_y.max(y);
+                        }
+                        points = points.checked_add(polygon.len()).ok_or_else(|| {
+                            ScanError::Invalid("Scanline region point count overflowed".to_owned())
+                        })?;
+                    }
+                    [min_x, min_y, max_x, max_y]
+                }
+            };
+            if points > MAX_SCAN_POINTS {
+                return Err(ScanError::Over(NotApplicable::TooManyPoints));
+            }
+            if polygons.is_empty() {
+                return Ok(Scan {
+                    rects: Vec::new(),
+                    pixels: 0,
+                    work: 0,
+                });
+            }
+            let width = max_x - min_x;
+            let height = max_y - min_y;
+            if width > MAX_SCAN_SPAN || height > MAX_SCAN_SPAN {
+                return Err(ScanError::Over(NotApplicable::SpanTooLarge));
+            }
+            if width <= 0 || height <= 0 {
+                return Ok(Scan {
+                    rects: Vec::new(),
+                    pixels: 0,
+                    work: 0,
+                });
+            }
+            let area = u64::from(width as u32) * u64::from(height as u32);
+            if area > MAX_SCAN_PIXELS {
+                return Err(ScanError::Over(NotApplicable::TooManyPixels));
+            }
+            let words_per_row = (width as usize).div_ceil(64);
+            let total_words = words_per_row.checked_mul(height as usize).ok_or_else(|| {
+                ScanError::Invalid("Scanline region bitset length overflowed".to_owned())
+            })?;
+            let mut bits: Vec<u64> = Vec::new();
+            bits.try_reserve_exact(total_words).map_err(|_| {
+                ScanError::Invalid("Scanline region bitset allocation failed".to_owned())
+            })?;
+            bits.resize(total_words, 0);
+
+            // The measured GDI rule rounds both ends of a span the same way,
+            // so a strictly convex polygon's row span is exactly
+            // `[ceil(min crossing), ceil(max crossing))` and the per-polygon
+            // event sort — the dominant cost on dense frames — is not needed.
+            // Any other rule (only the calibration battery explores those)
+            // and any non-convex polygon keep the general winding path.
+            let mut scratch = if rule == MEASURED_RULE {
+                Some(ConvexScratch::new()?)
+            } else {
+                None
+            };
+
+            // Same fail-closed requirement as the rectangle list: the general
+            // winding fill is reached from the install callback too. It is
+            // cleared per polygon and holds at most one event per row of that
+            // polygon's span, so it grows through the same checked push.
+            let mut events: Vec<(u32, i64, i64, i32)> = Vec::new();
+            // The fills own the bitset for the duration of this block; the
+            // rect extraction below reads it immutably, so the borrow has to
+            // end first.
+            let work = {
+                let mut grid = Grid {
+                    bits: &mut bits,
+                    words_per_row,
+                    min_x,
+                    min_y,
+                    width,
+                    work: 0,
+                };
+                for polygon in polygons {
+                    // The span fill is only valid for a strictly convex, simple
+                    // polygon; anything else — including the concave, collinear
+                    // and self-intersecting fixtures the calibration and boundary
+                    // tests feed straight into this function — keeps the general
+                    // winding path. `convex_input` skips only this re-check, and
+                    // only because `applicable` proved it for every polygon.
+                    let convex = convex_input || strictly_convex_with(polygon);
+                    match scratch.as_mut() {
+                        Some(scratch) if convex => fill_convex(polygon, &mut grid, scratch)?,
+                        _ => fill_winding(polygon, &mut grid, rule, &mut events)?,
+                    }
+                    // The fills charge once per polygon, so the cap is
+                    // enforced here: at most one polygon's worth of work can
+                    // run past the budget before this stops the scan.
+                    if grid.exhausted() {
+                        return Err(ScanError::Over(NotApplicable::TooMuchWork));
+                    }
+                }
+                grid.work
+            };
+
+            // The scan runs inside the per-frame install callback, so an
+            // allocation failure must fail the install rather than abort the
+            // process: a bare `push` would call `handle_alloc_error`. The
+            // lists below therefore grow through `push_checked`, which reports
+            // failure as an error. No up-front reservation of the caps: they
+            // are budgets, not expected sizes, and a real frame fills a few
+            // hundred rectangles.
+            let mut rects: Vec<[i32; 4]> = Vec::new();
+            let mut active: Vec<(u32, u32, usize)> = Vec::new();
+            let mut runs: Vec<(u32, u32)> = Vec::new();
+            let mut pixels = 0_u64;
+            for row in 0..height as u32 {
+                runs.clear();
+                let row_base = row as usize * words_per_row;
+                let mut open: Option<u32> = None;
+                for word_index in 0..words_per_row {
+                    let base = (word_index * 64) as u32;
+                    let word = bits[row_base + word_index];
+                    // A run carried from the previous word ends at this
+                    // word's start unless this word begins with a set bit.
+                    // A run that fills a word's top bit ends exactly at the
+                    // boundary as often as it continues into the next word.
+                    if word & 1 == 0
+                        && let Some(start) = open.take()
+                    {
+                        push_checked(&mut runs, (start, base))?;
+                    }
+                    if word == 0 {
+                        continue;
+                    }
+                    let mut bit = 0_u32;
+                    loop {
+                        let shifted = word >> bit;
+                        if shifted == 0 {
+                            break;
+                        }
+                        let zeros = shifted.trailing_zeros();
+                        // A carried run keeps its own start; only a fresh run
+                        // records the position where these ones begin.
+                        open.get_or_insert(base + bit + zeros);
+                        let ones = (shifted >> zeros).trailing_ones();
+                        let end = bit + zeros + ones;
+                        if end == 64 {
+                            // The run reaches this word's top bit; whether it
+                            // continues is decided by the next word.
+                            break;
+                        }
+                        let start = open.take().expect("run start was just set");
+                        push_checked(&mut runs, (start, base + end))?;
+                        bit = end;
+                    }
+                }
+                if let Some(start) = open {
+                    // Bits at or past `width` are never set, so a run carried
+                    // past the last word ends at the row's width.
+                    push_checked(&mut runs, (start, width as u32))?;
+                }
+                for &(left, right) in &runs {
+                    pixels += u64::from(right - left);
+                }
+                // Vertical merge only when the complete run list is
+                // identical; a partial overlap must split into new
+                // rectangles, never widen or narrow the previous row.
+                let identical = active.len() == runs.len()
+                    && active
+                        .iter()
+                        .zip(&runs)
+                        .all(|(active, run)| active.0 == run.0 && active.1 == run.1);
+                if identical {
+                    for &(_, _, rect_index) in &active {
+                        rects[rect_index][3] = min_y + row as i32 + 1;
+                    }
+                } else {
+                    active.clear();
+                    for &(left, right) in &runs {
+                        if rects.len() >= MAX_SCAN_RECTS {
+                            return Err(ScanError::Over(NotApplicable::TooManyRects));
+                        }
+                        let rect_index = rects.len();
+                        push_checked(
+                            &mut rects,
+                            [
+                                min_x + left as i32,
+                                min_y + row as i32,
+                                min_x + right as i32,
+                                min_y + row as i32 + 1,
+                            ],
+                        )?;
+                        push_checked(&mut active, (left, right, rect_index))?;
+                    }
+                }
+            }
+            Ok(Scan {
+                rects,
+                pixels,
+                work,
+            })
+        }
+
+        /// One region from a scanned rectangle list, or an empty region when
+        /// the fill is empty. The buffer is `Vec<u32>` so the RGNDATA header
+        /// and RECT array start on their required four-byte alignment.
+        pub(crate) fn region_from_scan(scan: &Scan) -> Result<GdiRegion, ScanError> {
+            if scan.rects.is_empty() {
+                return empty_region().map_err(ScanError::Invalid);
+            }
+            let payload = scan.rects.len().checked_mul(16).ok_or_else(|| {
+                ScanError::Invalid("Scanline region byte length overflowed".to_owned())
+            })?;
+            let total = payload.checked_add(32).ok_or_else(|| {
+                ScanError::Invalid("Scanline region byte length overflowed".to_owned())
+            })?;
+            if total > MAX_SCAN_BYTES {
+                return Err(ScanError::Over(NotApplicable::TooManyBytes));
+            }
+            let mut words: Vec<u32> = Vec::new();
+            words.try_reserve_exact(total / 4).map_err(|_| {
+                ScanError::Invalid("Scanline region buffer allocation failed".to_owned())
+            })?;
+            let mut bound_left = i32::MAX;
+            let mut bound_top = i32::MAX;
+            let mut bound_right = i32::MIN;
+            let mut bound_bottom = i32::MIN;
+            for rect in &scan.rects {
+                bound_left = bound_left.min(rect[0]);
+                bound_top = bound_top.min(rect[1]);
+                bound_right = bound_right.max(rect[2]);
+                bound_bottom = bound_bottom.max(rect[3]);
+            }
+            words.extend_from_slice(&[
+                32,
+                RDH_RECTANGLES,
+                scan.rects.len() as u32,
+                payload as u32,
+                bound_left as u32,
+                bound_top as u32,
+                bound_right as u32,
+                bound_bottom as u32,
+            ]);
+            for rect in &scan.rects {
+                words.extend_from_slice(&[
+                    rect[0] as u32,
+                    rect[1] as u32,
+                    rect[2] as u32,
+                    rect[3] as u32,
+                ]);
+            }
+            #[cfg(test)]
+            if region_tests::fail_call(region_tests::Call::ExtRegion) {
+                return Err(ScanError::Invalid(
+                    "ExtCreateRegion failed to create a GDI region".to_owned(),
+                ));
+            }
+            // SAFETY: `words` holds exactly the RGNDATA header plus one
+            // four-word RECT per rectangle, four-byte aligned, and stays alive
+            // and unmodified for the call. `ExtCreateRegion` only reads it.
+            let region = unsafe {
+                ExtCreateRegion(
+                    core::ptr::null(),
+                    total as u32,
+                    words.as_ptr().cast::<c_void>(),
+                )
+            };
+            GdiRegion::from_raw(region, "ExtCreateRegion").map_err(ScanError::Invalid)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn scanline_region(
+            polygons: &[Vec<[i32; 2]>],
+            rule: FillRule,
+        ) -> Result<GdiRegion, String> {
+            let scan = scan_polygons(polygons, rule).map_err(ScanError::into_message)?;
+            region_from_scan(&scan).map_err(ScanError::into_message)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn scanline_matches_chunked(
+            polygons: &[Vec<[i32; 2]>],
+            rule: FillRule,
+        ) -> Result<bool, String> {
+            let scanned = scanline_region(polygons, rule)?;
+            let chunked = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
+            regions_equal(&scanned, &chunked)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn scanline_matches_sequential(
+            polygons: &[Vec<[i32; 2]>],
+            rule: FillRule,
+        ) -> Result<bool, String> {
+            let scanned = scanline_region(polygons, rule)?;
+            let sequential = unified_region_sequential(polygons)?;
+            regions_equal(&scanned, &sequential)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn scanline_contains(
+            polygons: &[Vec<[i32; 2]>],
+            points: &[[i32; 2]],
+            rule: FillRule,
+        ) -> Result<Vec<bool>, String> {
+            let region = scanline_region(polygons, rule)?;
+            Ok(points
+                .iter()
+                .map(|point| {
+                    // SAFETY: `region` is a live handle owned by this call and
+                    // `PtInRegion` only reads it.
+                    unsafe { PtInRegion(region.handle(), point[0], point[1]) != 0 }
+                })
+                .collect())
+        }
+
+        /// The rule that reproduces GDI exactly on every calibration shape.
+        /// Fails if none or more than one candidate does: a tie means the
+        /// battery cannot distinguish the rules and must be extended before
+        /// the scanline path may be trusted. The failure names each
+        /// candidate's first counterexample.
+        #[cfg(test)]
+        pub(crate) fn calibrate_fill_rule(
+            cases: &[Vec<Vec<[i32; 2]>>],
+        ) -> Result<FillRule, String> {
+            let mut survivors = Vec::new();
+            let mut misses = Vec::new();
+            for rule in CANDIDATE_RULES {
+                let mut first_miss = None;
+                for polygons in cases {
+                    let gdi = gdi_fill_rects(polygons)?;
+                    let scanned = scan_polygons(polygons, rule).map_err(ScanError::into_message)?;
+                    let mut rects = scanned.rects;
+                    rects.sort_unstable();
+                    if rects != gdi {
+                        first_miss = Some(format!("shape={polygons:?} gdi={gdi:?} scan={rects:?}"));
+                        break;
+                    }
+                }
+                match first_miss {
+                    None => survivors.push(rule),
+                    Some(miss) => misses.push(format!("{rule:?}: {miss}")),
+                }
+            }
+            match survivors.as_slice() {
+                [rule] => Ok(*rule),
+                [] => Err(format!(
+                    "No scanline fill rule reproduces GDI on the calibration shapes.\n{}",
+                    misses.join("\n")
+                )),
+                _ => Err(format!(
+                    "{} fill rules reproduce GDI on the calibration shapes; the battery is ambiguous: {survivors:?}",
+                    survivors.len()
+                )),
+            }
+        }
+
+        /// `GetRegionData` round trip: `ExtCreateRegion` must rebuild exactly
+        /// the region GDI serialized, including the header layout.
+        #[cfg(test)]
+        pub(crate) fn probe_region_data_round_trip(
+            polygons: &[Vec<[i32; 2]>],
+        ) -> Result<bool, String> {
+            let original = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
+            let words = region_data_words(&original)?;
+            // SAFETY: the buffer starts with the RGNDATA header GDI just
+            // wrote; its `written` bytes are initialized and aligned.
+            let copy = unsafe {
+                ExtCreateRegion(
+                    core::ptr::null(),
+                    (words.len() * core::mem::size_of::<u32>()) as u32,
+                    words.as_ptr().cast::<c_void>(),
+                )
+            };
+            let copy = GdiRegion::from_raw(copy, "ExtCreateRegion")?;
+            regions_equal(&original, &copy)
+        }
+
+        /// Serializes a live region into its exact `RGNDATA` bytes, in
+        /// four-byte words so the header stays aligned. Also asserts the
+        /// header size and rectangle count agree with the byte count.
+        #[cfg(test)]
+        pub(crate) fn region_data_words(region: &GdiRegion) -> Result<Vec<u32>, String> {
+            // SAFETY: the region is live; a null buffer asks for the size.
+            let bytes = unsafe { GetRegionData(region.handle(), 0, core::ptr::null_mut()) };
+            if bytes < 32 {
+                return Err(format!(
+                    "GetRegionData returned {bytes} bytes, less than the 32-byte header"
+                ));
+            }
+            let mut words: Vec<u32> = Vec::new();
+            words
+                .try_reserve_exact(bytes.div_ceil(4) as usize)
+                .map_err(|_| "GetRegionData buffer allocation failed".to_owned())?;
+            words.resize(bytes.div_ceil(4) as usize, 0);
+            // SAFETY: the buffer holds at least `bytes` bytes and the region
+            // is live; GDI writes at most `bytes` bytes into it.
+            let written =
+                unsafe { GetRegionData(region.handle(), bytes, words.as_mut_ptr().cast()) };
+            if written != bytes {
+                return Err(format!(
+                    "GetRegionData wrote {written} of {bytes} requested bytes"
+                ));
+            }
+            let header_size = words[0];
+            let count = words[2];
+            let payload = words[3];
+            let expected = count
+                .checked_mul(16)
+                .ok_or_else(|| "RGNDATA payload size overflowed".to_owned())?;
+            if header_size != 32 || payload != expected || bytes != 32 + expected {
+                return Err(format!(
+                    "RGNDATA header is inconsistent: size={header_size} count={count} \
+                     payload={payload} bytes={bytes}"
+                ));
+            }
+            words.truncate(bytes as usize / 4);
+            Ok(words)
+        }
+
+        /// Decodes `RGNDATA` bytes into half-open rectangles without going
+        /// through GDI, so a fixture can compare exact rectangle sets.
+        #[cfg(test)]
+        pub(crate) fn region_data_rects(words: &[u32]) -> Result<Vec<[i32; 4]>, String> {
+            let count = *words
+                .get(2)
+                .ok_or_else(|| "RGNDATA is shorter than its header".to_owned())?
+                as usize;
+            let rects = words
+                .get(8..)
+                .ok_or_else(|| "RGNDATA has no rectangle array".to_owned())?;
+            if rects.len() < count * 4 {
+                return Err(format!(
+                    "RGNDATA has {} rectangle words, fewer than {count} rectangles need",
+                    rects.len()
+                ));
+            }
+            Ok((0..count)
+                .map(|index| {
+                    let rect = &rects[index * 4..index * 4 + 4];
+                    [
+                        rect[0] as i32,
+                        rect[1] as i32,
+                        rect[2] as i32,
+                        rect[3] as i32,
+                    ]
+                })
+                .collect())
+        }
+
+        /// GDI's exact filled rectangles for `polygons`, normalized to
+        /// half-open, sorted, pairwise-disjoint rectangles.
+        #[cfg(test)]
+        pub(crate) fn gdi_fill_rects(polygons: &[Vec<[i32; 2]>]) -> Result<Vec<[i32; 4]>, String> {
+            let region = chunked_region(polygons, REGION_CHUNK_POLYGONS)?;
+            let words = region_data_words(&region)?;
+            let mut rects = region_data_rects(&words)?;
+            rects.sort_unstable();
+            Ok(rects)
+        }
+
+        /// The area of a rectangle list as a pixel set, used to compare the
+        /// scanned fill with GDI's rectangles independent of rectangle
+        /// decomposition. Both sides must already be disjoint.
+        #[cfg(test)]
+        pub(crate) fn rect_pixels(rects: &[[i32; 4]]) -> u64 {
+            rects
+                .iter()
+                .map(|rect| {
+                    u64::from((rect[2] - rect[0]).max(0) as u32)
+                        * u64::from((rect[3] - rect[1]).max(0) as u32)
+                })
+                .sum()
+        }
+    }
+
     #[cfg(test)]
     mod region_tests {
         use super::*;
@@ -947,13 +2532,14 @@ mod win32 {
             Empty,
             Union,
             PolyPoly,
+            ExtRegion,
         }
 
         #[derive(Clone, Copy, Default)]
         struct State {
             live: usize,
             peak: usize,
-            calls: [usize; 4],
+            calls: [usize; 5],
             failure: Option<(Call, usize)>,
         }
 
@@ -1030,14 +2616,683 @@ mod win32 {
             ]
         }
 
+        /// Every rectangle GDI actually filled, decoded from its own
+        /// `RGNDATA`, so fill-rule calibration never relies on our assumption.
+        fn gdi_rects(polygons: &[Vec<[i32; 2]>]) -> Vec<[i32; 4]> {
+            super::scan::gdi_fill_rects(polygons).unwrap()
+        }
+
+        fn scan_rects(polygons: &[Vec<[i32; 2]>], rule: super::scan::FillRule) -> Vec<[i32; 4]> {
+            let scan = super::scan::scan_polygons(polygons, rule).unwrap();
+            let mut rects = scan.rects;
+            rects.sort_unstable();
+            rects
+        }
+
+        /// A half-open rectangle converted to the pixel set GDI reports, so
+        /// an off-by-one in either direction shows up as a distinct rect.
+        fn pixel_set(rects: &[[i32; 4]]) -> std::collections::BTreeSet<(i32, i32)> {
+            let mut set = std::collections::BTreeSet::new();
+            for rect in rects {
+                for y in rect[1]..rect[3] {
+                    for x in rect[0]..rect[2] {
+                        set.insert((x, y));
+                    }
+                }
+            }
+            set
+        }
+
+        #[test]
+        fn region_data_round_trip_preserves_region() {
+            let cases = vec![
+                vec![],
+                vec![rectangle(0, 0, 10, 10)],
+                vec![rectangle(0, 0, 10, 10), rectangle(5, 5, 10, 10)],
+                vec![rectangle(-100, -100, 8, 8), rectangle(100, 100, 8, 8)],
+                vec![vec![[0, 0], [1, 30], [0, 30]]],
+            ];
+            for polygons in cases {
+                reset();
+                assert!(
+                    super::scan::probe_region_data_round_trip(&polygons).unwrap(),
+                    "GetRegionData -> ExtCreateRegion changed the region for {polygons:?}"
+                );
+                assert_eq!(state().live, 0);
+            }
+        }
+
+        /// Shapes chosen to expose the endpoint rules: axis-aligned, both
+        /// diagonal directions, slanted edges crossing pixel centers in both
+        /// directions, vertices exactly on scanlines, shared edges with mixed
+        /// winding, touching shapes with a gap, and negative coordinates.
+        fn calibration_cases() -> Vec<Vec<Vec<[i32; 2]>>> {
+            vec![
+                vec![rectangle(0, 0, 10, 10)],
+                vec![rectangle(-4, -3, 7, 5)],
+                vec![vec![[0, 0], [10, 0], [10, 10]]],
+                vec![vec![[0, 0], [10, 10], [0, 10]]],
+                vec![vec![[0, 10], [10, 0], [10, 10]]],
+                vec![vec![[0, 0], [11, 6], [3, 11]]],
+                vec![vec![[0, 0], [9, 4], [1, 9]]],
+                vec![vec![[11, 0], [11, 6], [0, 3]]],
+                // A diamond: vertices exactly on scanlines, edges at
+                // fractional x crossings.
+                vec![vec![[5, 0], [10, 5], [5, 10], [0, 5]]],
+                vec![vec![[6, 1], [11, 6], [6, 11], [1, 6]]],
+                // Two triangles sharing the edge x = 5 with opposite
+                // winding: the union is the whole rectangle.
+                vec![
+                    vec![[0, 0], [5, 0], [5, 10]],
+                    vec![[5, 0], [10, 0], [5, 10]],
+                ],
+                // Touching squares with a one-pixel gap (ear/leg spacing).
+                vec![rectangle(0, 0, 4, 20), rectangle(5, 0, 4, 20)],
+                // Overlapping shapes whose union fill must use OR, not XOR.
+                vec![rectangle(0, 0, 8, 8), rectangle(4, 4, 8, 8)],
+                vec![vec![[0, 0], [30, 7], [3, 30], [17, 13]]],
+                // Concave L: the notch must stay empty under nonzero
+                // winding, not be closed by a simplified hull.
+                vec![vec![[0, 0], [20, 0], [20, 8], [8, 8], [8, 20], [0, 20]]],
+                // Self-intersecting star: GDI's winding fill leaves the
+                // centre filled; a convex-only assumption would differ.
+                vec![vec![
+                    [10, 0],
+                    [12, 7],
+                    [20, 7],
+                    [14, 12],
+                    [16, 20],
+                    [10, 15],
+                    [4, 20],
+                    [6, 12],
+                    [0, 7],
+                    [8, 7],
+                ]],
+            ]
+        }
+
+        #[test]
+        fn gdi_fill_rule_is_calibrated_by_measurement() {
+            reset();
+            let rule = super::scan::calibrate_fill_rule(&calibration_cases()).unwrap();
+            // Pin the measured rule so a future GDI/Windows change surfaces
+            // as an explicit failure instead of silent pixel drift.
+            assert_eq!(
+                rule,
+                super::scan::MEASURED_RULE,
+                "GDI's measured fill rule changed"
+            );
+            for polygons in calibration_cases() {
+                let gdi = gdi_rects(&polygons);
+                let scanned = scan_rects(&polygons, rule);
+                assert_eq!(gdi, scanned, "rectangles differ for {polygons:?}");
+            }
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn gdi_fill_uses_union_not_xor() {
+            reset();
+            let rule = super::scan::calibrate_fill_rule(&calibration_cases()).unwrap();
+            let overlapping = vec![rectangle(0, 0, 8, 8), rectangle(4, 4, 8, 8)];
+            let gdi = gdi_rects(&overlapping);
+            let fill = pixel_set(&gdi);
+            assert!(fill.contains(&(5, 5)), "overlap must stay filled");
+            assert_eq!(fill.len(), 112, "union area must be 112 pixels");
+            let scan = super::scan::scan_polygons(&overlapping, rule).unwrap();
+            assert_eq!(pixel_set(&scan.rects), fill);
+            assert_eq!(
+                scan.pixels,
+                super::scan::rect_pixels(&gdi),
+                "the scanned pixel count must match GDI's filled area"
+            );
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn convex_span_fill_matches_gdi_on_convex_polygons() {
+            reset();
+            let rule = super::scan::calibrate_fill_rule(&calibration_cases()).unwrap();
+            // Every strictly convex case in the calibration battery, plus
+            // slanted edges whose crossings are never integral and a shape
+            // whose vertices sit exactly on scanlines.
+            let mut cases: Vec<Vec<Vec<[i32; 2]>>> = vec![
+                vec![rectangle(0, 0, 10, 10)],
+                vec![rectangle(-4, -3, 7, 5)],
+                vec![vec![[0, 0], [10, 0], [10, 10]]],
+                vec![vec![[0, 0], [10, 10], [0, 10]]],
+                vec![vec![[0, 10], [10, 0], [10, 10]]],
+                vec![vec![[0, 0], [11, 6], [3, 11]]],
+                vec![vec![[0, 0], [9, 4], [1, 9]]],
+                vec![vec![[11, 0], [11, 6], [0, 3]]],
+                vec![vec![[5, 0], [10, 5], [5, 10], [0, 5]]],
+                vec![vec![[6, 1], [11, 6], [6, 11], [1, 6]]],
+                vec![vec![[0, 0], [30, 7], [3, 30], [17, 13]]],
+                // A one-pixel-wide sliver and a nearly horizontal ramp.
+                vec![vec![[0, 0], [1, 0], [1, 40], [0, 40]]],
+                vec![vec![[0, 0], [41, 1], [41, 2], [0, 2]]],
+                // Overlap: each polygon is convex, the union must be OR.
+                vec![rectangle(0, 0, 8, 8), rectangle(4, 4, 8, 8)],
+                vec![
+                    vec![[0, 0], [40, 0], [0, 40]],
+                    vec![[20, 20], [60, 20], [20, 60]],
+                ],
+            ];
+            // Fixed-seed convex polygons, including negative coordinates.
+            let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+            fn next(seed: &mut u64, limit: i32) -> i32 {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                (*seed % limit as u64) as i32 - limit / 4
+            }
+            for _ in 0..24 {
+                let mut polygons = Vec::new();
+                for _ in 0..4 {
+                    let x = next(&mut seed, 60);
+                    let y = next(&mut seed, 50);
+                    let w = 1 + next(&mut seed, 30).abs();
+                    let h = 1 + next(&mut seed, 25).abs();
+                    polygons.push(if seed & 1 == 0 {
+                        vec![[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+                    } else {
+                        vec![[x, y], [x + w, y], [x + w / 2, y + h]]
+                    });
+                }
+                cases.push(polygons);
+            }
+            for polygons in cases {
+                let gdi = gdi_rects(&polygons);
+                let span = super::scan::scan_convex_measured(&polygons, rule).unwrap();
+                let mut span_rects = span.rects;
+                span_rects.sort_unstable();
+                assert_eq!(gdi, span_rects, "convex span fill differs for {polygons:?}");
+                assert_eq!(state().live, 0);
+            }
+        }
+
+        #[test]
+        fn convex_span_and_winding_paths_are_interchangeable() {
+            reset();
+            let rule = super::scan::calibrate_fill_rule(&calibration_cases()).unwrap();
+            // The convex path must match the general path exactly on every
+            // input both can accept, so which one a polygon takes can never
+            // change the region.
+            let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+            fn next(seed: &mut u64, limit: i32) -> i32 {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                (*seed % limit as u64) as i32 - limit / 5
+            }
+            let mut cases: Vec<Vec<Vec<[i32; 2]>>> = calibration_cases()
+                .into_iter()
+                .filter(|polygons| {
+                    polygons
+                        .iter()
+                        .all(|p| super::scan::is_strictly_convex_simple(p))
+                })
+                .collect();
+            for _ in 0..24 {
+                let mut polygons = Vec::new();
+                for _ in 0..5 {
+                    let x = next(&mut seed, 200);
+                    let y = next(&mut seed, 160);
+                    let w = 1 + next(&mut seed, 70).abs();
+                    let h = 1 + next(&mut seed, 60).abs();
+                    polygons.push(if seed & 1 == 0 {
+                        vec![[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+                    } else {
+                        vec![[x, y], [x + w, y], [x + w / 2, y + h]]
+                    });
+                }
+                cases.push(polygons);
+            }
+            for polygons in cases {
+                let convex = super::scan::scan_convex_measured(&polygons, rule).unwrap();
+                let general = super::scan::scan_polygons(&polygons, rule).unwrap();
+                assert_eq!(
+                    convex.rects, general.rects,
+                    "convex and winding fills differ for {polygons:?}"
+                );
+                assert_eq!(convex.pixels, general.pixels);
+            }
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn single_pixel_difference_is_detected() {
+            reset();
+            let rule = super::scan::calibrate_fill_rule(&calibration_cases()).unwrap();
+            let polygons = vec![rectangle(0, 0, 6, 6)];
+            let mut scan = super::scan::scan_polygons(&polygons, rule).unwrap();
+            scan.rects[0][2] -= 1;
+            let scanned = super::scan::region_from_scan(&scan).unwrap();
+            let gdi = chunked_region(&polygons, REGION_CHUNK_POLYGONS).unwrap();
+            assert!(
+                !regions_equal(&scanned, &gdi).unwrap(),
+                "one missing pixel must fail the set comparison"
+            );
+            drop(scanned);
+            drop(gdi);
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn scanline_matches_gdi_on_boundary_and_random_polygons() {
+            reset();
+            let rule = super::scan::calibrate_fill_rule(&calibration_cases()).unwrap();
+            let mut cases: Vec<Vec<Vec<[i32; 2]>>> = calibration_cases();
+            // Deterministic pseudo-random convex quads and triangles over a
+            // range that includes negative coordinates and slanted edges.
+            let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+            fn next(seed: &mut u64, limit: i32) -> i32 {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                (*seed % limit as u64) as i32 - limit / 4
+            }
+            for _ in 0..24 {
+                let mut polygons = Vec::new();
+                for _ in 0..6 {
+                    let x = next(&mut seed, 90);
+                    let y = next(&mut seed, 70);
+                    let w = 1 + next(&mut seed, 40).abs();
+                    let h = 1 + next(&mut seed, 30).abs();
+                    if seed & 1 == 0 {
+                        polygons.push(vec![[x, y], [x + w, y], [x + w, y + h], [x, y + h]]);
+                    } else {
+                        polygons.push(vec![[x, y], [x + w, y], [x + w / 2, y + h]]);
+                    }
+                }
+                cases.push(polygons);
+            }
+            for polygons in cases {
+                assert!(
+                    super::scan::scanline_matches_chunked(&polygons, rule).unwrap(),
+                    "scanline differs from chunk-41 for {polygons:?}"
+                );
+                assert!(
+                    super::scan::scanline_matches_sequential(&polygons, rule).unwrap(),
+                    "scanline differs from the sequential oracle for {polygons:?}"
+                );
+                assert_eq!(state().live, 0);
+            }
+        }
+
+        #[test]
+        fn scanline_region_contains_matches_gdi_points() {
+            reset();
+            let rule = super::scan::calibrate_fill_rule(&calibration_cases()).unwrap();
+            let polygons = vec![
+                vec![
+                    [0, 0],
+                    [10, 0],
+                    [10, 30],
+                    [30, 30],
+                    [30, 0],
+                    [40, 0],
+                    [40, 40],
+                    [0, 40],
+                ],
+                rectangle(50, 50, 10, 10),
+            ];
+            let points: Vec<[i32; 2]> = (0..60)
+                .step_by(3)
+                .flat_map(|x| (0..60).step_by(7).map(move |y| [x, y]))
+                .collect();
+            let scanned = super::scan::scanline_contains(&polygons, &points, rule).unwrap();
+            let gdi = hit_region_contains(&polygons, &points).unwrap();
+            assert_eq!(scanned, gdi);
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn scanline_rejects_invalid_and_over_budget_input() {
+            reset();
+            let rule = super::scan::MEASURED_RULE;
+            // Malformed input is a real error, never a silent fallback.
+            assert!(matches!(
+                super::scan::scan_polygons(&[vec![[0, 0], [1, 1]]], rule),
+                Err(super::scan::ScanError::Invalid(_))
+            ));
+            assert!(matches!(
+                super::scan::scan_polygons(&[vec![[0, 0], [1 << 26, 0], [0, 10]]], rule),
+                Err(super::scan::ScanError::Invalid(_))
+            ));
+            // Budget overruns decline to the old path.
+            let too_wide = vec![vec![[0, 0], [super::scan::MAX_SCAN_SPAN + 1, 0], [0, 1]]];
+            assert!(matches!(
+                super::scan::scan_polygons(&too_wide, rule),
+                Err(super::scan::ScanError::Over(
+                    super::scan::NotApplicable::SpanTooLarge
+                ))
+            ));
+            // A triangle past the span cap declines before any allocation.
+            let too_tall = vec![vec![[0, 0], [100_000, 0], [0, 16_384]]];
+            assert!(matches!(
+                super::scan::scan_polygons(&too_tall, rule),
+                Err(super::scan::ScanError::Over(
+                    super::scan::NotApplicable::SpanTooLarge
+                ))
+            ));
+            // Many tall, thin triangles inside the span and area caps still
+            // exceed the total-work cap; the scan must stop instead of
+            // walking every edge-row again.
+            let heavy: Vec<Vec<[i32; 2]>> = (0..2_000)
+                .map(|_| vec![[0, 0], [3_000, 0], [0, 16_384]])
+                .collect();
+            assert!(matches!(
+                super::scan::scan_polygons(&heavy, rule),
+                Err(super::scan::ScanError::Over(
+                    super::scan::NotApplicable::TooMuchWork
+                ))
+            ));
+            assert_eq!(state().live, 0);
+        }
+
+        /// The byte cap has to hold for whatever list `region_from_scan` is
+        /// handed, not only for the one the scan produces: the scan's
+        /// rectangle cap rejects first at exactly the same byte count, so
+        /// without this the `TooManyBytes` branch could never be reached.
+        #[test]
+        fn region_from_scan_rejects_a_list_over_the_byte_budget() {
+            reset();
+            let over = super::scan::Scan {
+                rects: vec![[0, 0, 1, 1]; super::scan::MAX_SCAN_RECTS + 1],
+                pixels: 0,
+                work: 0,
+            };
+            assert!(matches!(
+                super::scan::region_from_scan(&over),
+                Err(super::scan::ScanError::Over(
+                    super::scan::NotApplicable::TooManyBytes
+                ))
+            ));
+            drop(over);
+            // Exactly at the cap must still build: the limit is a ceiling, not
+            // an off-by-one exclusion.
+            let at_cap = super::scan::Scan {
+                rects: vec![[0, 0, 1, 1]; super::scan::MAX_SCAN_RECTS],
+                pixels: 0,
+                work: 0,
+            };
+            drop(super::scan::region_from_scan(&at_cap).unwrap());
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn applicability_requires_simple_convex_polygons() {
+            reset();
+            use super::scan::{NotApplicable, applicable, is_strictly_convex_simple};
+            let square = vec![[0, 0], [10, 0], [10, 10], [0, 10]];
+            let triangle = vec![[0, 0], [10, 0], [0, 10]];
+            assert!(is_strictly_convex_simple(&square));
+            assert!(is_strictly_convex_simple(&triangle));
+            // Reversing the order keeps it simple and convex.
+            let mut reversed = square.clone();
+            reversed.reverse();
+            assert!(is_strictly_convex_simple(&reversed));
+
+            // Regular {5/2} and {7/3} star polygons over a radius-100 circle.
+            // Every turn of both is the same sign, so the local-sign test
+            // accepts them; only the turning number sees the difference. The
+            // coordinates are exact and no triple is collinear, which was
+            // checked before they were committed here.
+            const PENTAGRAM: [[i32; 2]; 5] = [[0, 100], [59, -81], [-95, 31], [95, 31], [-59, -81]];
+            const HEPTAGRAM: [[i32; 2]; 7] = [
+                [0, 100],
+                [43, -90],
+                [-78, 62],
+                [97, -22],
+                [-97, -22],
+                [78, 62],
+                [-43, -90],
+            ];
+
+            // Concave, self-intersecting, and a star over a convex vertex set:
+            // all decline, none is partially scanned.
+            for polygon in [
+                vec![[0, 0], [20, 0], [20, 8], [8, 8], [8, 20], [0, 20]],
+                vec![[0, 0], [10, 10], [10, 0], [0, 10]],
+                PENTAGRAM.to_vec(),
+                // Collinear and repeated vertices are outside the fast
+                // path's argument even though GDI fills them.
+                vec![[0, 0], [1, 1], [2, 2]],
+                vec![[0, 0], [0, 0], [0, 0]],
+            ] {
+                assert!(
+                    !is_strictly_convex_simple(&polygon),
+                    "{polygon:?} must not pass the simple-convex gate"
+                );
+            }
+
+            // The turning number is what separates a pentagram from a
+            // pentagon, so it has to reject in both winding directions: the
+            // same star walked backwards winds twice the other way. A star
+            // wound three times is the same trap at a different winding
+            // number, so a pass that only rejected "two turns" would still be
+            // wrong.
+            assert!(!is_strictly_convex_simple(&PENTAGRAM));
+            let backward: Vec<[i32; 2]> = PENTAGRAM.iter().rev().copied().collect();
+            assert!(!is_strictly_convex_simple(&backward));
+            assert!(!is_strictly_convex_simple(&HEPTAGRAM));
+            let backward: Vec<[i32; 2]> = HEPTAGRAM.iter().rev().copied().collect();
+            assert!(!is_strictly_convex_simple(&backward));
+
+            // A simple non-convex polygon whose every turn is one sign cannot
+            // exist, but a chain that only *locally* looks convex can: the
+            // same vertex set in star order has all turns equal and a winding
+            // of two, which is exactly the case a local-sign test misses.
+            let star_of_squares = vec![
+                [0, 0],
+                [9, 0],
+                [9, 9],
+                [0, 9],
+                [3, 3],
+                [6, 3],
+                [6, 6],
+                [3, 6],
+            ];
+            assert!(!is_strictly_convex_simple(&star_of_squares));
+
+            let mut frame = vec![square.clone(); super::scan::MIN_SCAN_POLYGONS];
+            assert_eq!(applicable(&frame), Ok(()));
+            frame.pop();
+            assert_eq!(applicable(&frame), Err(NotApplicable::TooFewPolygons));
+            frame.push(vec![[0, 0], [20, 0], [20, 8], [8, 8], [8, 20], [0, 20]]);
+            assert_eq!(applicable(&frame), Err(NotApplicable::NonConvex));
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn scanline_ext_create_region_failure_is_fail_closed() {
+            reset();
+            let polygons = vec![rectangle(0, 0, 10, 10)];
+            let _guard = FailureGuard::new(Call::ExtRegion, 1);
+            assert!(super::scan::scanline_region(&polygons, super::scan::MEASURED_RULE).is_err());
+            drop(_guard);
+            assert_eq!(state().live, 0);
+        }
+
+        /// Repeated builds must leave Windows' own GDI object count where it
+        /// started. The self-maintained counter proves every owned region was
+        /// released; this reads `GetGuiResources` so a missed `DeleteObject`
+        /// cannot be masked by a counter that was never incremented.
+        ///
+        /// Process-wide, so it must run alone: other tests in this binary
+        /// create and drop regions concurrently and would move the count
+        /// between the baseline and the checks. `ignored` by default for
+        /// that reason; the resource gate runs it as its own process.
+        #[test]
+        #[ignore = "process-wide GDI counter; run alone with --test-threads=1"]
+        fn repeated_builds_do_not_grow_the_process_gdi_object_count() {
+            reset();
+            let polygons = dense_convex_grid(super::scan::MIN_SCAN_POLYGONS);
+            // Warm-up: the first call initializes lazily-allocated GDI state
+            // that would otherwise look like a leak on the first round.
+            drop(super::scan::scanline_region(&polygons, super::scan::MEASURED_RULE).unwrap());
+            drop(super::scan::scanline_region(&polygons, super::scan::MEASURED_RULE).unwrap());
+            let baseline = super::gdi_object_count()
+                .unwrap_or_else(|error| panic!("GetGuiResources failed with Win32 error {error}"));
+            // A whole process may legitimately own zero GDI objects, so a
+            // non-zero baseline is not the control. The control is that a
+            // live region is visible: hold one and require the count to rise.
+            // Without this the leak loop could pass on an API that reports
+            // nothing at all for this process.
+            let held = super::scan::scanline_region(&polygons, super::scan::MEASURED_RULE).unwrap();
+            let while_held = super::gdi_object_count()
+                .unwrap_or_else(|error| panic!("GetGuiResources failed with Win32 error {error}"));
+            assert!(
+                while_held > baseline,
+                "a live region must be visible to GetGuiResources: baseline {baseline}, held {while_held}"
+            );
+            drop(held);
+            let after_held = super::gdi_object_count()
+                .unwrap_or_else(|error| panic!("GetGuiResources failed with Win32 error {error}"));
+            assert_eq!(
+                after_held, baseline,
+                "dropping the live region must return the count to baseline"
+            );
+            for round in 0..240 {
+                drop(super::scan::scanline_region(&polygons, super::scan::MEASURED_RULE).unwrap());
+                let now = super::gdi_object_count().unwrap_or_else(|error| {
+                    panic!("GetGuiResources failed with Win32 error {error} on round {round}")
+                });
+                assert_eq!(
+                    now, baseline,
+                    "GDI objects grew on round {round}: {baseline} -> {now}"
+                );
+            }
+            assert_eq!(state().live, 0);
+        }
+
+        /// The old batched path has the same obligation: it creates and
+        /// combines many regions per frame, so a leak there would be far
+        /// larger than in the single-region fast path.
+        ///
+        /// Process-wide like the fast-path check, so it also runs alone.
+        #[test]
+        #[ignore = "process-wide GDI counter; run alone with --test-threads=1"]
+        fn repeated_chunked_builds_do_not_grow_the_process_gdi_object_count() {
+            reset();
+            let polygons = dense_convex_grid(super::scan::MIN_SCAN_POLYGONS);
+            drop(chunked_region(&polygons, REGION_CHUNK_POLYGONS).unwrap());
+            drop(chunked_region(&polygons, REGION_CHUNK_POLYGONS).unwrap());
+            let baseline = super::gdi_object_count()
+                .unwrap_or_else(|error| panic!("GetGuiResources failed with Win32 error {error}"));
+            let held = chunked_region(&polygons, REGION_CHUNK_POLYGONS).unwrap();
+            let while_held = super::gdi_object_count()
+                .unwrap_or_else(|error| panic!("GetGuiResources failed with Win32 error {error}"));
+            assert!(
+                while_held > baseline,
+                "a live region must be visible to GetGuiResources: baseline {baseline}, held {while_held}"
+            );
+            drop(held);
+            for round in 0..8 {
+                drop(chunked_region(&polygons, REGION_CHUNK_POLYGONS).unwrap());
+                let now = super::gdi_object_count().unwrap_or_else(|error| {
+                    panic!("GetGuiResources failed with Win32 error {error} on round {round}")
+                });
+                assert_eq!(
+                    now, baseline,
+                    "GDI objects grew on chunked round {round}: {baseline} -> {now}"
+                );
+            }
+            assert_eq!(state().live, 0);
+        }
+
+        /// A grid of one-pixel squares: strictly convex, simple and above the
+        /// fast path's density floor, so the dispatcher must take the
+        /// scanline arm.
+        fn dense_convex_grid(count: usize) -> Vec<Vec<[i32; 2]>> {
+            (0..count)
+                .map(|index| {
+                    let x = (index % 256) as i32 * 3;
+                    let y = (index / 256) as i32 * 3;
+                    rectangle(x, y, 1, 1)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn dense_convex_frames_take_the_scanline_path() {
+            reset();
+            let polygons = dense_convex_grid(super::scan::MIN_SCAN_POLYGONS);
+            let region = region_for_polygons(&polygons).unwrap();
+            drop(region);
+            assert_eq!(
+                call_count(Call::PolyPoly),
+                0,
+                "dense convex input must not build GDI batches"
+            );
+            assert_eq!(
+                call_count(Call::ExtRegion),
+                1,
+                "the fast path must build the region with exactly one ExtCreateRegion"
+            );
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn dense_non_convex_frames_fall_back_to_batches() {
+            reset();
+            let mut polygons = dense_convex_grid(super::scan::MIN_SCAN_POLYGONS);
+            polygons.push(vec![[0, 0], [20, 0], [20, 8], [8, 8], [8, 20], [0, 20]]);
+            let region = region_for_polygons(&polygons).unwrap();
+            drop(region);
+            assert!(
+                call_count(Call::PolyPoly) > 0,
+                "a frame with one concave polygon must use the batched build"
+            );
+            assert_eq!(
+                call_count(Call::ExtRegion),
+                0,
+                "the fast path must decline the whole frame, never scan a subset"
+            );
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn dense_frame_over_a_budget_cap_falls_back_without_erroring() {
+            reset();
+            let mut polygons = dense_convex_grid(super::scan::MIN_SCAN_POLYGONS);
+            // One polygon wider than the fast path's span cap: a decline, not
+            // a failure, so production still installs a region.
+            polygons.push(vec![[0, 0], [16_385, 0], [16_385, 1], [0, 1]]);
+            let region = region_for_polygons(&polygons).unwrap();
+            drop(region);
+            assert!(
+                call_count(Call::PolyPoly) > 0,
+                "a budget overrun must fall back to the batched build"
+            );
+            assert_eq!(state().live, 0);
+        }
+
+        #[test]
+        fn fast_path_errors_are_not_hidden_as_a_fallback() {
+            reset();
+            let polygons = dense_convex_grid(super::scan::MIN_SCAN_POLYGONS);
+            let _guard = FailureGuard::new(Call::ExtRegion, 1);
+            assert!(
+                region_for_polygons(&polygons).is_err(),
+                "an ExtCreateRegion failure must surface, not fall back to batches"
+            );
+            assert_eq!(
+                call_count(Call::PolyPoly),
+                0,
+                "a real error must not be retried through the old path"
+            );
+            assert_eq!(state().live, 0);
+        }
+
         #[test]
         fn production_union_matches_sequential_oracle() {
-            // Exercises the production path through the same hook the app
-            // tests use (`hit_region_matches_sequential_oracle` builds
-            // `chunked_region(.., REGION_CHUNK_POLYGONS)`); every case here
-            // fits in one batch, so this covers the production leaf and fold,
-            // while `chunked_union_matches_sequential_oracle` covers
-            // multi-batch unions.
+            // Exercises the production dispatcher through the same hook the
+            // app tests use. Every case here is low density or non-convex, so
+            // the dispatcher must take the chunk-41 path; the dense convex
+            // arm is covered by `dense_convex_frames_take_the_scanline_path`
+            // and by the app-level Eous gate probe.
             let square = rectangle(0, 0, 10, 10);
             let concave = vec![
                 [0, 0],
