@@ -222,8 +222,8 @@ pub struct GraphicsDiagnostics {
 }
 
 /// The vertical world window a scene is rendered with: the view spans
-/// `[bottom, bottom + span]` in world Y, and the horizontal span follows the
-/// client aspect ratio.
+/// `[bottom, bottom + span]` in world Y and is centered horizontally on
+/// `center_x`, with the horizontal span following the client aspect ratio.
 ///
 /// The renderer, picking, dragging and the native hit region all consume the
 /// same value so they can never disagree about where a world point lands.
@@ -231,6 +231,9 @@ pub struct GraphicsDiagnostics {
 pub struct SceneView {
     pub span: f32,
     pub bottom: f32,
+    /// World X at the horizontal center of the view: `0.0` for the bounded
+    /// and primary-only scenes, the union-center offset otherwise.
+    pub center_x: f32,
 }
 
 /// The frozen camera every bounded scene used before desktop-span mode: 4.5
@@ -238,6 +241,7 @@ pub struct SceneView {
 pub const LEGACY: SceneView = SceneView {
     span: 4.5,
     bottom: -0.9,
+    center_x: 0.0,
 };
 
 impl Default for SceneView {
@@ -251,12 +255,43 @@ impl Default for SceneView {
 /// Desktop-span mode keeps the vertical pixel-per-world-unit scale of a 640
 /// logical pixel tall bounded scene at overlay `scale`: the world window
 /// widens together with the physical height instead of enlarging characters.
-/// The bottom stays at the legacy -0.9 so the visual origin does not move.
+/// The bottom stays at the legacy -0.9 so the visual origin does not move, and
+/// the horizontal center stays at the legacy 0.0.
 pub fn desktop_view(physical_height: u32, scale: f32) -> SceneView {
     let span = LEGACY.span * physical_height.max(1) as f32 / (640.0 * scale.max(f32::MIN_POSITIVE));
     SceneView {
         span,
         bottom: LEGACY.bottom,
+        center_x: 0.0,
+    }
+}
+
+/// The scene view for a desktop-span scene covering a monitor rectangle that
+/// is not the primary monitor, offset from it inside a multi-monitor union.
+///
+/// `physical_height` and `scale` feed [`desktop_view`] for the vertical
+/// window. `center_offset_px` is the horizontal distance from the primary
+/// monitor's center to the rectangle's center, and `below_primary_px` is how
+/// far the rectangle's bottom edge lies below the primary's bottom edge, both
+/// in physical pixels (X right, Y down, Win32 desktop coordinates).
+///
+/// Both offsets are divided by the same pixel-per-world-unit factor, so the
+/// rectangle stays anchored to the primary: a world point keeps its
+/// primary-local position whether it is viewed through this rectangle or
+/// through the primary alone. Callers pass offsets from a checked physical
+/// layout, so both values are finite and consistent with the height.
+pub fn desktop_view_at(
+    physical_height: u32,
+    scale: f32,
+    center_offset_px: f32,
+    below_primary_px: f32,
+) -> SceneView {
+    let span = desktop_view(physical_height, scale).span;
+    let q = 640.0 * scale.max(f32::MIN_POSITIVE) / LEGACY.span;
+    SceneView {
+        span,
+        bottom: LEGACY.bottom - below_primary_px / q,
+        center_x: center_offset_px / q,
     }
 }
 
@@ -266,15 +301,15 @@ pub fn scene_projection(width: u32, height: u32) -> Mat4 {
 
 /// [`scene_projection`] under an explicit [`SceneView`]. With [`LEGACY`] this
 /// is value-identical to the frozen function (the `bottom + span` sum rounds
-/// to the same `3.6` f32).
+/// to the same `3.6` f32, and adding the `0.0` center is exact).
 pub fn scene_projection_with(width: u32, height: u32, view: SceneView) -> Mat4 {
     let aspect = width.max(1) as f32 / height.max(1) as f32;
     let half_height = view.span * 0.5;
     let half_width = half_height * aspect;
     let top = view.bottom + view.span;
     glam::camera::rh::proj::directx::orthographic(
-        -half_width,
-        half_width,
+        -half_width + view.center_x,
+        half_width + view.center_x,
         view.bottom,
         top,
         0.1,
@@ -299,7 +334,7 @@ pub fn screen_to_world_with(cursor: [f32; 2], size: [u32; 2], view: SceneView) -
     let half_width = view.span * 0.5 * width / height;
     let top = view.bottom + view.span;
     [
-        (cursor[0] / width * 2.0 - 1.0) * half_width,
+        (cursor[0] / width * 2.0 - 1.0) * half_width + view.center_x,
         top - cursor[1] / height * view.span,
     ]
 }
@@ -320,7 +355,7 @@ pub fn world_to_screen_with(point: [f32; 2], size: [u32; 2], view: SceneView) ->
     let half_width = view.span * 0.5 * width / height;
     let top = view.bottom + view.span;
     [
-        (point[0] / half_width + 1.0) * 0.5 * width,
+        ((point[0] - view.center_x) / half_width + 1.0) * 0.5 * width,
         (top - point[1]) / view.span * height,
     ]
 }
