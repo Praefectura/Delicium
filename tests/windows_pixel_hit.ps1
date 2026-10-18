@@ -24,17 +24,14 @@ using System.Threading;
 using System.Windows.Forms;
 
 public static class PixelHitNative {
-    // Fail closed if the scene silently grew to (nearly) the full primary
-    // monitor: this capture harness must never turn into a whole-desktop
-    // screenshot. The desktop-span scene itself leaves a 2-pixel taskbar gap,
-    // so the guard accepts up to 8 pixels of inset on each axis.
+    // Reject desktop-sized captures, including a multi-monitor bounding box.
+    // Keep a small tolerance so a nearly covering window fails closed too.
     public static bool SpansPrimaryMonitor(Rectangle rectangle) {
         var primary = Screen.PrimaryScreen;
         if (primary == null) return false;
         var bounds = primary.Bounds;
-        return rectangle.Left >= bounds.Left - 4 && rectangle.Left <= bounds.Left + 4
-            && rectangle.Top >= bounds.Top - 4 && rectangle.Top <= bounds.Top + 4
-            && rectangle.Width >= bounds.Width - 8 && rectangle.Height >= bounds.Height - 8;
+        return rectangle.Left <= bounds.Left + 8 && rectangle.Top <= bounds.Top + 8
+            && rectangle.Right >= bounds.Right - 8 && rectangle.Bottom >= bounds.Bottom - 8;
     }
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }

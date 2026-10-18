@@ -185,7 +185,7 @@ function Last-WanderEvent($Events, [int[]]$Ids) {
     return @($Events | Where-Object { $_.Id -in $Ids } | Select-Object -Last 1)[0]
 }
 
-function Screen-Point([double]$X, [double]$Y, $Rectangle, [double]$Span, [double]$Bottom) {
+function Screen-Point([double]$X, [double]$Y, $Rectangle, [double]$Span, [double]$Bottom, [double]$CenterX) {
     # Materialize every native-struct field as a scalar before arithmetic.
     # PowerShell can otherwise preserve a one-field PSObject array returned
     # through a .NET value type and route `+` to array concatenation.
@@ -195,7 +195,7 @@ function Screen-Point([double]$X, [double]$Y, $Rectangle, [double]$Span, [double
     $height = [double]$Rectangle.Bottom - $top
     $halfWidth = [double]$Span * 0.5 * $width / $height
     $viewTop = [double]$Bottom + [double]$Span
-    $screenX = [int][Math]::Round($left + (0.5 + [double]$X / (2.0 * $halfWidth)) * $width)
+    $screenX = [int][Math]::Round($left + (0.5 + ([double]$X - $CenterX) / (2.0 * $halfWidth)) * $width)
     $screenY = [int][Math]::Round($top + ($viewTop - [double]$Y) / [double]$Span * $height)
     return [int[]]@($screenX, $screenY)
 }
@@ -214,6 +214,58 @@ function Ensure-InputGuard([IntPtr]$Scene, [int]$X, [int]$Y) {
         throw 'Physical input guard: cursor moved before injected input'
     }
     if ([WanderNative]::Hit($X, $Y) -ne $Scene) { throw 'Physical input guard: target is not the launched scene' }
+}
+
+function Place-WanderingCharacter([int]$TargetX, [int]$TargetY) {
+    $deadline = [DateTime]::Now.AddSeconds(15)
+    $sample = $null
+    do {
+        $candidate = Last-WanderEvent @(Read-WanderEvents) ([int[]](1, 2))
+        if ($null -ne $candidate) {
+            $point = Screen-Point $candidate.X $candidate.Y $rectangle $span $bottom $centerX
+            if ([WanderNative]::Hit($point[0], $point[1]) -eq $scene) {
+                [void][WanderNative]::SetCursorPos($point[0], $point[1])
+                if ([WanderNative]::Hit($point[0], $point[1]) -eq $scene) { $sample = $candidate; break }
+            }
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::Now -lt $deadline)
+    Assert-Test ($null -ne $sample) 'A recent wander endpoint is physically pickable for monitor placement'
+    Ensure-InputGuard $scene $point[0] $point[1]
+    $starts = Count-Log 'drag start instance='
+    $releases = Count-Log 'drag release instance='
+    [WanderNative]::Mouse(2); $script:mouseDown = $true
+    Wait-Log 'drag start instance=' ($starts + 1)
+    $startLine = @(Get-LogLines | Select-String 'drag start instance=') | Select-Object -Last 1
+    $start = [regex]::Match([string]$startLine, 'drag start instance=(\d+) x=(-?[0-9.]+) y=(-?[0-9.]+)')
+    Assert-Test ($start.Success -and [int]$start.Groups[1].Value -eq $sample.Id) 'Monitor placement captures the sampled instance'
+    $startX = [double]::Parse($start.Groups[2].Value, $invariant)
+    $startY = [double]::Parse($start.Groups[3].Value, $invariant)
+    # First cross the seam at the current visible height, then move vertically
+    # inside the secondary monitor. Do not send the cursor through a dead zone.
+    $fromX = $point[0]; $fromY = $point[1]
+    foreach ($waypoint in @(@($TargetX, $fromY), @($TargetX, $TargetY))) {
+        foreach ($step in 1..16) {
+            $x = $fromX + [int][Math]::Round(($waypoint[0] - $fromX) * $step / 16.0)
+            $y = $fromY + [int][Math]::Round(($waypoint[1] - $fromY) * $step / 16.0)
+            Assert-OwnHit $scene $x $y 'Monitor-placement drag path'
+            [void][WanderNative]::SetCursorPos($x, $y)
+            Ensure-InputGuard $scene $x $y
+            Start-Sleep -Milliseconds 30
+        }
+        $fromX = $waypoint[0]; $fromY = $waypoint[1]
+    }
+    $eventOffset = @(Read-WanderEvents).Count
+    [WanderNative]::Mouse(4); $script:mouseDown = $false
+    Wait-Log 'drag release instance=' ($releases + 1)
+    $releaseLine = @(Get-LogLines | Select-String 'drag release instance=') | Select-Object -Last 1
+    $release = [regex]::Match([string]$releaseLine, 'drag release instance=(\d+) x=(-?[0-9.]+) y=(-?[0-9.]+)')
+    Assert-Test ($release.Success -and [int]$release.Groups[1].Value -eq $sample.Id) 'Monitor placement releases the same instance'
+    $releaseX = [double]::Parse($release.Groups[2].Value, $invariant)
+    $releaseY = [double]::Parse($release.Groups[3].Value, $invariant)
+    Assert-Test ([Math]::Abs(($releaseX - $startX) - ($TargetX - $point[0]) * $span / $height) -lt 0.05) 'Monitor-placement x displacement uses the anchored view'
+    Assert-Test ([Math]::Abs(($releaseY - $startY) + ($TargetY - $point[1]) * $span / $height) -lt 0.05) 'Monitor-placement y displacement uses the anchored view'
+    $script:placed = [pscustomobject]@{ Id = $sample.Id; X = $releaseX; Y = $releaseY; Offset = $eventOffset }
 }
 
 if ([WanderNative]::SetThreadDpiAwarenessContext([IntPtr]::new(-4)) -eq [IntPtr]::Zero) {
@@ -235,7 +287,7 @@ try {
     # No --overlay-size and no --no-wander: this is the ordinary desktop-span path.
     # The user's saved configuration must not leak into the test scene.
     $env:DELICIUM_NO_CONFIG = '1'
-    $process = Start-Process -FilePath $Executable -ArgumentList '--exit-after', '180' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError $logPath
+    $process = Start-Process -FilePath $Executable -ArgumentList '--exit-after', '240' -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'stdout.log') -RedirectStandardError $logPath
     $deadline = [DateTime]::Now.AddSeconds(15)
     do {
         if ($process.HasExited) { throw ('Application exited before readiness; see ' + $run) }
@@ -262,6 +314,10 @@ try {
     $span = [double]::Parse($viewMatch.Groups[2].Value, $invariant)
     $bottom = [double]::Parse($viewMatch.Groups[3].Value, $invariant)
     Assert-Test ($span -gt 0) 'Scene view span is positive'
+    $desktopLine = @(Get-LogLines | Select-String 'desktop non_fullscreen=true') | Select-Object -Last 1
+    $centerMatch = [regex]::Match([string]$desktopLine, 'center_x=(-?[0-9.]+)')
+    Assert-Test $centerMatch.Success 'Desktop horizontal center is recorded'
+    $centerX = [double]::Parse($centerMatch.Groups[1].Value, $invariant)
 
     $boundsLine = @(Get-LogLines | Select-String 'wander bounds left=') | Select-Object -Last 1
     $boundsMatch = [regex]::Match([string]$boundsLine, 'wander bounds left=(-?[0-9]+(?:\.[0-9]+)?) right=(-?[0-9]+(?:\.[0-9]+)?) margin=([0-9]+(?:\.[0-9]+)?)')
@@ -269,7 +325,7 @@ try {
     $left = [double]::Parse($boundsMatch.Groups[1].Value, $invariant)
     $right = [double]::Parse($boundsMatch.Groups[2].Value, $invariant)
     $margin = [double]::Parse($boundsMatch.Groups[3].Value, $invariant)
-    Assert-Test ($left -lt 0 -and $right -gt 0 -and $right -gt $left) 'Wander bounds straddle zero and have positive width'
+    Assert-Test ($right -gt $left -and [Math]::Abs(($left + $right) / 2.0 - $centerX) -lt 0.02) 'Wander bounds have positive width and match the desktop horizontal center'
     Assert-Test ($margin -gt 0) 'Wander edge margin is positive'
     $expectedWidth = $span * $width / $height
     Assert-Test ([Math]::Abs(($right - $left) - $expectedWidth) -lt 0.02) ('Wander width matches scene-view aspect: recorded=' + ($right - $left) + ' expected=' + $expectedWidth)
@@ -305,7 +361,7 @@ try {
             Start-Sleep -Milliseconds 100
             continue
         }
-        $point = Screen-Point $sample.X 0.15 $rectangle $span $bottom
+        $point = Screen-Point $sample.X 0.15 $rectangle $span $bottom $centerX
         $x = [int]$point[0]; $y = [int]$point[1]
         if ($x -lt $rectangle.Left -or $x -ge $rectangle.Right -or $y -lt $rectangle.Top -or $y -ge $rectangle.Bottom) {
             Start-Sleep -Milliseconds 100
@@ -383,6 +439,57 @@ try {
         $dragCompleted = $true
     }
     Assert-Test $dragCompleted 'A guarded press succeeded within three latest-log retries'
+
+    $primary = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $secondary = @([System.Windows.Forms.Screen]::AllScreens | ForEach-Object { $_.Bounds } | Where-Object {
+        $_.Left -eq $primary.Right -and $_.Top -lt ($primary.Top - 100) -and $_.Bottom -gt ($primary.Bottom + 100)
+    }) | Select-Object -First 1
+    if ($secondary) {
+        $seam = $centerX + (($primary.Right - $rectangle.Left) / [double]$width - 0.5) * $expectedWidth
+        $sharedY = [int][Math]::Round($primary.Bottom - (0.15 + 0.9) * $height / $span)
+        Place-WanderingCharacter ($primary.Right + 40) $sharedY
+        $crossId = $placed.Id; $crossOffset = $placed.Offset
+        $deadline = [DateTime]::Now.AddSeconds(60)
+        $crossed = $false
+        do {
+            $pending = $null
+            foreach ($event in @((Read-WanderEvents) | Select-Object -Skip $crossOffset | Where-Object { $_.Id -eq $crossId })) {
+                if ($event.Kind -eq 'start') {
+                    $pending = $event
+                } elseif ($null -ne $pending -and (($pending.X - $seam) * ($event.X - $seam)) -lt 0 -and [Math]::Abs($event.X - $pending.Target) -lt 0.02) {
+                    $crossed = $true
+                    Write-Output ('seam walk instance=' + $crossId + ' from=' + $pending.X + ' to=' + $event.X + ' seam=' + $seam)
+                    break
+                }
+            }
+            if (-not $crossed) { Start-Sleep -Milliseconds 100 }
+        } while (-not $crossed -and [DateTime]::Now -lt $deadline)
+        Assert-Test $crossed 'An autonomous start-to-arrival walk crosses the shared monitor seam'
+
+        $secondaryX = [int](($secondary.Left + $secondary.Right) / 2)
+        foreach ($probeY in @([int](($secondary.Top + $primary.Top) / 2), [int](($primary.Bottom + $secondary.Bottom) / 2))) {
+            Place-WanderingCharacter $secondaryX $probeY
+            $probe = $placed
+            $segmentLeft = $centerX + (($secondary.Left - $rectangle.Left) / [double]$width - 0.5) * $expectedWidth + $margin
+            $segmentRight = $centerX + (($secondary.Right - $rectangle.Left) / [double]$width - 0.5) * $expectedWidth - $margin
+            $deadline = [DateTime]::Now.AddSeconds(35)
+            do {
+                $probeEvents = @((Read-WanderEvents) | Select-Object -Skip $probe.Offset | Where-Object { $_.Id -eq $probe.Id })
+                if ((Count-WanderPairs $probeEvents) -ge 1) { break }
+                Start-Sleep -Milliseconds 100
+            } while ([DateTime]::Now -lt $deadline)
+            Assert-Test ((Count-WanderPairs $probeEvents) -ge 1) ('A complete autonomous walk occurs at secondary-only physical y=' + $probeY)
+            foreach ($event in $probeEvents) {
+                Assert-Test ([Math]::Abs($event.Y - $probe.Y) -lt 0.002) 'Secondary-only wandering preserves the dragged height'
+                Assert-Test ($event.X -ge ($segmentLeft - 0.02) -and $event.X -le ($segmentRight + 0.02)) 'Secondary-only wandering stays inside its actual visible horizontal segment'
+                if ($event.Kind -eq 'start') {
+                    Assert-Test ($event.Target -ge ($segmentLeft - 0.02) -and $event.Target -le ($segmentRight + 0.02)) 'Secondary-only target excludes the primary-column dead zone'
+                }
+            }
+        }
+    } else {
+        Write-Output '[SKIP] Secondary-only height probes require a right-adjacent monitor extending above and below the primary'
+    }
     Assert-Test ((Count-Log 'hit_region mode=fallback') -eq 0) 'Wander acceptance completed without hit-region fallback'
     $passed = $true
 } finally {

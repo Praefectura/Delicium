@@ -3,12 +3,10 @@ param(
     [switch]$ValidateOnly
 )
 
-# Desktop-span acceptance: ordinary launch (no --overlay-size) must place the
-# scene client on the primary-monitor physical rectangle minus a 2-pixel gap
-# on the taskbar edge (a topmost window with the exact monitor rect reads as
-# fullscreen to the shell, which suppresses the auto-hide taskbar reveal),
-# keep the controls inside the monitor, and support dragging past the old
-# bounded window edge. This harness never takes screenshots: it defines no
+# Desktop-span acceptance: ordinary launch covers all monitors' physical
+# bounding rectangle with the NonRudeHWND shell hint, keeps the controls on
+# the primary monitor and supports dragging across a shared monitor seam.
+# This harness never takes screenshots: it defines no
 # Capture or EmptyArea helper at all, so a whole-desktop capture cannot
 # happen here.
 $ErrorActionPreference = 'Stop'
@@ -60,8 +58,7 @@ public static class DesktopSpanNative {
     [DllImport("gdi32.dll")] private static extern int GetRgnBox(IntPtr region, out Rect box);
     [DllImport("user32.dll")] private static extern int GetWindowRgn(IntPtr window, IntPtr region);
 
-    [StructLayout(LayoutKind.Sequential)] public struct AppBarData { public uint CbSize; public IntPtr HWnd; public uint CallbackMessage; public uint Edge; public Rect Rc; public IntPtr LParam; }
-    [DllImport("shell32.dll")] private static extern UIntPtr SHAppBarMessage(uint message, ref AppBarData data);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr GetPropW(IntPtr window, string name);
 
     public static IntPtr Find(uint process, string title) {
         IntPtr result = IntPtr.Zero;
@@ -125,10 +122,13 @@ public static class DesktopSpanNative {
             return Rectangle.FromLTRB(box.Left, box.Top, box.Right, box.Bottom);
         } finally { DeleteObject(region); }
     }
-    public static int TaskbarEdge() {
-        var data = new AppBarData { CbSize = (uint)Marshal.SizeOf(typeof(AppBarData)) };
-        if (SHAppBarMessage(5, ref data) == UIntPtr.Zero) return -1;
-        return (int)data.Edge;
+    public static Rectangle[] Monitors() { return Array.ConvertAll(Screen.AllScreens, screen => screen.Bounds); }
+    public static Rectangle DesktopBounds() {
+        var monitors = Monitors();
+        if (monitors.Length == 0) throw new Exception("No physical monitors");
+        var result = monitors[0];
+        foreach (var monitor in monitors) result = Rectangle.Union(result, monitor);
+        return result;
     }
 }
 
@@ -193,7 +193,7 @@ $cursor = [DesktopSpanNative+Point]::new()
 if (-not [DesktopSpanNative]::GetCursorPos([ref]$cursor)) { throw 'Cannot save the cursor position before testing' }
 $process = $null; $scene = [IntPtr]::Zero; $controls = [IntPtr]::Zero; $backdrop = [IntPtr]::Zero; $mouseDown = $false
 try {
-    # Ordinary launch: no --overlay-size, so the scene must span the primary monitor.
+    # Ordinary launch: no --overlay-size, so the scene spans the physical desktop.
     # --no-wander keeps the pinned positions this script's anchors assume.
     # The user's saved configuration must not leak into the test scene.
     $env:DELICIUM_NO_CONFIG = '1'
@@ -214,33 +214,20 @@ try {
 
     $monitor = [DesktopSpanNative]::Primary()
     $rectangle = [DesktopSpanNative]::Client($scene)
-    # The scene leaves a 2-physical-pixel gap on the taskbar's edge; the shell
-    # query that picks the edge must agree with the geometry the application
-    # produced. A window covering the monitor exactly would suppress the
-    # auto-hide taskbar reveal.
-    $taskbarEdge = [DesktopSpanNative]::TaskbarEdge()
-    Assert-Test ($taskbarEdge -ge 0) 'Shell reports the main taskbar edge via SHAppBarMessage'
-    $gap = 2
-    switch ($taskbarEdge) {
-        0 { $expectedRectangle = [System.Drawing.Rectangle]::new($monitor.Left + $gap, $monitor.Top, $monitor.Width - $gap, $monitor.Height) }
-        1 { $expectedRectangle = [System.Drawing.Rectangle]::new($monitor.Left, $monitor.Top + $gap, $monitor.Width, $monitor.Height - $gap) }
-        2 { $expectedRectangle = [System.Drawing.Rectangle]::new($monitor.Left, $monitor.Top, $monitor.Width - $gap, $monitor.Height) }
-        3 { $expectedRectangle = [System.Drawing.Rectangle]::new($monitor.Left, $monitor.Top, $monitor.Width, $monitor.Height - $gap) }
-        default { throw ('Unknown taskbar edge from the shell: ' + $taskbarEdge) }
-    }
-    Assert-Test ($rectangle.Left -eq $expectedRectangle.Left -and $rectangle.Top -eq $expectedRectangle.Top) 'Scene client origin matches the monitor rect inset by the taskbar gap'
-    Assert-Test ($rectangle.Width -eq $expectedRectangle.Width -and $rectangle.Height -eq $expectedRectangle.Height) 'Scene client size matches the monitor rect inset by the taskbar gap'
-    Assert-Test (-not ($rectangle.Width -eq $monitor.Width -and $rectangle.Height -eq $monitor.Height)) 'Scene client never covers the monitor exactly'
+    $expectedRectangle = [DesktopSpanNative]::DesktopBounds()
+    Assert-Test ($rectangle.Left -eq $expectedRectangle.Left -and $rectangle.Top -eq $expectedRectangle.Top) 'Scene client origin matches the physical desktop bounding rectangle'
+    Assert-Test ($rectangle.Width -eq $expectedRectangle.Width -and $rectangle.Height -eq $expectedRectangle.Height) 'Scene client size matches the physical desktop bounding rectangle'
+    Assert-Test ([DesktopSpanNative]::GetPropW($scene, 'NonRudeHWND') -eq [IntPtr]::new(1)) 'Desktop overlay carries the NonRudeHWND shell exemption'
     Assert-Test ([DesktopSpanNative]::Undecorated($scene)) 'Client and window coordinates have the same origin and extent'
     Assert-Test ([DesktopSpanNative]::HasRegion($scene)) 'Default mode installs a native window region'
     Assert-Test (-not [DesktopSpanNative]::PassesThrough($scene)) 'Default mode is not whole-window pass-through'
     $box = [DesktopSpanNative]::RegionBox($scene)
     Assert-Test ($box.Left -ge 0 -and $box.Top -ge 0 -and $box.Right -le $rectangle.Width -and $box.Bottom -le $rectangle.Height -and $box.Width -gt 0 -and $box.Height -gt 0) 'Region union is nonempty and bounded by the client'
 
-    # Anchor margins and the scene view derive from logical pixels at the
-    # monitor DPI, so read the scene DPI once and scale physical expectations.
-    $dpi = [DesktopSpanNative]::GetDpiForWindow($scene)
-    if ($dpi -le 0) { throw 'Cannot read the scene DPI for anchor-margin and span expectations' }
+    # The controls remain on the primary monitor. The overlay's DPI ownership
+    # may be a different monitor; scene scale must stay anchored to the primary.
+    $dpi = [DesktopSpanNative]::GetDpiForWindow($controls)
+    if ($dpi -le 0) { throw 'Cannot read primary-monitor DPI from the control window' }
     $scale = $dpi / 96.0
     $controlRect = [DesktopSpanNative]::Client($controls)
     Assert-Test ($controlRect.Left -ge $monitor.Left -and $controlRect.Top -ge $monitor.Top -and $controlRect.Right -le $monitor.Right -and $controlRect.Bottom -le $monitor.Bottom) 'Control window lies inside the primary monitor'
@@ -266,19 +253,29 @@ try {
     Assert-Test ($spanMatch.Success -and $bottomMatch.Success) 'Startup log carries a parseable scene view'
     $span = [double]$spanMatch.Groups[1].Value
     $bottom = [double]$bottomMatch.Groups[1].Value
-    Write-Output ('scene_view span=' + $span + ' bottom=' + $bottom)
+    $desktopLine = @(Get-Content -LiteralPath (Join-Path $run 'stderr.log') | Select-String 'desktop non_fullscreen=true') | Select-Object -Last 1
+    $centerMatch = [regex]::Match([string]$desktopLine, 'center_x=(-?[0-9.]+)')
+    $scaleMatch = [regex]::Match([string]$desktopLine, 'primary_scale=([0-9.]+)')
+    Assert-Test ($centerMatch.Success -and $scaleMatch.Success) 'Startup log records the primary scale and horizontal center'
+    $centerX = [double]$centerMatch.Groups[1].Value
+    Assert-Test ([Math]::Abs([double]$scaleMatch.Groups[1].Value - $scale) -lt 0.001) 'Scene scale is anchored to the primary monitor'
+    $q = 640.0 * $scale / 4.5
+    $expectedBottom = -0.9 - ($rectangle.Bottom - $monitor.Bottom) / $q
+    $expectedCenter = (($rectangle.Left + $rectangle.Right) - ($monitor.Left + $monitor.Right)) / (2.0 * $q)
+    Write-Output ('scene_view span=' + $span + ' bottom=' + $bottom + ' center_x=' + $centerX)
     Assert-Test ($span -gt 0) 'Desktop scene view has a positive world span'
-    Assert-Test ([Math]::Abs($bottom + 0.9) -lt 0.001) 'Desktop scene view keeps the legacy bottom at -0.9'
+    Assert-Test ([Math]::Abs($bottom - $expectedBottom) -lt 0.001) 'Desktop bottom preserves the primary-monitor world anchor'
+    Assert-Test ([Math]::Abs($centerX - $expectedCenter) -lt 0.001) 'Desktop center preserves the primary-monitor world anchor'
     # The span preserves the bounded scene's pixel-per-world-unit ratio at 640
     # logical pixels high; whether it grows past 4.5 depends on the monitor.
     $expectedSpan = 4.5 * $rectangle.Height / (640.0 * $scale)
     Assert-Test ([Math]::Abs($span - $expectedSpan) -lt 0.1) ('Desktop span matches the 640-logical-pixel formula: recorded=' + $span + ' expected=' + $expectedSpan)
     $viewTop = $bottom + $span
     function Screen-Point([double]$X, [double]$Y) {
-        return @([int][Math]::Round((0.5 + $X / ($span * $rectangle.Width / $rectangle.Height)) * $rectangle.Width), [int][Math]::Round(($viewTop - $Y) / $span * $rectangle.Height))
+        return @([int][Math]::Round((0.5 + ($X - $centerX) / ($span * $rectangle.Width / $rectangle.Height)) * $rectangle.Width), [int][Math]::Round(($viewTop - $Y) / $span * $rectangle.Height))
     }
 
-    $backdrop = [DesktopSpanBackdrop]::Open($monitor)
+    $backdrop = [DesktopSpanBackdrop]::Open($expectedRectangle)
     Assert-Test (([DesktopSpanNative]::Owner($backdrop) -ne 0) -and ([DesktopSpanNative]::Owner($backdrop) -ne $process.Id)) 'Backdrop is owned by this test process, not the application'
     [DesktopSpanNative]::Raise($scene); [DesktopSpanNative]::Raise($controls)
     [DesktopSpanBackdrop]::AnchorBelow($scene)
@@ -295,15 +292,17 @@ try {
 
     $anchor = Screen-Point -2.4 0.15
     $anchorX = $rectangle.Left + $anchor[0]; $anchorY = $rectangle.Top + $anchor[1]
+    Assert-Test ([Math]::Abs($anchorX - (($monitor.Left + $monitor.Right) / 2.0 - 2.4 * $q)) -le 1) 'Initial character retains its primary-monitor horizontal pixel anchor'
+    Assert-Test ([Math]::Abs($anchorY - ($monitor.Bottom - (0.15 + 0.9) * $q)) -le 1) 'Initial character retains its primary-monitor vertical pixel anchor'
     Assert-Test ([DesktopSpanNative]::Hit($anchorX, $anchorY) -eq $scene) 'Character anchor receives input in desktop mode'
 
     # Drag past the edges of the former bounded window: 960x640 logical at
     # the 640-logical-pixel scale is 1440x960 physical, placed 30 logical
     # pixels right of the monitor origin in the old layout.
-    $legacyRight = $rectangle.Left + [int](990 * $scale)
+    $legacyRight = $monitor.Left + [int](990 * $scale)
     # Aim 300 physical pixels past the old edge but stay comfortably inside
-    # the monitor, so the release point remains over the owned scene.
-    $targetX = [Math]::Min($legacyRight + 300, $rectangle.Right - 20)
+    # the primary monitor, so the release point remains over the owned scene.
+    $targetX = [Math]::Min($legacyRight + 300, $monitor.Right - 20)
     Assert-Test ($targetX -gt ($legacyRight + 10)) 'Drag target clears the former bounded-window right edge inside the monitor'
 
     $startBefore = Count-Log 'drag start instance='
@@ -337,6 +336,45 @@ try {
     $expectedWorld = ($targetX - $anchorX) * $span / $rectangle.Height
     $delta = [double]$release.Groups[2].Value - [double]$start.Groups[2].Value
     Assert-Test ([Math]::Abs($delta - $expectedWorld) -lt 0.25) ('Desktop drag moves the character by ' + [Math]::Round($delta, 3) + ' world units; expected about ' + [Math]::Round($expectedWorld, 3))
+    $neighbor = @([DesktopSpanNative]::Monitors() | Where-Object { $_.Left -eq $monitor.Right -and $_.Top -le $anchorY -and $_.Bottom -gt $anchorY }) | Select-Object -First 1
+    if ($neighbor) {
+        $secondaryX = [int](($neighbor.Left + $neighbor.Right) / 2)
+        $fromX = $targetX
+        $instance = $release.Groups[1].Value
+        foreach ($destination in @($secondaryX, $targetX)) {
+            $startBefore = Count-Log 'drag start instance='
+            $releaseBefore = Count-Log 'drag release instance='
+            $pixelBefore = Count-Log 'hit_region mode=pixel'
+            $fullWindowBefore = Count-Log 'hit_region mode=full-window'
+            Assert-Test ([DesktopSpanNative]::Hit($fromX, $anchorY) -eq $scene) 'Cross-monitor character is pickable at its current physical position'
+            [void][DesktopSpanNative]::SetCursorPos($fromX, $anchorY)
+            $mouseDown = $true; [DesktopSpanNative]::Mouse(2)
+            Wait-Log 'drag start instance=' ($startBefore + 1)
+            Wait-Log 'hit_region mode=full-window' ($fullWindowBefore + 1)
+            foreach ($step in 1..20) {
+                $x = $fromX + [int][Math]::Round(($destination - $fromX) * $step / 20.0)
+                Assert-Test ([DesktopSpanNative]::Hit($x, $anchorY) -eq $scene) 'Cross-monitor drag path remains owned by the scene'
+                [void][DesktopSpanNative]::SetCursorPos($x, $anchorY)
+                Start-Sleep -Milliseconds 45
+            }
+            [DesktopSpanNative]::Mouse(4); $mouseDown = $false
+            Wait-Log 'drag release instance=' ($releaseBefore + 1)
+            Wait-Log 'hit_region mode=pixel' ($pixelBefore + 1)
+            $startLine = @(Get-Content -LiteralPath (Join-Path $run 'stderr.log') | Select-String 'drag start instance=') | Select-Object -Last 1
+            $releaseLine = @(Get-Content -LiteralPath (Join-Path $run 'stderr.log') | Select-String 'drag release instance=') | Select-Object -Last 1
+            $start = [regex]::Match([string]$startLine, 'drag start instance=(\d+) x=(-?[0-9.]+)')
+            $release = [regex]::Match([string]$releaseLine, 'drag release instance=(\d+) x=(-?[0-9.]+)')
+            Assert-Test ($start.Success -and $release.Success -and $start.Groups[1].Value -eq $instance -and $release.Groups[1].Value -eq $instance) 'Cross-monitor press and release retain the same instance'
+            $delta = [double]$release.Groups[2].Value - [double]$start.Groups[2].Value
+            Assert-Test ([Math]::Abs($delta - ($destination - $fromX) / $q) -lt 0.05) 'Cross-monitor physical motion preserves the primary world scale'
+            Assert-Test ([DesktopSpanNative]::Hit($destination, $anchorY) -eq $scene) 'Released character is pickable on the destination monitor'
+            $finalRectangle = [DesktopSpanNative]::Client($scene)
+            Assert-Test ($finalRectangle -eq $expectedRectangle) 'Cross-monitor input does not change the physical desktop window rectangle'
+            $fromX = $destination
+        }
+    } else {
+        Write-Output '[SKIP] Cross-monitor drag requires a right-adjacent monitor at the character height'
+    }
     Assert-Test ([DesktopSpanNative]::HasRegion($scene)) 'Release restores the native character region'
     $box = [DesktopSpanNative]::RegionBox($scene)
     Assert-Test ($box.Left -ge 0 -and $box.Top -ge 0 -and $box.Right -le $rectangle.Width -and $box.Bottom -le $rectangle.Height -and $box.Width -gt 0 -and $box.Height -gt 0) 'Restored region union is nonempty and bounded by the client'
