@@ -1,0 +1,133 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` builds both executables on a clean Windows runner,
+# checks them the same way the local offline gate does, and publishes them
+# with the update manifest the client reads. Nothing is published from a
+# branch, and a tag that disagrees with Cargo.toml fails before building.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+# Every release needs a launcher that can install its manifest. Raise this
+# only when a release changes the manifest schema or the installation layout;
+# otherwise the launcher that is already installed can install the new engine
+# in a single launch.
+env:
+  MIN_LAUNCHER_VERSION: "0.1.0"
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check the tag against Cargo.toml
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "`$tag` must be vMAJOR.MINOR.PATCH; the client follows the stable channel and refuses pre-releases"
+          }
+          $version = $tag.Substring(1)
+          $declared = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($version -ne $declared) {
+            throw "tag $tag disagrees with Cargo.toml version $declared"
+          }
+          if ([version]$env:MIN_LAUNCHER_VERSION -gt [version]$version) {
+            throw "MIN_LAUNCHER_VERSION $env:MIN_LAUNCHER_VERSION is newer than the release $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+        id: version
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # The library target only. `tests/gpu_render.rs` needs a hardware
+      # adapter, which a hosted runner does not have.
+      - name: Test
+        run: cargo test --release --locked --lib
+
+      - name: Assemble the release files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.version.outputs.version }}'
+          $tag = $env:GITHUB_REF_NAME
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item target/release/delicium.exe dist/delicium.exe -Force
+          Copy-Item target/release/delicium-launcher.exe dist/delicium-launcher.exe -Force
+          if (-not (Test-Path dist/delicium.exe) -or -not (Test-Path dist/delicium-launcher.exe)) {
+            throw "the build did not produce both executables"
+          }
+
+          # The manifest schema is parsed strictly by the client: every field
+          # below is required, paths are relative to the installation root,
+          # and digests are lowercase hexadecimal.
+          function New-Entry([string] $name) {
+            $file = Get-Item -LiteralPath (Join-Path dist $name)
+            [ordered]@{
+              path   = $name
+              asset  = $name
+              size   = [int64] $file.Length
+              sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+
+          $manifest = [ordered]@{
+            schema               = 1
+            product              = 'delicium'
+            channel              = 'stable'
+            version              = $version
+            tag                  = $tag
+            published            = (Get-Date).ToUniversalTime().ToString('o')
+            notes                = $null
+            min_launcher_version = $env:MIN_LAUNCHER_VERSION
+            os                   = 'windows'
+            arch                 = 'x86_64'
+            launcher             = @(New-Entry 'delicium-launcher.exe')
+            app                  = @(New-Entry 'delicium.exe')
+          }
+          $json = $manifest | ConvertTo-Json -Depth 10
+          # No BOM: the client parses the document as strict JSON.
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) 'dist/latest.json'),
+            $json,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          Get-Content dist/latest.json
+
+      # Tags are immutable here: a release is created once, and re-running the
+      # workflow must not clobber files a client may already have downloaded.
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag `
+            dist/delicium.exe `
+            dist/delicium-launcher.exe `
+            dist/latest.json `
+            --title $tag `
+            --notes "Delicium $tag" `
+            --latest
