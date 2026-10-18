@@ -452,9 +452,17 @@ try {
     $expectedX = $anchor[0] - 160
     $expectedY = $anchor[1]
     $anchor = $null; $best = 0
+    # The idle sway moves the character within its own frame, so the drag
+    # anchor can sit close enough to the left edge that the expected poke
+    # position minus the search margin is off the bitmap. Clamp the window
+    # instead of sampling a negative pixel.
+    $xFirst = [Math]::Max(0, $expectedX - 16)
+    $xLast = [Math]::Min($bitmap.Width - 1, $expectedX + 16)
+    $yFirst = [Math]::Max(0, $expectedY - 16)
+    $yLast = [Math]::Min($bitmap.Height - 1, $expectedY + 16)
     try {
-        for ($y = $expectedY - 16; $y -le $expectedY + 16; $y++) {
-            for ($x = $expectedX - 16; $x -le $expectedX + 16; $x++) {
+        for ($y = $yFirst; $y -le $yLast; $y++) {
+            for ($x = $xFirst; $x -le $xLast; $x++) {
                 $color = $bitmap.GetPixel($x, $y)
                 $distance = [Math]::Max([Math]::Abs($color.R - 36), [Math]::Max([Math]::Abs($color.G - 58), [Math]::Abs($color.B - 78)))
                 if ($distance -gt $best) { $best = $distance; $anchor = @($x, $y) }
