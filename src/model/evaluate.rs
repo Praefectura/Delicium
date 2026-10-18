@@ -15,13 +15,21 @@
 //! reject them. Every animation wraps modulo its own duration. All
 //! indices coming from a compiled asset are bounds-checked here as well;
 //! compiled data is trusted in shape but not assumed infallible.
+//!
+//! [`try_sample_parameters_clip`] and [`try_sample_joints_clip`] sample a
+//! single selected animation (the action-role path): `Loop` wraps modulo the
+//! clip duration like the classic path (in `f64`, before narrowing), while
+//! `Clamp` holds the final keys and never wraps back to the first frame.
+//! They are deliberately fallible only: no infallible wrapper, no silent
+//! fallback.
 
 use glam::{Mat4, Quat, Vec3};
 
 use crate::model::error::ModelError;
 use crate::model::types::{
-    AnimationInterpolation, CompiledSkeleton3d, CompiledSprite2d, Deformer2d, JointTransform,
-    Parameter, RotationKey, ScalarKey, ScaleKey, TranslationKey,
+    AnimationInterpolation, ClipPlayback, CompiledSkeleton3d, CompiledSprite2d, Deformer2d,
+    JointTransform, Parameter, ParameterAnimation, RotationKey, ScalarKey, ScaleKey,
+    SkeletalAnimation, TranslationKey,
 };
 
 /// Upper bound on a coordinate produced by deformation. Well outside any
@@ -57,6 +65,21 @@ fn wrap_time(time: f64, duration: f32) -> f32 {
     if wrapped.is_finite() { wrapped } else { 0.0 }
 }
 
+/// Maps `time` onto the clip's local sampling time according to `playback`.
+///
+/// `Loop` reuses [`wrap_time`] (f64 modulo first, then narrow); `Clamp`
+/// narrows to `[0, duration]` in f64 and never wraps the endpoint back to the
+/// first frame. `duration` has already passed [`check_duration`].
+fn clip_local_time(time: f64, duration: f32, playback: ClipPlayback) -> f32 {
+    match playback {
+        ClipPlayback::Loop => wrap_time(time, duration),
+        ClipPlayback::Clamp => {
+            let local = time.clamp(0.0, f64::from(duration)) as f32;
+            if local.is_finite() { local } else { 0.0 }
+        }
+    }
+}
+
 fn check_duration(duration: f32, animation: &str) -> Result<(), ModelError> {
     if !duration.is_finite() || duration <= 0.0 {
         return Err(ModelError::InvalidInput {
@@ -83,25 +106,13 @@ pub fn sample_parameters(model: &CompiledSprite2d, time: f64) -> Vec<f32> {
 /// Fallible form of [`sample_parameters`]: reports inconsistent compiled data
 /// instead of degrading.
 pub fn try_sample_parameters(model: &CompiledSprite2d, time: f64) -> Result<Vec<f32>, ModelError> {
-    let mut values: Vec<f32> = model.parameters.iter().map(|p| p.default).collect();
     let time = checked_time(time)?;
+    let mut values: Vec<f32> = model.parameters.iter().map(|p| p.default).collect();
 
     for animation in &model.animations {
         check_duration(animation.duration, &animation.name)?;
         let local_time = wrap_time(time, animation.duration);
-        for channel in &animation.channels {
-            let parameter =
-                model
-                    .parameters
-                    .get(channel.parameter)
-                    .ok_or(ModelError::OutOfRange {
-                        context: format!("animation `{}` channel", animation.name),
-                        index: channel.parameter,
-                        len: model.parameters.len(),
-                    })?;
-            let value = sample_scalar_keys(&channel.keys, local_time, animation.duration)?;
-            values[channel.parameter] = clamp(value, parameter.min, parameter.max);
-        }
+        apply_parameter_animation(model, animation, local_time, &mut values)?;
     }
 
     if !values.iter().all(|v| v.is_finite()) {
@@ -110,6 +121,66 @@ pub fn try_sample_parameters(model: &CompiledSprite2d, time: f64) -> Result<Vec<
         });
     }
     Ok(values)
+}
+
+/// Samples the parameter animation at `clip_index` at `time`, starting from
+/// the declared defaults; other animations are not applied.
+///
+/// `Loop` wraps modulo the clip duration exactly like
+/// [`try_sample_parameters`]; `Clamp` holds `[0, duration]` and never wraps
+/// the final frame back to the first. An out-of-range `clip_index` is an
+/// explicit [`ModelError::OutOfRange`]; there is no silent fallback.
+pub fn try_sample_parameters_clip(
+    model: &CompiledSprite2d,
+    clip_index: usize,
+    time: f64,
+    playback: ClipPlayback,
+) -> Result<Vec<f32>, ModelError> {
+    let time = checked_time(time)?;
+    let animation = model
+        .animations
+        .get(clip_index)
+        .ok_or_else(|| ModelError::OutOfRange {
+            context: "clip animation".to_string(),
+            index: clip_index,
+            len: model.animations.len(),
+        })?;
+    check_duration(animation.duration, &animation.name)?;
+
+    let local_time = clip_local_time(time, animation.duration, playback);
+    let mut values: Vec<f32> = model.parameters.iter().map(|p| p.default).collect();
+    apply_parameter_animation(model, animation, local_time, &mut values)?;
+
+    if !values.iter().all(|v| v.is_finite()) {
+        return Err(ModelError::InvalidInput {
+            detail: "sampled parameter values are not finite".to_string(),
+        });
+    }
+    Ok(values)
+}
+
+/// Applies one parameter animation's channels at `local_time` (already mapped
+/// onto the clip) to `values`. Shared by the all-animation path and the
+/// single-clip path.
+fn apply_parameter_animation(
+    model: &CompiledSprite2d,
+    animation: &ParameterAnimation,
+    local_time: f32,
+    values: &mut [f32],
+) -> Result<(), ModelError> {
+    for channel in &animation.channels {
+        let parameter = model
+            .parameters
+            .get(channel.parameter)
+            .ok_or(ModelError::OutOfRange {
+                context: format!("animation `{}` channel", animation.name),
+                index: channel.parameter,
+                len: model.parameters.len(),
+            })?;
+        let value = sample_scalar_keys(&channel.keys, local_time, animation.duration)?;
+        values[channel.parameter] = clamp(value, parameter.min, parameter.max);
+    }
+    Ok(())
 }
 
 /// Linear sampling with clamping to the first/last key inside `[0, duration]`.
@@ -434,53 +505,105 @@ pub fn try_sample_joints(
     model: &CompiledSkeleton3d,
     time: f64,
 ) -> Result<Vec<JointTransform>, ModelError> {
-    let mut locals = bind_pose(model);
     let time = checked_time(time)?;
+    let mut locals = bind_pose(model);
 
     for animation in &model.animations {
         check_duration(animation.duration, &animation.name)?;
         let local_time = wrap_time(time, animation.duration);
-        for channel in &animation.channels {
-            let slot = locals
-                .get_mut(channel.joint)
-                .ok_or(ModelError::OutOfRange {
-                    context: format!("animation `{}` channel joint", animation.name),
-                    index: channel.joint,
-                    len: model.joints.len(),
-                })?;
-            let step = channel.interpolation == AnimationInterpolation::Step;
-
-            if !channel.translation.is_empty() {
-                slot.translation = sample_translation(
-                    &channel.translation,
-                    local_time,
-                    animation.duration,
-                    step,
-                    &animation.name,
-                )?;
-            }
-            if !channel.rotation.is_empty() {
-                slot.rotation = sample_rotation(
-                    &channel.rotation,
-                    local_time,
-                    animation.duration,
-                    step,
-                    &animation.name,
-                )?;
-            }
-            if !channel.scale.is_empty() {
-                slot.scale = sample_scale(
-                    &channel.scale,
-                    local_time,
-                    animation.duration,
-                    step,
-                    &animation.name,
-                )?;
-            }
-        }
+        apply_skeletal_animation(model, animation, local_time, &mut locals)?;
     }
 
-    for local in &locals {
+    check_joint_pose(&locals)?;
+    Ok(locals)
+}
+
+/// Samples the joint animation at `clip_index` at `time`, starting from the
+/// bind pose; other animations are not applied.
+///
+/// `Loop` wraps modulo the clip duration exactly like [`try_sample_joints`];
+/// `Clamp` holds `[0, duration]` and never wraps the final frame back to the
+/// first. An out-of-range `clip_index` is an explicit
+/// [`ModelError::OutOfRange`]; there is no silent fallback.
+pub fn try_sample_joints_clip(
+    model: &CompiledSkeleton3d,
+    clip_index: usize,
+    time: f64,
+    playback: ClipPlayback,
+) -> Result<Vec<JointTransform>, ModelError> {
+    let time = checked_time(time)?;
+    let animation = model
+        .animations
+        .get(clip_index)
+        .ok_or_else(|| ModelError::OutOfRange {
+            context: "clip animation".to_string(),
+            index: clip_index,
+            len: model.animations.len(),
+        })?;
+    check_duration(animation.duration, &animation.name)?;
+
+    let local_time = clip_local_time(time, animation.duration, playback);
+    let mut locals = bind_pose(model);
+    apply_skeletal_animation(model, animation, local_time, &mut locals)?;
+
+    check_joint_pose(&locals)?;
+    Ok(locals)
+}
+
+/// Applies one skeletal animation's channels at `local_time` (already mapped
+/// onto the clip) to `locals`. Shared by the all-animation path and the
+/// single-clip path.
+fn apply_skeletal_animation(
+    model: &CompiledSkeleton3d,
+    animation: &SkeletalAnimation,
+    local_time: f32,
+    locals: &mut [JointTransform],
+) -> Result<(), ModelError> {
+    for channel in &animation.channels {
+        let slot = locals
+            .get_mut(channel.joint)
+            .ok_or(ModelError::OutOfRange {
+                context: format!("animation `{}` channel joint", animation.name),
+                index: channel.joint,
+                len: model.joints.len(),
+            })?;
+        let step = channel.interpolation == AnimationInterpolation::Step;
+
+        if !channel.translation.is_empty() {
+            slot.translation = sample_translation(
+                &channel.translation,
+                local_time,
+                animation.duration,
+                step,
+                &animation.name,
+            )?;
+        }
+        if !channel.rotation.is_empty() {
+            slot.rotation = sample_rotation(
+                &channel.rotation,
+                local_time,
+                animation.duration,
+                step,
+                &animation.name,
+            )?;
+        }
+        if !channel.scale.is_empty() {
+            slot.scale = sample_scale(
+                &channel.scale,
+                local_time,
+                animation.duration,
+                step,
+                &animation.name,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a pose with a non-finite component; runs after every sampling
+/// path so neither entry point can hand out `NaN`s.
+fn check_joint_pose(locals: &[JointTransform]) -> Result<(), ModelError> {
+    for local in locals {
         if !local.translation.is_finite() || !local.rotation.is_finite() || !local.scale.is_finite()
         {
             return Err(ModelError::InvalidInput {
@@ -488,7 +611,7 @@ pub fn try_sample_joints(
             });
         }
     }
-    Ok(locals)
+    Ok(())
 }
 
 fn bind_pose(model: &CompiledSkeleton3d) -> Vec<JointTransform> {
@@ -735,5 +858,28 @@ fn clamp(value: f32, min: f32, max: f32) -> f32 {
         max
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_never_wraps_the_endpoint_back_to_the_first_frame() {
+        // `Loop` maps the duration onto the first frame; `Clamp` holds it.
+        assert_eq!(clip_local_time(3.0, 3.0, ClipPlayback::Loop), 0.0);
+        assert_eq!(clip_local_time(3.0, 3.0, ClipPlayback::Clamp), 3.0);
+        assert_eq!(clip_local_time(4.5, 3.0, ClipPlayback::Clamp), 3.0);
+    }
+
+    #[test]
+    fn loop_reduces_the_phase_in_f64_before_narrowing() {
+        let time = 262_144.125_f64;
+        assert_eq!(
+            clip_local_time(time, 3.0, ClipPlayback::Loop),
+            (time % 3.0) as f32
+        );
+        assert_eq!(clip_local_time(time, 3.0, ClipPlayback::Clamp), 3.0);
     }
 }

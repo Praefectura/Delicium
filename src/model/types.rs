@@ -45,10 +45,50 @@ pub struct CompiledModel {
     pub data: ModelData,
     /// Declared interaction capabilities, resolved to indices at compile time.
     pub interaction: InteractionBinding,
+    /// Declared action-role bindings, resolved to animation indices at
+    /// compile time; `None` when the document carries no `actions` table
+    /// (`0.1` documents and `0.2` documents without one).
+    pub actions: Option<ActionBindings>,
     /// Decoded image table, indexed by the `texture` fields of the compiled
     /// payload; images are shared via [`Arc`](std::sync::Arc) and never
     /// copied per instance or per frame.
     pub images: Vec<Arc<ModelImage>>,
+}
+
+// ---------------------------------------------------------------------------
+// Action bindings
+// ---------------------------------------------------------------------------
+
+/// Index of the animation playing each semantic action role.
+///
+/// The indices point into the animation list of the compiled payload that
+/// matches the model's kind: [`CompiledSprite2d::animations`] for `sprite2d`,
+/// [`CompiledSkeleton3d::animations`] for `skeleton3d`. A model may bind the
+/// same animation to several roles. `greet` and `play` are optional slots:
+/// `None` means the model does not declare them, and there is no fallback
+/// index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionBindings {
+    /// Index of the idle animation.
+    pub idle: usize,
+    /// Index of the walk animation.
+    pub walk: usize,
+    /// Index of the reaction animation.
+    pub reaction: usize,
+    /// Index of the greeting animation, if declared.
+    pub greet: Option<usize>,
+    /// Index of the play animation, if declared.
+    pub play: Option<usize>,
+}
+
+/// How a clip sampling call treats time beyond the clip duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipPlayback {
+    /// Wrap `time` modulo the clip duration (the classic looping rule).
+    Loop,
+    /// Clamp `time` into `[0, duration]`; the final key is held and never
+    /// wraps back to the first frame.
+    Clamp,
 }
 
 // ---------------------------------------------------------------------------

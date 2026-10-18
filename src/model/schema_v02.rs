@@ -16,6 +16,13 @@
 //!
 //! A `0.2` document without `images`, `texture` or `material` is valid and
 //! compiles to the original color/vertex-color output.
+//!
+//! An optional top-level `actions` table can bind the idle/walk/reaction
+//! roles (required when the table is present) and the optional greet/play
+//! slots to animations of this model by name. It is exclusive to `0.2` and
+//! deliberately names the *capability*, not a clip kind: older builds reject
+//! the field (`deny_unknown_fields`), so a document using it cannot be
+//! half-loaded.
 
 use serde::Deserialize;
 
@@ -44,6 +51,10 @@ pub struct RawEnvelope {
     /// Optional interaction capabilities.
     #[serde(default)]
     pub interaction: RawInteraction,
+    /// Optional action-role bindings; all three roles are required once the
+    /// table is declared, and each names an animation of this model.
+    #[serde(default)]
+    pub actions: Option<RawActions>,
     /// Embedded image table; layers and meshes reference entries by id.
     #[serde(default)]
     pub images: Vec<RawImage>,
@@ -53,6 +64,28 @@ pub struct RawEnvelope {
     /// Payload for `kind == "skeleton3d"`.
     #[serde(default)]
     pub skeleton3d: Option<RawSkeleton3d>,
+}
+
+/// Top-level `0.2` action-role bindings. The three base roles (`idle`,
+/// `walk`, `reaction`) are required once the table is present; `greet` and
+/// `play` are optional additional slots. Each declared value names an
+/// animation of the model (the animation lists of the declared `kind`).
+/// Reusing one clip for several roles is allowed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawActions {
+    /// Name of the idle animation.
+    pub idle: String,
+    /// Name of the walk animation.
+    pub walk: String,
+    /// Name of the reaction animation.
+    pub reaction: String,
+    /// Optional name of the greeting animation.
+    #[serde(default)]
+    pub greet: Option<String>,
+    /// Optional name of the play animation.
+    #[serde(default)]
+    pub play: Option<String>,
 }
 
 /// One embedded image: a unique id and the raw PNG bytes, standard-padded

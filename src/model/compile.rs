@@ -30,10 +30,10 @@ use crate::model::limits::LoadLimits;
 use crate::model::schema as raw;
 use crate::model::schema_v02 as raw2;
 use crate::model::types::{
-    AlphaMode, AnimationInterpolation, CompiledModel, CompiledSkeleton3d, CompiledSprite2d,
-    Deformer2d, InteractionBinding, Joint, Layer2d, Mask2d, Material3d, ModelData, ModelImage,
-    ParamChannel, Parameter, ParameterAnimation, RotationKey, ScalarKey, ScaleKey,
-    SkeletalAnimation, SkeletalChannel, TranslationKey, Vertex3d,
+    ActionBindings, AlphaMode, AnimationInterpolation, CompiledModel, CompiledSkeleton3d,
+    CompiledSprite2d, Deformer2d, InteractionBinding, Joint, Layer2d, Mask2d, Material3d,
+    ModelData, ModelImage, ParamChannel, Parameter, ParameterAnimation, RotationKey, ScalarKey,
+    ScaleKey, SkeletalAnimation, SkeletalChannel, TranslationKey, Vertex3d,
 };
 
 /// Safety margin of the conservative whole-model cutout visibility test.
@@ -63,6 +63,7 @@ pub(super) fn compile(
                     gaze_parameter,
                     head_joint: None,
                 },
+                actions: None,
                 images: Vec::new(),
             })
         }
@@ -79,6 +80,7 @@ pub(super) fn compile(
                     gaze_parameter: None,
                     head_joint,
                 },
+                actions: None,
                 images: Vec::new(),
             })
         }
@@ -128,6 +130,17 @@ pub(super) fn compile_v02(
                 .ok_or(ModelError::MissingPayload { kind: "sprite2d" })?;
             let (sprite, gaze_parameter) =
                 compile_sprite2d_v02(payload, &env.interaction, &images, limits)?;
+            let actions = match &env.actions {
+                Some(actions) => Some(resolve_action_bindings(
+                    actions,
+                    &sprite
+                        .animations
+                        .iter()
+                        .map(|animation| animation.name.as_str())
+                        .collect::<Vec<_>>(),
+                )?),
+                None => None,
+            };
             Ok(CompiledModel {
                 name: env.name.clone(),
                 data: ModelData::Sprite2d(sprite),
@@ -135,6 +148,7 @@ pub(super) fn compile_v02(
                     gaze_parameter,
                     head_joint: None,
                 },
+                actions,
                 images,
             })
         }
@@ -145,6 +159,17 @@ pub(super) fn compile_v02(
                 .ok_or(ModelError::MissingPayload { kind: "skeleton3d" })?;
             let (skeleton, head_joint) =
                 compile_skeleton3d_v02(payload, &env.interaction, &images, &image_max_alpha)?;
+            let actions = match &env.actions {
+                Some(actions) => Some(resolve_action_bindings(
+                    actions,
+                    &skeleton
+                        .animations
+                        .iter()
+                        .map(|animation| animation.name.as_str())
+                        .collect::<Vec<_>>(),
+                )?),
+                None => None,
+            };
             Ok(CompiledModel {
                 name: env.name.clone(),
                 data: ModelData::Skeleton3d(skeleton),
@@ -152,6 +177,7 @@ pub(super) fn compile_v02(
                     gaze_parameter: None,
                     head_joint,
                 },
+                actions,
                 images,
             })
         }
@@ -1110,6 +1136,51 @@ fn joint_position(joints: &[raw::RawJoint], name: &str) -> Option<usize> {
 
 fn parameter_index(parameters: &[Parameter], name: &str) -> Option<usize> {
     parameters.iter().position(|p| p.name == name)
+}
+
+/// Resolves the `0.2` `actions` table against one kind's animation names.
+///
+/// Validation already resolved every reference; this is the compiler's
+/// defensive re-resolution, mirroring `image_index`. A missing or ambiguous
+/// name is an error, never a guessed index; an absent optional slot stays
+/// `None`.
+fn resolve_action_bindings(
+    actions: &raw2::RawActions,
+    animation_names: &[&str],
+) -> Result<ActionBindings, ModelError> {
+    let resolve = |role: &str, name: &str| -> Result<usize, ModelError> {
+        let ctx = format!("actions.{role}");
+        let Some(index) = animation_names.iter().position(|n| *n == name) else {
+            return Err(ModelError::UnknownReference {
+                kind: "animation",
+                name: name.to_string(),
+                context: ctx,
+            });
+        };
+        if animation_names[index + 1..].contains(&name) {
+            return Err(ModelError::invalid(
+                ctx,
+                format!(
+                    "animation reference `{name}` is ambiguous; the name is declared more than once"
+                ),
+            ));
+        }
+        Ok(index)
+    };
+    let resolve_optional =
+        |role: &str, name: Option<&String>| -> Result<Option<usize>, ModelError> {
+            match name {
+                Some(name) => Ok(Some(resolve(role, name)?)),
+                None => Ok(None),
+            }
+        };
+    Ok(ActionBindings {
+        idle: resolve("idle", &actions.idle)?,
+        walk: resolve("walk", &actions.walk)?,
+        reaction: resolve("reaction", &actions.reaction)?,
+        greet: resolve_optional("greet", actions.greet.as_ref())?,
+        play: resolve_optional("play", actions.play.as_ref())?,
+    })
 }
 
 fn normalize_quat(value: [f32; 4], ctx: &str) -> Result<Quat, ModelError> {

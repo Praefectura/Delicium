@@ -132,7 +132,13 @@ pub(super) fn validate_v02(env: &raw2::RawEnvelope, limits: &LoadLimits) -> Resu
                     other: "skeleton3d",
                 });
             }
-            validate_sprite2d_v02(payload, &env.interaction, &image_names, limits)
+            validate_sprite2d_v02(
+                payload,
+                &env.interaction,
+                env.actions.as_ref(),
+                &image_names,
+                limits,
+            )
         }
         "skeleton3d" => {
             let payload = env
@@ -145,7 +151,13 @@ pub(super) fn validate_v02(env: &raw2::RawEnvelope, limits: &LoadLimits) -> Resu
                     other: "sprite2d",
                 });
             }
-            validate_skeleton3d_v02(payload, &env.interaction, &image_names, limits)
+            validate_skeleton3d_v02(
+                payload,
+                &env.interaction,
+                env.actions.as_ref(),
+                &image_names,
+                limits,
+            )
         }
         other => Err(ModelError::invalid(
             "kind",
@@ -370,6 +382,7 @@ fn validate_layers(
 fn validate_sprite2d_v02(
     s: &raw2::RawSprite2d,
     interaction: &raw::RawInteraction,
+    actions: Option<&raw2::RawActions>,
     image_names: &[&str],
     limits: &LoadLimits,
 ) -> Result<(), ModelError> {
@@ -378,6 +391,13 @@ fn validate_sprite2d_v02(
     reject_unused_images(image_names, &used_images)?;
     validate_deformers(&s.deformers, &parameter_names, limits)?;
     validate_parameter_animations(&s.animations, &s.parameters, limits)?;
+    validate_action_bindings(
+        actions,
+        &s.animations
+            .iter()
+            .map(|anim| anim.name.as_str())
+            .collect::<Vec<_>>(),
+    )?;
 
     if let Some(name) = &interaction.gaze_parameter {
         resolve_name(
@@ -986,6 +1006,63 @@ fn validate_parameter_animations(
     Ok(())
 }
 
+/// Resolves the optional top-level `actions` table against one kind's
+/// animation names.
+///
+/// The schema requires the three base roles (`idle`, `walk`, `reaction`);
+/// `greet` and `play` are optional slots, checked only when declared. Each
+/// declared name must resolve to an animation of the model; an empty name, an
+/// unresolved name, or a name declared more than once in the animation list
+/// (ambiguous) is an error. Binding several roles to the same animation is
+/// allowed, so only resolution is checked here.
+fn validate_action_bindings(
+    actions: Option<&raw2::RawActions>,
+    animation_names: &[&str],
+) -> Result<(), ModelError> {
+    let Some(actions) = actions else {
+        return Ok(());
+    };
+    let check = |role: &str, name: &str| -> Result<(), ModelError> {
+        let ctx = format!("actions.{role}");
+        if name.is_empty() {
+            return Err(ModelError::invalid(
+                &ctx,
+                "animation reference must not be empty",
+            ));
+        }
+        let mut matches = animation_names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n == name);
+        if matches.next().is_none() {
+            return Err(ModelError::UnknownReference {
+                kind: "animation",
+                name: name.to_string(),
+                context: ctx,
+            });
+        }
+        if matches.next().is_some() {
+            return Err(ModelError::invalid(
+                &ctx,
+                format!(
+                    "animation reference `{name}` is ambiguous; the name is declared more than once"
+                ),
+            ));
+        }
+        Ok(())
+    };
+    check("idle", &actions.idle)?;
+    check("walk", &actions.walk)?;
+    check("reaction", &actions.reaction)?;
+    if let Some(name) = &actions.greet {
+        check("greet", name)?;
+    }
+    if let Some(name) = &actions.play {
+        check("play", name)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 3D
 // ---------------------------------------------------------------------------
@@ -1018,6 +1095,7 @@ fn validate_skeleton3d(
 fn validate_skeleton3d_v02(
     s: &raw2::RawSkeleton3d,
     interaction: &raw::RawInteraction,
+    actions: Option<&raw2::RawActions>,
     image_names: &[&str],
     limits: &LoadLimits,
 ) -> Result<(), ModelError> {
@@ -1025,6 +1103,13 @@ fn validate_skeleton3d_v02(
     validate_vertices(&s.vertices, s.joints.len(), limits)?;
     validate_mesh3d(&s.indices, &s.vertices, limits)?;
     validate_skeletal_animations(&s.animations, &joint_names, &s.joints, limits)?;
+    validate_action_bindings(
+        actions,
+        &s.animations
+            .iter()
+            .map(|anim| anim.name.as_str())
+            .collect::<Vec<_>>(),
+    )?;
 
     let mut used_images = vec![false; image_names.len()];
     let texture = match &s.texture {

@@ -16,6 +16,8 @@
 //! - [`read_model_file`]: read a file with a hard byte budget, then compile.
 //! - [`sample_parameters`], [`deform_layer`]: 2D evaluation.
 //! - [`sample_joints`], [`skin_matrices`]: 3D evaluation.
+//! - [`try_sample_parameters_clip`], [`try_sample_joints_clip`]: single-clip
+//!   evaluation with [`ClipPlayback::Loop`] or [`ClipPlayback::Clamp`].
 //!
 //! # Format
 //!
@@ -25,10 +27,16 @@
 //! file cannot be half-loaded and mistaken for a supported one.
 //!
 //! `0.2` adds an embedded image table (`images`: unique `id` + standard-padded
-//! Base64 PNG), optional per-layer/per-mesh `texture` + `uvs`, and a basic 3D
+//! Base64 PNG), optional per-layer/per-mesh `texture` + `uvs`, a basic 3D
 //! `material` (`roughness`, `metallic`, `alpha_mode` `opaque`/`cutout`,
-//! `alpha_cutoff`). Everything else is unchanged from `0.1`; a `0.2` document
-//! without textures falls back to the `0.1` color / vertex-color paths.
+//! `alpha_cutoff`), and an optional top-level `actions` table
+//! (`idle`/`walk`/`reaction` required, optional `greet`/`play` slots; each
+//! value the exact name of an animation of this model, and roles may reuse
+//! one animation). Bindings resolve to [`ActionBindings`] indices on the
+//! compiled model; older builds reject the field outright, and documents
+//! without it keep the classic all-animation evaluation. Everything else is
+//! unchanged from `0.1`; a `0.2` document without textures falls back to the
+//! `0.1` color / vertex-color paths.
 //!
 //! UV conventions: origin top-left, values in `[0, 1]`, one entry per vertex.
 //! Generated 2D grids derive `u = column / columns`, `v = 1 - row / rows`.
@@ -66,14 +74,16 @@ mod validate;
 pub use error::ModelError;
 pub use evaluate::{
     deform_layer, sample_joints, sample_parameters, skin_matrices, try_deform_layer,
-    try_sample_joints, try_sample_parameters, try_skin_matrices,
+    try_sample_joints, try_sample_joints_clip, try_sample_parameters, try_sample_parameters_clip,
+    try_skin_matrices,
 };
 pub use limits::LoadLimits;
 pub use types::{
-    AlphaMode, AnimationInterpolation, CompiledModel, CompiledSkeleton3d, CompiledSprite2d,
-    Deformer2d, InteractionBinding, Joint, JointTransform, Layer2d, Mask2d, Material3d, ModelData,
-    ModelImage, ModelKind, ParamChannel, Parameter, ParameterAnimation, RotationKey, ScalarKey,
-    ScaleKey, SkeletalAnimation, SkeletalChannel, TranslationKey, Vertex3d,
+    ActionBindings, AlphaMode, AnimationInterpolation, ClipPlayback, CompiledModel,
+    CompiledSkeleton3d, CompiledSprite2d, Deformer2d, InteractionBinding, Joint, JointTransform,
+    Layer2d, Mask2d, Material3d, ModelData, ModelImage, ModelKind, ParamChannel, Parameter,
+    ParameterAnimation, RotationKey, ScalarKey, ScaleKey, SkeletalAnimation, SkeletalChannel,
+    TranslationKey, Vertex3d,
 };
 
 use std::io::Read;
