@@ -6,6 +6,11 @@
   "interaction": {
     "gaze_parameter": "gaze_x"
   },
+  "actions": {
+    "idle": "idle",
+    "walk": "walk",
+    "reaction": "reaction"
+  },
   "sprite2d": {
     "parameters": [
       {
@@ -22,6 +27,24 @@
       },
       {
         "name": "ear_sway",
+        "min": -1.0,
+        "max": 1.0,
+        "default": 0.0
+      },
+      {
+        "name": "body_sway",
+        "min": -1.0,
+        "max": 1.0,
+        "default": 0.0
+      },
+      {
+        "name": "body_bob",
+        "min": -1.0,
+        "max": 1.0,
+        "default": 0.0
+      },
+      {
+        "name": "ear_flick",
         "min": -1.0,
         "max": 1.0,
         "default": 0.0
@@ -65,7 +88,7 @@
       {
         "name": "ear_r",
         "type": "rotation",
-        "parent": "head_tilt",
+        "parent": "ear_flick_r",
         "parameter": "ear_sway",
         "pivot": [
           0.4,
@@ -76,7 +99,7 @@
       {
         "name": "torso_breathe",
         "type": "warp",
-        "parent": null,
+        "parent": "torso_sway",
         "parameter": "breath",
         "bounds": [
           -0.38,
@@ -130,7 +153,7 @@
       {
         "name": "head_tilt",
         "type": "rotation",
-        "parent": null,
+        "parent": "torso_sway",
         "parameter": "gaze_x",
         "pivot": [
           0.0,
@@ -141,13 +164,80 @@
       {
         "name": "ear_l",
         "type": "rotation",
-        "parent": "head_tilt",
+        "parent": "ear_flick_l",
         "parameter": "ear_sway",
         "pivot": [
           -0.4,
           0.46
         ],
         "max_angle_radians": 0.45
+      },
+      {
+        "name": "figure_bob",
+        "type": "warp",
+        "parent": null,
+        "parameter": "body_bob",
+        "bounds": [
+          -0.62,
+          -0.9,
+          1.24,
+          1.74
+        ],
+        "grid": [
+          2,
+          2
+        ],
+        "offsets": [
+          [
+            0.0,
+            0.06
+          ],
+          [
+            0.0,
+            0.06
+          ],
+          [
+            0.0,
+            0.06
+          ],
+          [
+            0.0,
+            0.06
+          ]
+        ]
+      },
+      {
+        "name": "torso_sway",
+        "type": "rotation",
+        "parent": "figure_bob",
+        "parameter": "body_sway",
+        "pivot": [
+          0.0,
+          -0.85
+        ],
+        "max_angle_radians": 0.14
+      },
+      {
+        "name": "ear_flick_l",
+        "type": "rotation",
+        "parent": "head_tilt",
+        "parameter": "ear_flick",
+        "pivot": [
+          -0.4,
+          0.46
+        ],
+        "max_angle_radians": 0.6
+      },
+      {
+        "name": "ear_flick_r",
+        "type": "rotation",
+        "parent": "head_tilt",
+        "parameter": "ear_flick",
+        "pivot": [
+          0.4,
+          0.46
+        ],
+        "max_angle_radians": -0.6
       }
     ],
     "layers": [
@@ -524,6 +614,189 @@
               },
               {
                 "time": 4.0,
+                "value": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "walk",
+        "duration": 1.2,
+        "channels": [
+          {
+            "parameter": "body_sway",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 0.3,
+                "value": 0.55
+              },
+              {
+                "time": 0.6,
+                "value": 0.0
+              },
+              {
+                "time": 0.9,
+                "value": -0.55
+              },
+              {
+                "time": 1.2,
+                "value": 0.0
+              }
+            ]
+          },
+          {
+            "parameter": "body_bob",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 0.3,
+                "value": 0.5
+              },
+              {
+                "time": 0.6,
+                "value": 0.0
+              },
+              {
+                "time": 0.9,
+                "value": 0.5
+              },
+              {
+                "time": 1.2,
+                "value": 0.0
+              }
+            ]
+          },
+          {
+            "parameter": "ear_sway",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 0.3,
+                "value": -0.65
+              },
+              {
+                "time": 0.6,
+                "value": 0.0
+              },
+              {
+                "time": 0.9,
+                "value": 0.65
+              },
+              {
+                "time": 1.2,
+                "value": 0.0
+              }
+            ]
+          },
+          {
+            "parameter": "breath",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.3
+              },
+              {
+                "time": 0.6,
+                "value": 0.6
+              },
+              {
+                "time": 1.2,
+                "value": 0.3
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "reaction",
+        "duration": 1.0,
+        "channels": [
+          {
+            "parameter": "body_bob",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 0.08,
+                "value": -0.8
+              },
+              {
+                "time": 0.2,
+                "value": -0.85
+              },
+              {
+                "time": 0.45,
+                "value": 0.35
+              },
+              {
+                "time": 0.75,
+                "value": 0.06
+              },
+              {
+                "time": 1.0,
+                "value": 0.0
+              }
+            ]
+          },
+          {
+            "parameter": "body_sway",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 0.1,
+                "value": 0.4
+              },
+              {
+                "time": 0.4,
+                "value": -0.2
+              },
+              {
+                "time": 0.8,
+                "value": 0.0
+              },
+              {
+                "time": 1.0,
+                "value": 0.0
+              }
+            ]
+          },
+          {
+            "parameter": "ear_flick",
+            "keys": [
+              {
+                "time": 0.0,
+                "value": 0.0
+              },
+              {
+                "time": 0.06,
+                "value": 1.0
+              },
+              {
+                "time": 0.35,
+                "value": 0.9
+              },
+              {
+                "time": 0.6,
+                "value": -0.15
+              },
+              {
+                "time": 1.0,
                 "value": 0.0
               }
             ]
