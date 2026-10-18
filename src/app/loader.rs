@@ -17,6 +17,10 @@ pub(super) enum LoadSource {
     Example3d,
     TexturedExample2d,
     TexturedExample3d,
+    /// The bundled interactive pet used by `--bangboo`; it has no slot in the
+    /// four-example cache, which stays owned by the legacy and textured
+    /// example pairs.
+    Bangboo,
     File(PathBuf),
     ValidationProbe,
 }
@@ -28,6 +32,7 @@ impl LoadSource {
             Self::Example3d => "Bundled 3D example".into(),
             Self::TexturedExample2d => "Bundled textured 2D example".into(),
             Self::TexturedExample3d => "Bundled textured 3D example".into(),
+            Self::Bangboo => "Bangboo".into(),
             Self::File(path) => path.display().to_string(),
             Self::ValidationProbe => "Smoke-test invalid model".into(),
         }
@@ -39,7 +44,7 @@ impl LoadSource {
             Self::Example3d => Some(1),
             Self::TexturedExample2d => Some(2),
             Self::TexturedExample3d => Some(3),
-            Self::File(_) | Self::ValidationProbe => None,
+            Self::Bangboo | Self::File(_) | Self::ValidationProbe => None,
         }
     }
 
@@ -59,6 +64,10 @@ impl LoadSource {
             ),
             Self::TexturedExample3d => load_model_bytes(
                 include_bytes!("../../assets/examples/robot3d-textured.dmodel.json"),
+                limits,
+            ),
+            Self::Bangboo => load_model_bytes(
+                include_bytes!("../../assets/examples/bangboo-eous.dmodel.json"),
                 limits,
             ),
             Self::File(path) => {
@@ -160,6 +169,14 @@ mod tests {
             None
         );
         assert_eq!(LoadSource::ValidationProbe.example_index(), None);
+    }
+
+    #[test]
+    fn bangboo_source_has_no_example_slot_and_its_own_label() {
+        // The pet must not land in the four-example cache: those slots keep
+        // their legacy/textured meaning for smoke, bench and the controls.
+        assert_eq!(LoadSource::Bangboo.example_index(), None);
+        assert_eq!(LoadSource::Bangboo.label(), "Bangboo");
     }
 
     #[test]

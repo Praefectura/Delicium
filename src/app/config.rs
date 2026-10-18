@@ -56,8 +56,9 @@ pub(super) enum EntrySource {
 
 impl EntrySource {
     /// The persistent form of a load source, when one exists: the validation
-    /// probe cannot round-trip, and network paths are rejected by the loader
-    /// itself, so neither is configuration material.
+    /// probe and the `--bangboo` pet scene cannot round-trip, and network
+    /// paths are rejected by the loader itself, so none is configuration
+    /// material.
     pub(super) fn from_load_source(source: &LoadSource) -> Option<Self> {
         match source {
             LoadSource::Example2d => Some(Self::Example2d),
@@ -72,7 +73,7 @@ impl EntrySource {
                     Some(Self::File { path: path.clone() })
                 }
             }
-            LoadSource::ValidationProbe => None,
+            LoadSource::Bangboo | LoadSource::ValidationProbe => None,
         }
     }
 
@@ -90,10 +91,11 @@ impl EntrySource {
 
 /// Whether configuration may be read and written for these options. The
 /// smoke test and benchmarks must stay deterministic and operate on their
-/// own scenes; `DELICIUM_NO_CONFIG` set to anything but the empty string or
-/// `0` disables persistence explicitly.
+/// own scenes; `--bangboo` likewise owns its fixed pet scene and must not
+/// read or overwrite the user's saved scene. `DELICIUM_NO_CONFIG` set to
+/// anything but the empty string or `0` disables persistence explicitly.
 pub(super) fn enabled(options: &Options) -> bool {
-    if options.smoke_test || options.bench.is_some() {
+    if options.smoke_test || options.bench.is_some() || options.bangboo {
         return false;
     }
     let disabled = std::env::var_os("DELICIUM_NO_CONFIG")
@@ -260,6 +262,20 @@ mod tests {
         let text = serde_json::to_string_pretty(&config).unwrap();
         let parsed: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn bangboo_mode_disables_persistence_without_changing_the_format() {
+        // The pet scene must not read or overwrite the user's file, whatever
+        // DELICIUM_NO_CONFIG says.
+        let options = Options {
+            bangboo: true,
+            ..Options::default()
+        };
+        assert!(!enabled(&options));
+        // The persistent format gains no Bangboo entry: the pet scene is not
+        // configuration material, so it never round-trips.
+        assert_eq!(EntrySource::from_load_source(&LoadSource::Bangboo), None);
     }
 
     #[test]

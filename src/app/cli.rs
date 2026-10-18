@@ -30,12 +30,16 @@ pub struct Options {
     pub models: Vec<PathBuf>,
     pub backend: BackendChoice,
     /// An explicit bounded scene size, or `None` for the ordinary launch mode
-    /// where the scene covers the primary monitor. `--smoke-test` and
+    /// where the scene covers all monitors' bounding rectangle. `--smoke-test` and
     /// `--bench` normalize an omitted value to the bounded 960x640 scene.
     pub overlay_size: Option<[u32; 2]>,
     pub exit_after: Option<Duration>,
     pub smoke_test: bool,
     pub bench: Option<BenchOptions>,
+    /// `--bangboo` replaces the default scene with the two bundled pet
+    /// characters; it is a standalone mode and rejects `--model`,
+    /// `--smoke-test` and `--bench`.
+    pub bangboo: bool,
     /// Autonomous wandering is on for ordinary launches; `--no-wander` turns
     /// it off. `--smoke-test` always normalizes it off, and `--bench`
     /// normalizes it off unless `--bench-wander` selects the wandering
@@ -55,6 +59,7 @@ impl Default for Options {
             exit_after: None,
             smoke_test: false,
             bench: None,
+            bangboo: false,
             wander: true,
             bench_wander: false,
         }
@@ -73,10 +78,12 @@ Usage: delicium [OPTIONS]\n\n\
                           Select the GPU backend\n\
   --overlay-size WIDTHxHEIGHT\n\
                           Explicit bounded scene size in logical pixels\n\
-                          (default: the scene covers the entire primary\n\
-                          monitor; characters keep their native size)\n\
+                          (default: the scene spans all monitors;\n\
+                          characters keep their native size)\n\
   --exit-after SECONDS     Exit after 0.1 to 600 seconds, useful for smoke tests\n\
   --smoke-test             Use bundled examples; no --model; exit >= 10 seconds\n\
+  --bangboo                Start with two bundled interactive pets; no --model,\n\
+                          --smoke-test or --bench\n\
   --no-wander              Disable autonomous character wandering\n\
   --bench 4|16|32|64       Run a local bundled-model benchmark\n\
   --bench-mode pixel|interactive\n\
@@ -143,6 +150,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParseResul
                 options.exit_after = Some(Duration::from_secs_f64(seconds));
             }
             Some("--smoke-test") => options.smoke_test = true,
+            Some("--bangboo") => options.bangboo = true,
             Some("--no-wander") => options.wander = false,
             Some("--bench-wander") => bench_wander = true,
             Some("--bench") => {
@@ -230,7 +238,21 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParseResul
             options.exit_after = Some(Duration::from_secs(12));
         }
     }
-    // Ordinary launches span the primary monitor; the automated smoke test and
+    if options.bangboo {
+        // The pet scene is a standalone bundled mode: it replaces both the
+        // default scene and any explicit model list, and it cannot drive the
+        // automated workloads.
+        if !options.models.is_empty() {
+            return Err("--bangboo cannot be combined with --model".into());
+        }
+        if options.smoke_test {
+            return Err("--bangboo cannot be combined with --smoke-test".into());
+        }
+        if options.bench.is_some() {
+            return Err("--bangboo cannot be combined with --bench".into());
+        }
+    }
+    // Ordinary launches span all monitors; the automated smoke test and
     // the benchmark workload keep the bounded 960x640 scene unless an explicit
     // size was given.
     if options.overlay_size.is_none() && (options.smoke_test || options.bench.is_some()) {
@@ -501,6 +523,64 @@ mod tests {
             panic!("expected run")
         };
         assert!(options.bench.is_none());
+    }
+
+    #[test]
+    fn bangboo_mode_defaults_and_standalone_combinations() {
+        // Plain --bangboo: enabled, no models, wandering keeps its default.
+        let ParseResult::Run(options) = parse(&["--bangboo"]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert!(options.bangboo);
+        assert!(options.models.is_empty());
+        assert!(options.wander);
+        // The compatible modifiers are accepted and keep their meaning.
+        let ParseResult::Run(options) = parse(&[
+            "--bangboo",
+            "--no-wander",
+            "--overlay-size",
+            "960x640",
+            "--exit-after",
+            "120",
+        ])
+        .unwrap() else {
+            panic!("expected run options");
+        };
+        assert!(options.bangboo);
+        assert!(!options.wander);
+        assert_eq!(options.overlay_size, Some([960, 640]));
+        assert_eq!(options.exit_after, Some(Duration::from_secs(120)));
+        // It is a standalone scene: every automated or explicit-scene mode is
+        // rejected in either order.
+        for args in [
+            vec!["--bangboo", "--model", "first.json"],
+            vec!["--model", "first.json", "--bangboo"],
+            vec!["--bangboo", "--smoke-test"],
+            vec!["--smoke-test", "--bangboo"],
+            vec!["--bangboo", "--bench", "4"],
+            vec!["--bench", "4", "--bangboo"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+        // A bare flag takes no value.
+        assert!(parse(&["--bangboo", "true"]).is_err());
+    }
+
+    #[test]
+    fn bangboo_stays_off_by_default() {
+        let ParseResult::Run(options) = parse(&[]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert!(!options.bangboo);
+        // The smoke test and the benchmark do not enable it either.
+        let ParseResult::Run(options) = parse(&["--smoke-test"]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert!(!options.bangboo);
+        let ParseResult::Run(options) = parse(&["--bench", "4"]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert!(!options.bangboo);
     }
 
     #[test]

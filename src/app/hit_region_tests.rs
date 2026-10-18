@@ -3,6 +3,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "hit_region_frozen_tests.rs"]
+mod frozen;
+#[path = "hit_region_geometry_tests.rs"]
+mod geometry;
+#[path = "hit_region_scan_tests.rs"]
+mod scan_gate;
+#[path = "hit_region_temporal_tests.rs"]
+mod temporal;
+
 use glam::{Mat4, Vec3};
 use serde_json::json;
 
@@ -52,6 +61,39 @@ fn translated(frame: &RenderFrame, dx_pixels: f32) -> RenderFrame {
             Mat4::from_translation(Vec3::new(dx_pixels * 4.5 / 640.0, 0.0, 0.0)) * *transform;
     }
     frame
+}
+
+#[test]
+fn nonzero_desktop_center_agrees_with_native_hit_region_and_picking_transform() {
+    let size = [4160, 2560];
+    let view = crate::renderer::desktop_view_at(2560, 1.5, 800.0, 449.0);
+    let screen = [[2900.0, 1300.0], [3100.0, 1300.0], [3000.0, 1500.0]];
+    let vertices: Vec<_> = screen
+        .iter()
+        .map(|&point| crate::renderer::screen_to_world_with(point, size, view))
+        .collect();
+    let (simulation, frame) = sprite_scene(&vertices, &[0, 1, 2], 1.0);
+    let geometry = HitGeometry::from_frame_with_view(&simulation, &frame, size, view).unwrap();
+    assert_eq!(
+        crate::platform::hit_region_contains(geometry.polygons(), &[[3000, 1400], [3500, 1400]])
+            .unwrap(),
+        [true, false]
+    );
+    for (world, expected) in vertices.iter().zip(screen) {
+        let actual = crate::renderer::world_to_screen_with(*world, size, view);
+        assert!((actual[0] - expected[0]).abs() < 0.001);
+        assert!((actual[1] - expected[1]).abs() < 0.001);
+    }
+    let changed_view = crate::renderer::SceneView {
+        center_x: view.center_x + 0.0001,
+        ..view
+    };
+    let changed =
+        HitGeometry::from_frame_with_view(&simulation, &frame, size, changed_view).unwrap();
+    assert!(
+        changed.changed_since(&geometry),
+        "a view change invalidates even subpixel geometry"
+    );
 }
 
 #[test]
@@ -157,7 +199,10 @@ fn cache_invalidates_identity_size_and_topology_changes() {
             2 => changed.polys.push(changed.polys[0].clone()),
             _ => changed.polys[0].push([2.0, 2.0]),
         }
-        assert!(changed.changed_since(&baseline));
+        assert_eq!(
+            changed.change_since(&baseline),
+            super::RegionChange::Immediate
+        );
     }
     let (simulation, frame) = sprite_scene(&[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], &[0, 1, 2], 1.0);
     let original = HitGeometry::from_frame(&simulation, &frame, CoverageGpu::SIZE).unwrap();
@@ -430,6 +475,374 @@ fn frozen_gpu_frames_are_fully_covered_by_current_and_cached_native_regions() {
     );
 }
 
+#[test]
+fn bound_actions_and_crossfades_share_gpu_and_native_hit_geometry() {
+    use crate::simulation::{ActionKind, FIXED_DT, WorldXBounds};
+
+    let mut simulation = Simulation::new();
+    for (bytes, x) in [
+        (
+            include_bytes!("../../assets/examples/puppet2d-textured.dmodel.json").as_slice(),
+            -1.5,
+        ),
+        (
+            include_bytes!("../../assets/examples/robot3d-textured.dmodel.json").as_slice(),
+            1.5,
+        ),
+    ] {
+        let model = load_model_bytes(bytes, &LoadLimits::default()).unwrap();
+        assert!(model.actions.is_some());
+        let asset = simulation.insert_asset(model).unwrap();
+        simulation.spawn(asset, Vec3::new(x, 0.15, 0.0)).unwrap();
+    }
+    simulation
+        .set_wander_bounds(Some(WorldXBounds {
+            left: -2.8,
+            right: 2.8,
+        }))
+        .unwrap();
+    let mut gpu = CoverageGpu::new(&simulation);
+    let mut seen = [[false; 3]; 2];
+    let snapshots = [0, 300, 306, 309, 310, 315, 325, 340, 365, 372, 390];
+    for tick in 0..=390 {
+        if tick == 310 {
+            for id in [1, 2] {
+                let position = simulation.instance(id).unwrap().position;
+                simulation.poke_reaction(id, position + Vec3::X).unwrap();
+            }
+        }
+        if tick != 0 {
+            simulation.advance(FIXED_DT).unwrap();
+        }
+        for (index, instance) in simulation.instances().iter().enumerate() {
+            let state = match instance.action.unwrap() {
+                ActionKind::Idle => 0,
+                ActionKind::Walk => 1,
+                ActionKind::Reaction => 2,
+                ActionKind::Greet | ActionKind::Play => {
+                    panic!("old examples must not opt into social actions")
+                }
+            };
+            seen[index][state] = true;
+        }
+        if snapshots.contains(&tick) {
+            let frame = simulation.render_frame().unwrap();
+            let geometry = HitGeometry::from_frame(&simulation, &frame, CoverageGpu::SIZE).unwrap();
+            assert!(
+                crate::platform::hit_region_matches_sequential_oracle(geometry.polygons()).unwrap()
+            );
+            assert_gpu_coverage(&mut gpu, &frame, geometry.polygons(), tick);
+        }
+    }
+    assert!(seen.iter().all(|states| states.iter().all(|state| *state)));
+    println!(
+        "ACTION_REGION_COVERAGE pass=true kinds=2 states=3 snapshots={}",
+        snapshots.len()
+    );
+}
+
+#[test]
+fn bangboo_social_poses_share_gpu_and_native_hit_geometry() {
+    use crate::simulation::{ActionKind, FIXED_DT, WorldXBounds};
+    let mut simulation = Simulation::new();
+    let model = load_model_bytes(
+        include_bytes!("../../assets/examples/bangboo-eous.dmodel.json"),
+        &LoadLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(model.name, "bangboo");
+    let bindings = model.actions.unwrap();
+    assert!(bindings.greet.is_some() && bindings.play.is_some());
+    let asset = simulation.insert_asset(model).unwrap();
+    for x in [-0.65, 0.65] {
+        simulation.spawn(asset, Vec3::new(x, 0.15, 0.0)).unwrap();
+    }
+    simulation
+        .set_wander_bounds(Some(WorldXBounds {
+            left: -3.5,
+            right: 3.5,
+        }))
+        .unwrap();
+    let mut gpu = CoverageGpu::new(&simulation);
+    let captures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".artifacts")
+        .join(format!(
+            "eous-gpu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&captures).unwrap();
+    let mut seen = [[false; 5]; 2];
+    let snapshots = [
+        0, 1, 6, 20, 50, 80, 96, 100, 110, 130, 180, 225, 230, 240, 246, 255, 275, 300, 390, 450,
+        600, 700,
+    ];
+    for tick in 0..=700 {
+        if tick == 240 {
+            for id in [1, 2] {
+                let position = simulation.instance(id).unwrap().position;
+                simulation.poke_reaction(id, position + Vec3::X).unwrap();
+            }
+        }
+        if tick != 0 {
+            simulation.advance(FIXED_DT).unwrap();
+        }
+        for (index, instance) in simulation.instances().iter().enumerate() {
+            let state = match instance.action.unwrap() {
+                ActionKind::Idle => 0,
+                ActionKind::Walk => 1,
+                ActionKind::Reaction => 2,
+                ActionKind::Greet => 3,
+                ActionKind::Play => 4,
+            };
+            seen[index][state] = true;
+        }
+        if snapshots.contains(&tick) {
+            gpu.capture = Some(captures.join(format!(
+                "tick-{tick:03}-{:?}.png",
+                simulation.instance(1).unwrap().action.unwrap()
+            )));
+            let frame = simulation.render_frame().unwrap();
+            let geometry = HitGeometry::from_frame(&simulation, &frame, CoverageGpu::SIZE).unwrap();
+            assert!(
+                crate::platform::hit_region_matches_sequential_oracle(geometry.polygons()).unwrap()
+            );
+            assert_gpu_coverage(&mut gpu, &frame, geometry.polygons(), tick);
+        }
+    }
+    assert!(
+        seen.iter().all(|states| states.iter().all(|seen| *seen)),
+        "both pets must actually visit all five actions: {seen:?}"
+    );
+    println!(
+        "BANGBOO_REGION_COVERAGE pass=true instances=2 states=5 snapshots={}",
+        snapshots.len()
+    );
+    let model = simulation.asset(asset).unwrap();
+    let crate::model::ModelData::Skeleton3d(mesh) = &model.data else {
+        unreachable!()
+    };
+    for phase in 0..8 {
+        let pose = crate::model::try_sample_joints_clip(
+            mesh,
+            bindings.walk,
+            f64::from(mesh.animations[bindings.walk].duration) * phase as f64 / 8.0,
+            crate::model::ClipPlayback::Clamp,
+        )
+        .unwrap();
+        let skin_matrices = crate::model::try_skin_matrices(mesh, &pose).unwrap();
+        let frame = RenderFrame {
+            instances: [-1.0, 1.0]
+                .into_iter()
+                .enumerate()
+                .map(|(i, facing)| InstanceDraw::Skeleton3d {
+                    asset,
+                    instance: i as u64 + 1,
+                    transform: Mat4::from_translation(Vec3::new(facing, 0.15, 0.0))
+                        * Mat4::from_scale(Vec3::new(facing, 1.0, 1.0)),
+                    skin_matrices: skin_matrices.clone(),
+                })
+                .collect(),
+        };
+        gpu.capture = Some(captures.join(format!("walk-phase-{phase}-both-facings.png")));
+        let geometry = HitGeometry::from_frame(&simulation, &frame, CoverageGpu::SIZE).unwrap();
+        assert!(
+            crate::platform::hit_region_matches_sequential_oracle(geometry.polygons()).unwrap()
+        );
+        assert_gpu_coverage(&mut gpu, &frame, geometry.polygons(), 800 + phase);
+    }
+    println!("EOUS_WALK_REGION_COVERAGE pass=true phases=8 facings=2");
+    println!("EOUS_GPU_CAPTURES {}", captures.display());
+}
+
+#[test]
+#[ignore = "explicit hardware GPU/native coverage and visible interaction captures"]
+fn eous_attention_presentations_share_complete_gpu_and_native_geometry() {
+    use crate::simulation::{AttentionSource, FIXED_DT, WorldRect};
+
+    let model = load_model_bytes(
+        include_bytes!("../../assets/examples/bangboo-eous.dmodel.json"),
+        &LoadLimits::default(),
+    )
+    .unwrap();
+    let crate::model::ModelData::Skeleton3d(mesh) = &model.data else {
+        unreachable!()
+    };
+    let mut simulation = Simulation::new();
+    simulation.set_attention_enabled(true);
+    let asset = simulation.insert_asset(model.clone()).unwrap();
+    let id = simulation.spawn(asset, Vec3::new(0.0, 0.15, 0.0)).unwrap();
+    let mut preview = CoverageGpu::new(&simulation);
+    let size = [2560, 1600];
+    let view = crate::renderer::desktop_view(size[1], 1.5);
+    let mut desktop = CoverageGpu::with_view(&simulation, size, view);
+    let captures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".artifacts")
+        .join(format!(
+            "eous-attention-gpu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&captures).unwrap();
+    let snapshots = [
+        0, 12, 30, 60, 75, 105, 120, 140, 180, 205, 240, 250, 265, 272, 278, 286, 306, 320, 334,
+        345, 370, 400, 480, 600, 780, 900,
+    ];
+    let boundary = WorldRect {
+        left: -3.0,
+        right: 3.0,
+        bottom: 0.15,
+        top: 5.0,
+    };
+    let mut seen = [false; 6];
+    let mut minimum = f32::INFINITY;
+    let mut maximal_shear = 0.0_f32;
+    for tick in 0..=900 {
+        match tick {
+            1 => simulation
+                .set_pointer_world(Some(Vec3::new(0.5, 1.2, 0.0)))
+                .unwrap(),
+            61 => simulation
+                .set_pointer_world(Some(Vec3::new(-0.5, 1.2, 0.0)))
+                .unwrap(),
+            121 => {
+                simulation.set_pointer_world(None).unwrap();
+                simulation
+                    .set_attention_edges(&[], &[], &[boundary])
+                    .unwrap();
+            }
+            181 => simulation
+                .set_attention_edges(&[boundary], &[], &[])
+                .unwrap(),
+            211 => simulation
+                .set_attention_edges(&[boundary], &[boundary], &[boundary])
+                .unwrap(),
+            241 => {
+                simulation.set_attention_edges(&[], &[], &[]).unwrap();
+                simulation.suspend_wander(id).unwrap();
+                simulation.begin_drag_feedback(id).unwrap();
+            }
+            271 => {
+                simulation.end_drag_feedback(id, true).unwrap();
+                simulation.resume_wander(id).unwrap();
+            }
+            301 | 315 | 329 => {
+                simulation
+                    .poke_reaction(id, simulation.instance(id).unwrap().position + Vec3::X)
+                    .unwrap();
+            }
+            _ => {}
+        }
+        if (242..=270).contains(&tick) {
+            simulation
+                .set_position(id, Vec3::new((tick - 241) as f32 * 0.018 - 0.27, 0.15, 0.0))
+                .unwrap();
+        }
+        if tick > 0 {
+            simulation.advance(FIXED_DT).unwrap();
+        }
+        let state = simulation.attention_snapshot(id).unwrap();
+        maximal_shear = maximal_shear.max(state.shear_x.abs());
+        match state.source {
+            AttentionSource::Pointer => seen[0] = true,
+            AttentionSource::ScreenEdge => seen[1] = true,
+            AttentionSource::WorkAreaEdge => seen[2] = true,
+            AttentionSource::WindowEdge => seen[3] = true,
+            AttentionSource::Idle => seen[4] = true,
+            AttentionSource::Drag => seen[5] = true,
+            AttentionSource::None => {}
+        }
+        if !snapshots.contains(&tick) {
+            continue;
+        }
+        let mut frame = simulation.render_frame().unwrap();
+        let position = simulation.instance(id).unwrap().position;
+        let InstanceDraw::Skeleton3d {
+            transform,
+            skin_matrices,
+            ..
+        } = &frame.instances[0]
+        else {
+            unreachable!()
+        };
+        for vertex in &mesh.vertices {
+            let skinned = vertex.joints.iter().zip(vertex.weights).fold(
+                Vec3::ZERO,
+                |sum, (&joint, weight)| {
+                    sum + skin_matrices[joint as usize]
+                        .transform_point3(Vec3::from_array(vertex.position))
+                        * weight
+                },
+            );
+            let point = transform.transform_point3(skinned) - position;
+            assert!(
+                point.is_finite(),
+                "nonfinite presented vertex at tick {tick}"
+            );
+            minimum = minimum.min(point.y);
+            assert!(
+                point.y >= -0.0005,
+                "presented skin below floor at tick {tick}: {point:?}"
+            );
+        }
+        preview.capture =
+            Some(captures.join(format!("tick-{tick:03}-{}.png", state.source.as_str())));
+        for mirror in 0..2 {
+            if mirror == 1 {
+                let InstanceDraw::Skeleton3d { transform, .. } = &mut frame.instances[0] else {
+                    unreachable!()
+                };
+                *transform *= Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0));
+                preview.capture = None;
+            }
+            for gpu in [&mut preview, &mut desktop] {
+                let geometry = HitGeometry::from_frame_with_view(
+                    &simulation,
+                    &frame,
+                    gpu.size,
+                    gpu.scene_view,
+                )
+                .unwrap();
+                assert!(
+                    crate::platform::hit_region_matches_sequential_oracle(geometry.polygons())
+                        .unwrap()
+                );
+                assert_gpu_coverage(gpu, &frame, geometry.polygons(), tick);
+                assert!(
+                    crate::platform::hit_region_contains(
+                        geometry.polygons(),
+                        &[
+                            [0, 0],
+                            [gpu.size[0] as i32 - 1, 0],
+                            [0, gpu.size[1] as i32 - 1],
+                            [gpu.size[0] as i32 - 1, gpu.size[1] as i32 - 1]
+                        ]
+                    )
+                    .unwrap()
+                    .iter()
+                    .all(|inside| !inside)
+                );
+            }
+        }
+    }
+    assert!(
+        seen.iter().all(|seen| *seen),
+        "missing actual attention sources: {seen:?}"
+    );
+    assert!(maximal_shear > 0.01 && maximal_shear <= 0.080001);
+    println!(
+        "EOUS_ATTENTION_COVERAGE pass=true snapshots={} views=2 facings=2 floor={minimum} max_shear={maximal_shear}",
+        snapshots.len()
+    );
+    println!("EOUS_ATTENTION_GPU_CAPTURES {}", captures.display());
+}
+
 fn animated_scene() -> Simulation {
     let mut simulation = Simulation::new();
     for (bytes, positions) in [
@@ -476,13 +889,23 @@ struct CoverageGpu {
     queue: Arc<wgpu::Queue>,
     renderer: SceneRenderer,
     texture: wgpu::Texture,
+    capture: Option<std::path::PathBuf>,
+    size: [u32; 2],
+    scene_view: crate::renderer::SceneView,
 }
 
 impl CoverageGpu {
     const SIZE: [u32; 2] = [960, 640];
-    const ROW_BYTES: u32 = Self::SIZE[0] * 4;
-
     fn new(simulation: &Simulation) -> Self {
+        Self::with_view(simulation, Self::SIZE, crate::renderer::LEGACY)
+    }
+
+    fn with_view(
+        simulation: &Simulation,
+        size: [u32; 2],
+        scene_view: crate::renderer::SceneView,
+    ) -> Self {
+        assert!(size[0].is_multiple_of(64) && size[0] > 0 && size[1] > 0);
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12 | wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -514,7 +937,12 @@ impl CoverageGpu {
             wgpu::TextureFormat::Rgba8Unorm,
         )
         .unwrap();
-        for asset in [1, 2] {
+        let assets: std::collections::BTreeSet<_> = simulation
+            .instances()
+            .iter()
+            .map(|instance| instance.asset)
+            .collect();
+        for asset in assets {
             renderer
                 .register_asset(asset, &render_asset(simulation.asset(asset).unwrap()))
                 .unwrap();
@@ -522,8 +950,8 @@ impl CoverageGpu {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Frozen-frame region coverage target"),
             size: wgpu::Extent3d {
-                width: Self::SIZE[0],
-                height: Self::SIZE[1],
+                width: size[0],
+                height: size[1],
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -538,6 +966,9 @@ impl CoverageGpu {
             queue,
             renderer,
             texture,
+            capture: None,
+            size,
+            scene_view,
         }
     }
 
@@ -547,7 +978,7 @@ impl CoverageGpu {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Frozen-frame region coverage readback"),
-            size: u64::from(Self::ROW_BYTES) * u64::from(Self::SIZE[1]),
+            size: u64::from(self.size[0] * 4) * u64::from(self.size[1]),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -556,7 +987,7 @@ impl CoverageGpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.renderer
-            .render_to(frame, &view, Self::SIZE, &mut encoder)
+            .render_to_with_view(frame, &view, self.size, self.scene_view, &mut encoder)
             .unwrap();
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -569,13 +1000,13 @@ impl CoverageGpu {
                 buffer: &readback,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(Self::ROW_BYTES),
-                    rows_per_image: Some(Self::SIZE[1]),
+                    bytes_per_row: Some(self.size[0] * 4),
+                    rows_per_image: Some(self.size[1]),
                 },
             },
             wgpu::Extent3d {
-                width: Self::SIZE[0],
-                height: Self::SIZE[1],
+                width: self.size[0],
+                height: self.size[1],
                 depth_or_array_layers: 1,
             },
         );
@@ -598,6 +1029,20 @@ impl CoverageGpu {
             .unwrap();
         let points = {
             let bytes = readback.slice(..).get_mapped_range().unwrap();
+            if let Some(path) = &self.capture {
+                let mut encoder = png::Encoder::new(
+                    std::fs::File::create_new(path).unwrap(),
+                    self.size[0],
+                    self.size[1],
+                );
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&bytes)
+                    .unwrap();
+            }
             bytes
                 .as_chunks::<4>()
                 .0
@@ -605,8 +1050,8 @@ impl CoverageGpu {
                 .enumerate()
                 .filter_map(|(pixel, rgba)| {
                     (rgba[3] > 0).then_some([
-                        (pixel as u32 % Self::SIZE[0]) as i32,
-                        (pixel as u32 / Self::SIZE[0]) as i32,
+                        (pixel as u32 % self.size[0]) as i32,
+                        (pixel as u32 / self.size[0]) as i32,
                     ])
                 })
                 .collect()

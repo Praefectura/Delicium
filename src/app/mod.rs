@@ -1,3 +1,4 @@
+mod attention;
 mod benchmark;
 pub mod cli;
 mod config;
@@ -25,11 +26,11 @@ use crate::{
     model::ModelKind,
     platform,
     renderer::{
-        Graphics, InstanceDraw, LEGACY, RenderFrame, SceneFrameOutcome, SceneView, desktop_view,
+        Graphics, InstanceDraw, LEGACY, RenderFrame, SceneFrameOutcome, SceneView, desktop_view_at,
         screen_to_world_with,
     },
     simulation::{
-        AssetId, InstanceId, Simulation, WANDER_EDGE_MARGIN, WanderEvent, WorldXBounds,
+        AssetId, InstanceId, Simulation, WANDER_EDGE_MARGIN, WanderEvent, WorldRect, WorldXBounds,
         render_asset,
     },
 };
@@ -37,7 +38,7 @@ use crate::{
 use self::{
     benchmark::{Benchmark, Phase, RegionDecision, SceneSample},
     cli::{BenchMode, Options, ParseResult},
-    hit_region::HitGeometry,
+    hit_region::{HitGeometry, RegionChange},
     loader::{CompletedLoad, LoadJob, LoadSource, Loader},
     ui::{ControlUi, InstanceSummary, UiCommand},
 };
@@ -50,8 +51,8 @@ const MAX_PENDING_LOADS: usize = loader::QUEUE_CAPACITY;
 /// below this distance the gesture is a click.
 const CLICK_TOLERANCE_PX: f32 = 4.0;
 
-/// Whether a press at `press` released at `release` was a click: the pointer
-/// stayed inside [`CLICK_TOLERANCE_PX`] of where it went down.
+/// Whether the current endpoint is inside the click tolerance. The gesture's
+/// latched `drag_moved` state also excludes any earlier excursion.
 fn is_click_press(press: [f32; 2], release: [f32; 2]) -> bool {
     let dx = release[0] - press[0];
     let dy = release[1] - press[1];
@@ -108,13 +109,97 @@ struct Runtime {
     graphics: Graphics,
     egui_context: egui::Context,
     egui_input: egui_winit::State,
-    /// The scene view the renderer, picking, dragging and the native hit
-    /// region all share. [`LEGACY`] for bounded scenes; the desktop formula
-    /// while the scene spans the primary monitor.
+    /// Shared by rendering, picking, dragging and native hit regions.
     scene_view: SceneView,
-    /// Whether the scene window spans the primary monitor (ordinary launch)
-    /// rather than a bounded explicit `--overlay-size` window.
-    desktop_scene: bool,
+    /// The startup layout; bounded launches do not use desktop constraints.
+    desktop: Option<DesktopLayout>,
+}
+
+struct DesktopLayout {
+    bounds: platform::DesktopRect,
+    primary: platform::DesktopRect,
+    monitors: Vec<platform::DesktopRect>,
+    scale: f32,
+}
+
+impl DesktopLayout {
+    fn new(
+        primary: platform::DesktopRect,
+        monitors: Vec<platform::DesktopRect>,
+        scale: f32,
+    ) -> Result<Self, String> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err("Invalid primary monitor scale".into());
+        }
+        let bounds = platform::desktop_bounding_rect(&monitors)?;
+        Ok(Self {
+            bounds,
+            primary,
+            monitors,
+            scale,
+        })
+    }
+
+    fn view(&self) -> SceneView {
+        self.view_at(self.bounds)
+    }
+
+    fn view_at(&self, rect: platform::DesktopRect) -> SceneView {
+        let center_offset = (i64::from(rect.left) + i64::from(rect.right)
+            - i64::from(self.primary.left)
+            - i64::from(self.primary.right)) as f32
+            * 0.5;
+        let below_primary = (i64::from(rect.bottom) - i64::from(self.primary.bottom)) as f32;
+        desktop_view_at(rect.size().height, self.scale, center_offset, below_primary)
+    }
+
+    fn window_view(&self, window: &Window) -> Result<SceneView, String> {
+        let position = window.outer_position().map_err(|error| error.to_string())?;
+        let rect = platform::DesktopRect::from_physical(position, window.inner_size())?;
+        Ok(self.view_at(rect))
+    }
+
+    fn regions(&self) -> Vec<WorldRect> {
+        let view = self.view();
+        let size = self.bounds.size();
+        self.monitors
+            .iter()
+            .map(|rect| {
+                let top_left = screen_to_world_with(
+                    [
+                        (i64::from(rect.left) - i64::from(self.bounds.left)) as f32,
+                        (i64::from(rect.top) - i64::from(self.bounds.top)) as f32,
+                    ],
+                    [size.width, size.height],
+                    view,
+                );
+                let bottom_right = screen_to_world_with(
+                    [
+                        (i64::from(rect.right) - i64::from(self.bounds.left)) as f32,
+                        (i64::from(rect.bottom) - i64::from(self.bounds.top)) as f32,
+                    ],
+                    [size.width, size.height],
+                    view,
+                );
+                WorldRect {
+                    left: top_left[0],
+                    right: bottom_right[0],
+                    bottom: bottom_right[1],
+                    top: top_left[1],
+                }
+            })
+            .collect()
+    }
+
+    /// Compare first: DPI/resize callbacks must not generate a resize loop.
+    fn restore_window(&self, window: &Window) {
+        if window.outer_position().ok() != Some(self.bounds.position()) {
+            window.set_outer_position(self.bounds.position());
+        }
+        if window.inner_size() != self.bounds.size() {
+            let _ = window.request_inner_size(self.bounds.size());
+        }
+    }
 }
 
 enum Operation {
@@ -140,13 +225,13 @@ enum RegionMode {
 }
 
 /// Horizontal world bounds of a scene view at the given physical size,
-/// matching [`screen_to_world_with`]: `x = ±span / 2 * aspect`.
+/// matching [`screen_to_world_with`]: `x = center_x ± span / 2 * aspect`.
 fn wander_bounds(view: SceneView, size: PhysicalSize<u32>) -> WorldXBounds {
     let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
     let half = view.span * 0.5 * aspect;
     WorldXBounds {
-        left: -half,
-        right: half,
+        left: view.center_x - half,
+        right: view.center_x + half,
     }
 }
 
@@ -199,7 +284,9 @@ struct HitRegionCache {
 /// Frames between installs under sustained change, by current polygon count.
 ///
 /// The installed region may lag the silhouette by up to `cadence - 1` dirty
-/// frames; `region_cadence` is 1 below 2048 polygons, so the desktop
+/// frames only while movement stays within the safe padding budget; larger
+/// movement and structural changes install immediately. `region_cadence` is
+/// 1 below 2048 polygons, so the desktop
 /// (four instances, ~650 polygons) and every GUI acceptance script keep the
 /// historical install-every-changed-frame behavior. The thresholds sit well
 /// clear of the measured polygon counts (648 / 2616 / 5232 / 10512), so a
@@ -215,6 +302,32 @@ fn region_cadence(polygons: usize) -> u32 {
 }
 
 impl HitRegionCache {
+    fn decision(&mut self, current: &HitGeometry) -> RegionDecision {
+        let Some(previous) = &self.geometry else {
+            return RegionDecision::Rebuilt;
+        };
+        if self.force_install {
+            return RegionDecision::Rebuilt;
+        }
+        match current.change_since(previous) {
+            RegionChange::Immediate => RegionDecision::Rebuilt,
+            RegionChange::Unchanged => {
+                self.note_unchanged();
+                RegionDecision::Reused
+            }
+            RegionChange::WithinMargin => {
+                // Corresponding raw topology is unchanged. Reuse the actual
+                // installed count without materializing a deferred candidate.
+                let polygons = previous.polygons().len();
+                if self.note_changed(polygons) {
+                    RegionDecision::Rebuilt
+                } else {
+                    RegionDecision::Deferred
+                }
+            }
+        }
+    }
+
     /// The fresh geometry matches the installed baseline: nothing to deliver,
     /// so the throttle no longer owes an install.
     fn note_unchanged(&mut self) {
@@ -271,11 +384,19 @@ struct Application {
     latest_replacement: HashMap<InstanceId, u64>,
     sources: HashMap<InstanceId, LoadSource>,
     examples: [Option<AssetId>; 4],
+    /// The bundled Bangboo asset loaded by `--bangboo`; kept alive beyond its
+    /// instances so the controls can add another pet without a reload. It
+    /// never occupies one of the four example slots, whose meaning is pinned
+    /// by the smoke and benchmark workloads.
+    bangboo_asset: Option<AssetId>,
     next_request: u64,
     cursor: [f32; 2],
     /// Cursor position where the current drag gesture went down; only set
     /// while a drag is live. Release uses it to tell a click from a drag.
     press_cursor: Option<[f32; 2]>,
+    /// Latched once the pointer crosses the click tolerance, even if it returns.
+    drag_moved: bool,
+    attention_poll: attention::AttentionPoll,
     dragging: Option<(InstanceId, Vec3)>,
     /// The region mode a drag suspended (`Pixel`), restored on the first
     /// frame after the drag ends.
@@ -308,10 +429,12 @@ impl Application {
     fn new(options: Options) -> Result<Self, String> {
         let now = Instant::now();
         let benchmark = options.bench.clone().map(Benchmark::new);
+        let mut simulation = Simulation::new();
+        simulation.set_attention_enabled(!options.smoke_test && benchmark.is_none());
         Ok(Self {
             options,
             runtime: None,
-            simulation: Simulation::new(),
+            simulation,
             loader: Loader::new()?,
             ui: ControlUi::default(),
             pending: HashMap::new(),
@@ -319,9 +442,12 @@ impl Application {
             latest_replacement: HashMap::new(),
             sources: HashMap::new(),
             examples: [None; 4],
+            bangboo_asset: None,
             next_request: 1,
             cursor: [0.0; 2],
             press_cursor: None,
+            drag_moved: false,
+            attention_poll: attention::AttentionPoll::new(now),
             dragging: None,
             drag_region: None,
             hit_region: HitRegionCache {
@@ -358,11 +484,27 @@ impl Application {
         let monitor_size = monitor
             .as_ref()
             .map(|monitor| monitor.size().to_logical::<f64>(scale));
-        // Ordinary launch (no --overlay-size) makes the scene cover the
-        // primary monitor's physical rectangle; an explicit --overlay-size,
-        // --smoke-test and --bench keep the bounded window (normalized in the
-        // CLI). Without a primary monitor the bounded path runs instead.
-        let desktop_scene = self.options.overlay_size.is_none() && monitor.is_some();
+        // Ordinary launch uses a fixed snapshot of all physical monitors.
+        // Explicit sizes, smoke and bench retain their bounded window path.
+        let desktop = if self.options.overlay_size.is_none() {
+            let monitors = event_loop
+                .available_monitors()
+                .map(|monitor| {
+                    platform::DesktopRect::from_physical(monitor.position(), monitor.size())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            match (monitor.as_ref(), monitors.is_empty()) {
+                (Some(primary), false) => Some(DesktopLayout::new(
+                    platform::DesktopRect::from_physical(primary.position(), primary.size())?,
+                    monitors,
+                    scale as f32,
+                )?),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let desktop_scene = desktop.is_some();
         let requested = self.options.overlay_size.unwrap_or([960, 640]);
         let width = monitor_size.map_or(requested[0] as f64, |size| {
             (requested[0] as f64).min((size.width - 430.0).max(320.0))
@@ -370,24 +512,12 @@ impl Application {
         let height = monitor_size.map_or(requested[1] as f64, |size| {
             (requested[1] as f64).min((size.height - 110.0).max(240.0))
         });
-        let overlay = Arc::new(if desktop_scene {
-            let monitor = monitor.as_ref().unwrap();
-            let size = monitor.size();
-            // The scene must not cover the monitor exactly: a topmost window
-            // with the monitor's own rect reads as fullscreen to the shell,
-            // which then suppresses the auto-hide taskbar reveal. Leave a
-            // small gap on the taskbar's edge (bottom if the shell query
-            // fails, the common docking edge).
-            let edge = platform::taskbar_edge().unwrap_or(platform::TaskbarEdge::Bottom);
-            let (position, scene_size) = platform::desktop_scene_rect(
-                monitor.position(),
-                size,
-                edge,
-                platform::TASKBAR_GAP_PX,
-            );
+        let overlay = Arc::new(if let Some(layout) = &desktop {
+            let position = layout.bounds.position();
+            let scene_size = layout.bounds.size();
             log::info!(
-                "desktop scene edge={:?} position=({}, {}) size={}x{}",
-                edge,
+                "desktop scene monitors={} position=({}, {}) size={}x{}",
+                layout.monitors.len(),
                 position.x,
                 position.y,
                 scene_size.width,
@@ -422,11 +552,16 @@ impl Application {
                 ))
                 .map_err(|error| error.to_string())?
         });
-        let scene_view = if desktop_scene {
-            desktop_view(overlay.inner_size().height, overlay.scale_factor() as f32)
-        } else {
-            LEGACY
-        };
+        if let Some(layout) = &desktop {
+            platform::mark_non_fullscreen(&overlay)?;
+            layout.restore_window(&overlay);
+            log::info!(
+                "desktop non_fullscreen=true primary_scale={:.4} center_x={:.6}",
+                layout.scale,
+                layout.view().center_x
+            );
+        }
+        let scene_view = desktop.as_ref().map_or(LEGACY, DesktopLayout::view);
         log::info!(
             "scene_view mode={} span={:.6} bottom={:.6}",
             if desktop_scene { "desktop" } else { "bounded" },
@@ -508,7 +643,7 @@ impl Application {
             egui_context,
             egui_input,
             scene_view,
-            desktop_scene,
+            desktop,
         });
         // The icon must not appear while a benchmark drives the windows;
         // scripts and harness runs assume closing a window ends the process.
@@ -532,6 +667,9 @@ impl Application {
         );
         {
             let runtime = self.runtime.as_ref().unwrap();
+            self.simulation
+                .set_wander_regions(runtime.desktop.as_ref().map(DesktopLayout::regions))
+                .map_err(|error| error.to_string())?;
             sync_wander_bounds(
                 &mut self.simulation,
                 self.options.wander,
@@ -570,6 +708,15 @@ impl Application {
                 LoadSource::Example3d,
                 Operation::Spawn {
                     positions: benchmark::positions(options.instances, ModelKind::Skeleton3d),
+                },
+            )?;
+        } else if self.options.bangboo {
+            // The pet scene: two instances of the same bundled asset at a
+            // fixed pair of positions, close enough to find each other.
+            self.submit_load(
+                LoadSource::Bangboo,
+                Operation::Spawn {
+                    positions: vec![Vec3::new(-0.65, 0.15, 0.0), Vec3::new(0.65, 0.15, 0.0)],
                 },
             )?;
         } else if !self.options.models.is_empty() {
@@ -806,6 +953,7 @@ impl Application {
                 .map_err(|error| error.to_string()),
         };
         let succeeded = result.is_ok();
+        self.note_bangboo_load(&completed.source, asset, succeeded);
         match result {
             Ok(()) => self.ui.status = format!("Loaded {}", model.name),
             Err(error) => self.report_error(error),
@@ -819,8 +967,20 @@ impl Application {
         }
     }
 
+    /// Remembers the bundled pet asset once a Bangboo load has actually been
+    /// committed, so the cache outlives its instances and the controls can
+    /// add another pet without a reload. Failed loads never reach this point.
+    fn note_bangboo_load(&mut self, source: &LoadSource, asset: AssetId, succeeded: bool) {
+        if succeeded && matches!(source, LoadSource::Bangboo) {
+            self.bangboo_asset.get_or_insert(asset);
+        }
+    }
+
     fn collect_assets(&mut self) {
-        let keep: Vec<_> = self.examples.iter().flatten().copied().collect();
+        let mut keep: Vec<_> = self.examples.iter().flatten().copied().collect();
+        if let Some(asset) = self.bangboo_asset {
+            keep.push(asset);
+        }
         let removed = self.simulation.collect_unused_assets(&keep);
         if let Some(runtime) = &mut self.runtime {
             for asset in removed {
@@ -852,6 +1012,29 @@ impl Application {
             return Err("Benchmark workload modified through the controls".into());
         }
         match command {
+            UiCommand::SpawnExample(kind)
+                if self.options.bangboo && kind == ModelKind::Skeleton3d =>
+            {
+                // The pet scene adds another Bangboo instead of the old robot.
+                let position = self.next_spawn_position();
+                if let Some(asset) = self.bangboo_asset {
+                    let instance = self
+                        .simulation
+                        .spawn(asset, position)
+                        .map_err(|error| error.to_string())?;
+                    self.sources.insert(instance, LoadSource::Bangboo);
+                    self.ui.selected = Some(instance);
+                    self.ui.status = "Added Bangboo".into();
+                    log::info!("spawn instance={instance} asset={asset} kind={kind}");
+                } else {
+                    self.submit_load(
+                        LoadSource::Bangboo,
+                        Operation::Spawn {
+                            positions: vec![position],
+                        },
+                    )?;
+                }
+            }
             UiCommand::SpawnExample(kind) => {
                 let (source, index) = match (kind, self.options.bench.is_some()) {
                     (ModelKind::Sprite2d, true) => (LoadSource::Example2d, 0),
@@ -954,6 +1137,7 @@ impl Application {
             .as_ref()
             .map(|b| SceneSample::new(b.phase, elapsed));
         self.ui.frame_ms = self.ui.frame_ms * 0.9 + elapsed.as_secs_f32() * 1000.0 * 0.1;
+        self.poll_attention(now);
         let timer = self.bench_clock();
         let advanced = self.simulation.advance(elapsed);
         if let Some(sample) = &mut self.scene_sample {
@@ -980,6 +1164,29 @@ impl Application {
                     log::info!("wander arrive instance={instance} x={x:.3} y={y:.3}")
                 }
             }
+        }
+        for event in self.simulation.drain_action_events() {
+            log::info!(
+                "action change instance={} action={} restart={}",
+                event.instance,
+                event.action.as_str(),
+                event.restarted
+            );
+        }
+        for event in self.simulation.drain_social_events() {
+            log::info!(
+                "social pair first={} second={} phase={}",
+                event.first,
+                event.second,
+                event.phase.as_str()
+            );
+        }
+        for event in self.simulation.drain_attention_events() {
+            log::info!(
+                "attention change instance={} source={}",
+                event.instance,
+                event.source.as_str()
+            );
         }
         self.ui.tick_count = self.simulation.tick_count();
         self.ui.interactions = self.simulation.interactions().len();
@@ -1383,6 +1590,26 @@ impl Application {
 
     // -- hit region ----------------------------------------------------------
 
+    fn refresh_hit_region_after_resize(&mut self) -> Result<(), String> {
+        self.hit_region.geometry = None;
+        self.hit_region.dirty_frames = 0;
+        self.hit_region.force_install = true;
+        // A drag deliberately keeps whole-window capture. Fallback must stay
+        // click-through; only the pixel mode has geometry tied to this view.
+        if self.hit_region.mode == RegionMode::Pixel {
+            let runtime = self.runtime.as_ref().ok_or("Windows are not ready")?;
+            let size = runtime.overlay.inner_size();
+            if size.width == 0 || size.height == 0 {
+                if let Err(error) = platform::set_hit_region(&runtime.overlay, &[]) {
+                    self.enter_fallback(format!("Cannot clear resized hit regions: {error}"))?;
+                }
+            } else {
+                self.sync_hit_region_now()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Installs the target mode's region immediately, for mode switches and
     /// the start of a drag. A failed build or native call enters the
     /// click-through fallback and returns `Ok`; an error is only returned
@@ -1435,7 +1662,7 @@ impl Application {
         let size = [size.width, size.height];
         let view = runtime.scene_view;
         let timer = self.bench_clock();
-        let collected = HitGeometry::from_frame_with_view(&self.simulation, frame, size, view);
+        let collected = HitGeometry::collect_frame_with_view(&self.simulation, frame, size, view);
         if let Some(sample) = &mut self.scene_sample {
             sample.hit_geometry = timer.map(|timer| timer.elapsed());
         }
@@ -1450,32 +1677,29 @@ impl Application {
             }
         };
         let timer = self.bench_clock();
-        let unchanged = self
-            .hit_region
-            .geometry
-            .as_ref()
-            .is_some_and(|previous| !geometry.changed_since(previous));
+        let decision = self.hit_region.decision(&geometry);
         if let Some(sample) = &mut self.scene_sample {
             sample.hit_compare = timer.map(|timer| timer.elapsed());
-            sample.polygons = geometry.polygons().len();
+            sample.polygons = self
+                .hit_region
+                .geometry
+                .as_ref()
+                .map_or(0, |previous| previous.polygons().len());
+            sample.region = decision;
         }
-        if unchanged {
-            self.hit_region.note_unchanged();
-            if let Some(sample) = &mut self.scene_sample {
-                sample.region = RegionDecision::Reused;
+        match decision {
+            RegionDecision::Reused => {
+                log::trace!("hit_region mode=pixel unchanged");
+                return Ok(());
             }
-            log::trace!("hit_region mode=pixel unchanged");
-            return Ok(());
-        }
-        if !self.hit_region.note_changed(geometry.polygons().len()) {
-            if let Some(sample) = &mut self.scene_sample {
-                sample.region = RegionDecision::Deferred;
+            RegionDecision::Deferred => {
+                log::trace!(
+                    "hit_region mode=pixel deferred dirty_frames={}",
+                    self.hit_region.dirty_frames
+                );
+                return Ok(());
             }
-            log::trace!(
-                "hit_region mode=pixel deferred dirty_frames={}",
-                self.hit_region.dirty_frames
-            );
-            return Ok(());
+            _ => {}
         }
         if let Err(error) = self.install_pixel_geometry(geometry) {
             if let Some(sample) = &mut self.scene_sample {
@@ -1491,11 +1715,19 @@ impl Application {
     /// Installs `geometry` as the window region and makes it the new
     /// comparison baseline. Mode transitions log at info; per-frame rebuilds
     /// of an already-installed mode log at trace.
-    fn install_pixel_geometry(&mut self, geometry: HitGeometry) -> Result<(), String> {
+    fn install_pixel_geometry(&mut self, mut geometry: HitGeometry) -> Result<(), String> {
         let Some(runtime) = &self.runtime else {
             return Ok(());
         };
-        let timer = self.scene_sample.as_ref().map(|_| Instant::now());
+        let timer = self.bench_clock();
+        geometry.materialize()?;
+        if let Some(elapsed) = timer.map(|timer| timer.elapsed())
+            && let Some(sample) = &mut self.scene_sample
+        {
+            sample.hit_geometry = Some(sample.hit_geometry.unwrap_or_default() + elapsed);
+            sample.polygons = geometry.polygons().len();
+        }
+        let timer = self.bench_clock();
         let installed = platform::set_hit_region(&runtime.overlay, geometry.polygons());
         if let Some(sample) = &mut self.scene_sample {
             sample.native_region_build_install = timer.map(|timer| timer.elapsed());
@@ -1545,15 +1777,39 @@ impl Application {
     /// dragged character reports no error. Every other case resumes with a
     /// fresh idle pause, so a released character never leaves immediately.
     fn end_drag(&mut self) {
-        // Every drag-terminating path (release, cursor leaving the overlay,
-        // focus loss, mode switch, removal) goes through here, so the press
-        // origin must be dropped as well.
+        self.finish_drag(false);
+    }
+
+    fn note_drag_motion(&mut self) {
+        if self.drag_moved
+            || self
+                .press_cursor
+                .is_none_or(|press| is_click_press(press, self.cursor))
+        {
+            return;
+        }
+        if let Some((instance, _)) = self.dragging {
+            self.drag_moved = true;
+            if let Err(error) = self.simulation.begin_drag_feedback(instance) {
+                self.report_error(error.to_string());
+            }
+        }
+    }
+
+    fn finish_drag(&mut self, released: bool) {
         self.press_cursor = None;
+        let moved = std::mem::take(&mut self.drag_moved);
         let Some((instance, _)) = self.dragging.take() else {
             return;
         };
         if self.simulation.instance(instance).is_none() {
             return;
+        }
+        if let Err(error) = self
+            .simulation
+            .end_drag_feedback(instance, released && moved)
+        {
+            self.report_error(error.to_string());
         }
         if let Err(error) = self.simulation.resume_wander(instance) {
             self.report_error(error.to_string());
@@ -1644,7 +1900,7 @@ impl Application {
                 .render_frame()
                 .map_err(|error| error.to_string())?,
         };
-        HitGeometry::from_frame_with_view(&self.simulation, &frame, size, view)
+        HitGeometry::collect_frame_with_view(&self.simulation, &frame, size, view)
     }
 
     /// Region building or installation failed: clear the region, make the
@@ -1750,22 +2006,40 @@ impl ApplicationHandler for Application {
                         benchmark.fail("Benchmark window dimensions changed".into());
                     }
                 }
-                if is_overlay {
-                    runtime.scene_view = if runtime.desktop_scene {
-                        desktop_view(size.height, runtime.overlay.scale_factor() as f32)
-                    } else {
-                        LEGACY
-                    };
+                let size = if is_overlay && size.width > 0 && size.height > 0 {
+                    if let Some(layout) = &runtime.desktop {
+                        layout.restore_window(&runtime.overlay);
+                        match layout.window_view(&runtime.overlay) {
+                            Ok(view) => runtime.scene_view = view,
+                            Err(error) => {
+                                self.fail(error, event_loop);
+                                return;
+                            }
+                        }
+                    }
+                    let actual = runtime.overlay.inner_size();
                     sync_wander_bounds(
                         &mut self.simulation,
                         self.options.wander,
                         runtime.scene_view,
-                        size,
+                        actual,
                     );
+                    actual
+                } else {
+                    size
+                };
+                if let Err(error) = runtime.graphics.resize(window_id, size) {
+                    self.fail(error.to_string(), event_loop);
+                    return;
                 }
-                runtime.graphics.resize(window_id, size);
+                if is_overlay && let Err(error) = self.refresh_hit_region_after_resize() {
+                    self.fail(error, event_loop);
+                }
             }
-            WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::ScaleFactorChanged {
+                mut inner_size_writer,
+                ..
+            } => {
                 if let Some(benchmark) = &mut self.benchmark
                     && benchmark.phase != Phase::Setup
                 {
@@ -1776,22 +2050,70 @@ impl ApplicationHandler for Application {
                 } else {
                     &runtime.overlay
                 };
-                if !is_control {
-                    let size = window.inner_size();
-                    runtime.scene_view = if runtime.desktop_scene {
-                        desktop_view(size.height, window.scale_factor() as f32)
-                    } else {
-                        LEGACY
-                    };
+                if is_overlay {
+                    if let Some(layout) = &runtime.desktop {
+                        if let Err(error) =
+                            inner_size_writer.request_inner_size(layout.bounds.size())
+                        {
+                            self.fail(
+                                format!("Cannot preserve desktop size after DPI change: {error}"),
+                                event_loop,
+                            );
+                            return;
+                        }
+                        layout.restore_window(window);
+                        if window.inner_size().width > 0 && window.inner_size().height > 0 {
+                            match layout.window_view(window) {
+                                Ok(view) => runtime.scene_view = view,
+                                Err(error) => {
+                                    self.fail(error, event_loop);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    sync_wander_bounds(
+                        &mut self.simulation,
+                        self.options.wander,
+                        runtime.scene_view,
+                        window.inner_size(),
+                    );
+                }
+                if let Err(error) = runtime.graphics.resize(window_id, window.inner_size()) {
+                    self.fail(error.to_string(), event_loop);
+                    return;
+                }
+                window.request_redraw();
+                if is_overlay && let Err(error) = self.refresh_hit_region_after_resize() {
+                    self.fail(error, event_loop);
+                }
+            }
+            WindowEvent::Moved(_) if is_overlay && runtime.desktop.is_some() => {
+                let layout = runtime.desktop.as_ref().unwrap();
+                layout.restore_window(&runtime.overlay);
+                let size = runtime.overlay.inner_size();
+                if size.width > 0 && size.height > 0 {
+                    match layout.window_view(&runtime.overlay) {
+                        Ok(view) => runtime.scene_view = view,
+                        Err(error) => {
+                            self.fail(error, event_loop);
+                            return;
+                        }
+                    }
                     sync_wander_bounds(
                         &mut self.simulation,
                         self.options.wander,
                         runtime.scene_view,
                         size,
                     );
+                    if let Err(error) = runtime.graphics.resize(window_id, size) {
+                        self.fail(error.to_string(), event_loop);
+                        return;
+                    }
+                    if let Err(error) = self.refresh_hit_region_after_resize() {
+                        self.fail(error, event_loop);
+                    }
                 }
-                runtime.graphics.resize(window_id, window.inner_size());
-                window.request_redraw();
             }
             WindowEvent::Focused(true) if is_overlay => platform::raise_controls(&runtime.control),
             WindowEvent::Focused(false) if is_overlay => self.end_drag(),
@@ -1825,6 +2147,7 @@ impl ApplicationHandler for Application {
             }
             WindowEvent::CursorMoved { position, .. } if is_overlay => {
                 self.cursor = [position.x as f32, position.y as f32];
+                self.note_drag_motion();
                 if let Some((instance, offset)) = self.dragging {
                     let probe = self
                         .runtime
@@ -1870,9 +2193,10 @@ impl ApplicationHandler for Application {
                     // no travel is a click (a poke), not a drag; classify
                     // before ending the drag, which clears the state.
                     let clicked = self.dragging.is_some()
+                        && !self.drag_moved
                         && press.is_some_and(|press| is_click_press(press, self.cursor));
                     let released = self.dragging;
-                    self.end_drag();
+                    self.finish_drag(true);
                     if clicked && let Some((instance, _)) = released {
                         self.poke_character(instance);
                     }
@@ -1898,6 +2222,7 @@ impl ApplicationHandler for Application {
                     self.dragging =
                         Some((instance, info.position - Vec3::new(point[0], point[1], 0.0)));
                     self.press_cursor = Some(self.cursor);
+                    self.drag_moved = false;
                     self.ui.selected = Some(instance);
                     // Park the character: a press must not let it walk away
                     // from under the pointer, even if the pointer holds still
@@ -2039,6 +2364,90 @@ fn pose_sample(frame: &RenderFrame) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn monitor_rect(x: i32, y: i32, width: u32, height: u32) -> platform::DesktopRect {
+        platform::DesktopRect::from_physical(
+            PhysicalPosition::new(x, y),
+            PhysicalSize::new(width, height),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn staggered_desktop_preserves_primary_anchor_and_monitor_regions() {
+        let primary = monitor_rect(0, 0, 2560, 1600);
+        let secondary = monitor_rect(2560, -511, 1600, 2560);
+        let layout = DesktopLayout::new(primary, vec![primary, secondary], 1.5).unwrap();
+        let view = layout.view();
+        assert_eq!(view.span, 12.0);
+        assert_eq!(view.center_x, 3.75);
+        assert!((view.bottom + 3.0046875).abs() < 0.00001);
+        let bounds = wander_bounds(view, layout.bounds.size());
+        assert!((bounds.left + 6.0).abs() < 0.00001);
+        assert!((bounds.right - 13.5).abs() < 0.00001);
+        for (world_x, screen_x) in [
+            (-2.4, 768.0),
+            (-0.8, 1109.3334),
+            (0.8, 1450.6666),
+            (2.4, 1792.0),
+        ] {
+            let point = crate::renderer::world_to_screen_with([world_x, 0.15], [4160, 2560], view);
+            assert!((point[0] - screen_x).abs() < 0.001);
+            assert!((point[1] - 511.0 - 1376.0).abs() < 0.001);
+        }
+        let regions = layout.regions();
+        assert_eq!(regions.len(), 2);
+        assert!((regions[0].right - regions[1].left).abs() < 0.00001);
+        for screen_y in [-200.0, 800.0, 1800.0] {
+            let y = screen_to_world_with([0.0, screen_y + 511.0], [4160, 2560], view)[1];
+            let visible: Vec<_> = regions
+                .iter()
+                .filter(|rect| rect.bottom < y && y <= rect.top)
+                .collect();
+            assert_eq!(visible.len(), if screen_y == 800.0 { 2 } else { 1 });
+            if visible.len() == 1 {
+                assert!((visible[0].left - 6.0).abs() < 0.00001);
+                assert!((visible[0].right - 13.5).abs() < 0.00001);
+            }
+        }
+    }
+
+    #[test]
+    fn single_negative_monitor_degenerates_to_original_desktop_view() {
+        let primary = monitor_rect(-1920, -300, 1920, 1080);
+        let layout = DesktopLayout::new(primary, vec![primary], 1.25).unwrap();
+        assert_eq!(layout.view(), crate::renderer::desktop_view(1080, 1.25));
+        assert_eq!(layout.bounds, primary);
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(DesktopLayout::new(primary, vec![primary], scale).is_err());
+        }
+        assert!(DesktopLayout::new(primary, vec![], 1.0).is_err());
+    }
+
+    #[test]
+    fn negative_left_and_upper_monitor_does_not_shift_primary_world_positions() {
+        let primary = monitor_rect(100, 200, 1920, 1080);
+        let secondary = monitor_rect(-1180, -824, 1280, 1024);
+        let layout = DesktopLayout::new(primary, vec![primary, secondary], 1.25).unwrap();
+        let size = layout.bounds.size();
+        let old = crate::renderer::desktop_view(1080, 1.25);
+        for world in [[-2.4, 0.15], [0.0, 2.0], [2.4, -0.5]] {
+            let before = crate::renderer::world_to_screen_with(world, [1920, 1080], old);
+            let after = crate::renderer::world_to_screen_with(
+                world,
+                [size.width, size.height],
+                layout.view(),
+            );
+            assert!(
+                (after[0] + layout.bounds.left as f32 - before[0] - primary.left as f32).abs()
+                    < 0.001
+            );
+            assert!(
+                (after[1] + layout.bounds.top as f32 - before[1] - primary.top as f32).abs()
+                    < 0.001
+            );
+        }
+    }
     use crate::model::{LoadLimits, load_model_bytes};
 
     fn application_with_character() -> (Application, InstanceId, AssetId) {
@@ -2067,6 +2476,87 @@ mod tests {
         // Diagonal travel compares the true distance: 2.8^2 + 2.8^2 < 16.
         assert!(is_click_press([100.0, 200.0], [102.8, 202.8]));
         assert!(!is_click_press([100.0, 200.0], [103.0, 203.0]));
+    }
+
+    #[test]
+    fn crossing_click_tolerance_is_latched_even_after_returning_to_press() {
+        let (mut app, instance, _) = application_with_character();
+        app.dragging = Some((instance, Vec3::ZERO));
+        app.press_cursor = Some([100.0, 200.0]);
+        app.cursor = [103.9, 200.0];
+        app.note_drag_motion();
+        assert!(!app.drag_moved);
+        assert!(
+            !app.simulation
+                .attention_snapshot(instance)
+                .unwrap()
+                .dragging
+        );
+        app.cursor = [104.0, 200.0];
+        app.note_drag_motion();
+        assert!(app.drag_moved);
+        assert!(
+            app.simulation
+                .attention_snapshot(instance)
+                .unwrap()
+                .dragging
+        );
+        app.cursor = [100.0, 200.0];
+        app.note_drag_motion();
+        assert!(is_click_press(app.press_cursor.unwrap(), app.cursor));
+        assert!(
+            app.drag_moved,
+            "returning to the origin must not turn a drag into a poke"
+        );
+        app.finish_drag(true);
+        let state = app.simulation.attention_snapshot(instance).unwrap();
+        assert!(!state.dragging);
+        assert!(state.settle_remaining > 0.0 && state.settle_remaining <= 0.2);
+        assert!(!app.drag_moved);
+        assert!(app.press_cursor.is_none() && app.dragging.is_none());
+    }
+
+    #[test]
+    fn all_drag_cancellation_paths_clear_feedback_without_a_release_settle() {
+        let (mut app, instance, _) = application_with_character();
+        app.simulation.suspend_wander(instance).unwrap();
+        app.dragging = Some((instance, Vec3::ZERO));
+        app.press_cursor = Some([10.0, 20.0]);
+        app.cursor = [30.0, 20.0];
+        app.note_drag_motion();
+        app.end_drag();
+        let state = app.simulation.attention_snapshot(instance).unwrap();
+        assert!(!state.dragging);
+        assert_eq!(state.settle_remaining, 0.0);
+        assert_eq!(state.shear_x, 0.0);
+        assert_eq!(state.scale_y, 1.0);
+        assert!(!app.drag_moved);
+        assert!(app.press_cursor.is_none() && app.dragging.is_none());
+        app.end_drag();
+        assert!(app.fatal.is_none());
+    }
+
+    #[test]
+    fn finishing_an_unmoved_press_or_removed_character_never_settles() {
+        let (mut app, instance, _) = application_with_character();
+        app.dragging = Some((instance, Vec3::ZERO));
+        app.press_cursor = Some([0.0; 2]);
+        app.finish_drag(true);
+        assert_eq!(
+            app.simulation
+                .attention_snapshot(instance)
+                .unwrap()
+                .settle_remaining,
+            0.0
+        );
+        app.dragging = Some((instance, Vec3::ZERO));
+        app.press_cursor = Some([0.0; 2]);
+        app.drag_moved = true;
+        assert!(app.simulation.despawn(instance));
+        app.finish_drag(true);
+        assert!(!app.drag_moved);
+        assert!(app.press_cursor.is_none() && app.dragging.is_none());
+        assert!(app.ui.last_error.is_none());
     }
 
     #[test]
@@ -2144,6 +2634,46 @@ mod tests {
         for index in [0, 1, 3] {
             assert!(app.simulation.asset(app.examples[index].unwrap()).is_some());
         }
+    }
+
+    #[test]
+    fn bangboo_cache_records_only_committed_bangboo_loads() {
+        let mut app = Application::new(Options::default()).unwrap();
+        // A failed load must not pollute the cache.
+        app.note_bangboo_load(&LoadSource::Bangboo, 7, false);
+        assert_eq!(app.bangboo_asset, None);
+        // A successful load of any other source is not the pet scene.
+        app.note_bangboo_load(&LoadSource::Example2d, 7, true);
+        assert_eq!(app.bangboo_asset, None);
+        // A committed Bangboo load is remembered exactly once.
+        app.note_bangboo_load(&LoadSource::Bangboo, 7, true);
+        assert_eq!(app.bangboo_asset, Some(7));
+        app.note_bangboo_load(&LoadSource::Bangboo, 8, true);
+        assert_eq!(app.bangboo_asset, Some(7));
+    }
+
+    #[test]
+    fn bangboo_cache_survives_instance_collection_and_never_takes_a_slot() {
+        let mut app = Application::new(Options::default()).unwrap();
+        let model = load_model_bytes(
+            include_bytes!("../../assets/examples/puppet2d.dmodel.json"),
+            &LoadLimits::default(),
+        )
+        .unwrap();
+        let asset = app.simulation.insert_asset(model).unwrap();
+        let instance = app.simulation.spawn(asset, Vec3::ZERO).unwrap();
+        app.bangboo_asset = Some(asset);
+        // The cache is kept alive with no surviving instance...
+        app.simulation.despawn(instance);
+        app.collect_assets();
+        assert!(app.simulation.asset(asset).is_some());
+        // ...but only while it is still cached: dropping it releases the asset
+        // and none of the four example slots ever held it.
+        assert!(app.examples.iter().all(|slot| slot.is_none()));
+        app.bangboo_asset = None;
+        app.collect_assets();
+        assert!(app.simulation.asset(asset).is_none());
+        assert_eq!(app.simulation.asset_count(), 0);
     }
 
     #[test]
