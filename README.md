@@ -170,20 +170,28 @@ summary above.
 
 ### Status
 
-Pre-release, single platform, no tagged release yet. The following is verified locally and
-is *not* a claim about the published pipeline:
+Pre-release, single platform, one tagged release (`v0.1.0`). What has actually been run:
 
-- **Verified.** Offline gate green: `fmt --check`, `clippy --all-targets -D warnings`,
-  222 library tests (19 ignored by design), six non-GPU integration targets, eight
-  hardware-GPU tests, and a release build. Seven Windows GUI acceptance scripts pass.
-  The launcher/settings handshake was proved with a cross-process probe.
-- **Not yet run.** No tag has been pushed, so `.github/workflows/release.yml` has never
-  executed; no GitHub Release exists; the manifest
-  (`releases/latest/download/latest.json`) has never been fetched over the network. Every
-  install path in the tests used an in-memory fetcher or a local fixture. A complete
-  install-from-Release on a clean machine is still outstanding.
+- **Offline gate.** `fmt --check`, `clippy --all-targets -D warnings`, 222 library tests
+  (19 ignored by design), six non-GPU integration targets, eight hardware-GPU tests, and a
+  release build. Seven Windows GUI acceptance scripts pass. The launcher/settings handshake
+  was proved with a cross-process probe.
+- **Release pipeline.** Tag `v0.1.0` triggered `.github/workflows/release.yml` on
+  `windows-latest`; the run finished green and published three assets:
+  `delicium-launcher.exe`, `delicium.exe` and `latest.json`. An anonymous request to
+  `releases/latest/download/latest.json` returns the manifest, which redirects to
+  `objects.githubusercontent.com` and is followed by the client's WinHTTP redirect policy.
+- **Install from the published Release.** The launcher downloaded from the Release, pointed
+  at an empty installation root, fetched the manifest and the engine over the network,
+  verified SHA-256, installed `app/0.1.0/delicium.exe`, and ran it to a clean exit. The
+  on-disk engine hash matches the manifest. A second launch reported `Up to date (0.1.0)`
+  and did not reinstall.
+- **Still outstanding.** That end-to-end run happened on the development machine with an
+  isolated `DELICIUM_INSTALL_ROOT`, not on a pristine machine. Self-replacement of the
+  launcher image has not been exercised by a release that raises `min_launcher_version`,
+  because no such release exists yet. Dual-monitor acceptance is untested.
 
-Treat the updater as implemented and locally tested, not as battle-tested.
+Treat the updater as implemented and exercised end to end once, not as battle-tested.
 
 ### What is not here yet
 
@@ -264,12 +272,14 @@ with the rights holders.
 
 ### 验证状态
 
-预发布阶段，仅 Windows，尚无带 tag 的成品发布。以下是本机实测结论，**不构成**对已发布流水线的声明：
+预发布阶段，仅 Windows，已有一个带 tag 的发布（`v0.1.0`）。以下都是实际跑过的：
 
-- **已验证**：离线门全绿——`fmt --check`、`clippy --all-targets -D warnings`、222 项 lib 测试（19 项按设计忽略）、六个非 GPU 集成目标、八项硬件 GPU 测试与 release 构建；七套 Windows GUI 验收脚本通过；启动器与设置页的握手用跨进程探针实测通过。
-- **尚未运行**：没有推过 tag，`.github/workflows/release.yml` 从未执行；GitHub 上没有 Release；清单（`releases/latest/download/latest.json`）从未真正经网络获取。测试中的所有安装路径都走内存 fetcher 或本地 fixture。在干净机器上从 Release 完整安装一次仍未做。
+- **离线门**：`fmt --check`、`clippy --all-targets -D warnings`、222 项 lib 测试（19 项按设计忽略）、六个非 GPU 集成目标、八项硬件 GPU 测试与 release 构建；七套 Windows GUI 验收脚本通过；启动器与设置页的握手用跨进程探针实测通过。
+- **发布流水线**：推 tag `v0.1.0` 触发 `.github/workflows/release.yml` 在 `windows-latest` 上运行，结果全绿，发布三个资产：`delicium-launcher.exe`、`delicium.exe`、`latest.json`。未认证请求 `releases/latest/download/latest.json` 能拿到清单；该请求重定向到 `objects.githubusercontent.com`，由客户端的 WinHTTP 重定向策略跟随。
+- **从已发布 Release 安装**：把 Release 里的启动器下载到本机，指向一个空安装根，经网络取清单与引擎、校验 SHA-256、装入 `app/0.1.0/delicium.exe` 并运行至干净退出；落盘引擎哈希与清单一致。第二次启动报告 `Up to date (0.1.0)`，未重复安装。
+- **仍未完成**：上述端到端是在开发机上用隔离的 `DELICIUM_INSTALL_ROOT` 跑的，不是在全新机器上。启动器镜像自替换尚未被"提高 `min_launcher_version` 的发布"实际触发过，因为还不存在这样的发布。双屏实机验收未做。
 
-请把更新器理解为"已实现并在本地验证"，而不是"久经考验"。
+请把更新器理解为"已实现并端到端跑通过一次"，而不是"久经考验"。
 
 ### 尚未包含
 
