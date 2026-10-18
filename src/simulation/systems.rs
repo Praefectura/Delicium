@@ -1,17 +1,20 @@
 //! Schedule and systems that advance the simulation world one fixed step.
 //!
-//! One tick runs four systems, in this order:
+//! One tick runs six systems, in this order:
 //!
-//! 1. [`wander_step`]: every instance advances its idle/walk state machine
+//! 1. the social step pairs available participants before either can wander;
+//! 2. [`wander_step`]: every instance advances its idle/walk state machine
 //!    inside the current wander bounds and may move horizontally;
-//! 2. [`interaction_snapshot`]: an exclusive system that snapshots every
+//! 3. [`interaction_snapshot`]: an exclusive system that snapshots every
 //!    position in instance-id order, resolves the nearest neighbour inside
 //!    [`INTERACTION_RADIUS`](super::INTERACTION_RADIUS) for each instance and
 //!    eases the reaction weights; it runs after the walk so the snapshot and
 //!    the same frame's render agree on where every instance is;
-//! 3. [`reaction_step`]: ages every poke reaction by one step and turns 2D
+//! 4. [`reaction_step`]: ages every poke reaction by one step and turns 2D
 //!    instances toward their poke point while one is active;
-//! 4. [`advance_poses`]: a parallel-query system that samples animation
+//! 5. the attention step: an opt-in, deterministic presentation pass that is
+//!    a no-op while attention stays disabled;
+//! 6. [`advance_poses`]: a parallel-query system that samples animation
 //!    parameters or joint locals for every instance and advances the pose
 //!    ring (`prev <- curr <- sampled`).
 //!
@@ -33,11 +36,13 @@ use glam::Vec3;
 
 use crate::model::ModelKind;
 
+use super::actions::{self, ActionEvents, ActionState};
 use super::components::{
     InstanceTag, InteractionState, InteractionsRes, ModelHandle, PokeReaction, PoseState, Position,
-    TickStatus, TimeState, WanderBoundsRes, WanderEventsRes, WanderPhase, WanderState,
+    TickStatus, TimeState, WanderBoundsRes, WanderEventsRes, WanderPhase, WanderRegionsRes,
+    WanderState,
 };
-use super::pose::{DriveInput, sample_pose};
+use super::pose::DriveInput;
 use super::{
     FIXED_DT_SECONDS, INTERACTION_EASE_PER_SECOND, INTERACTION_RADIUS, InstanceId, InteractionEdge,
     MAX_SIM_THREADS, POKE_HOP_AMPLITUDE, POKE_HOP_SECONDS, POKE_REACTION_SECONDS,
@@ -48,6 +53,17 @@ use super::{
 
 /// Weight fraction gained per fixed step while a neighbour is in range.
 const EASE_STEP: f32 = INTERACTION_EASE_PER_SECOND / 60.0;
+
+/// Fraction of the remaining 3D body turn gained per fixed step, and the
+/// residual below which it snaps exactly onto its target.
+///
+/// A turn spans twice the authored yaw (50 degrees for the bundled
+/// character), and the same tick usually starts the walk clip's own 25-degree
+/// cross-fade. Keeping the first step under a third of that span keeps the
+/// visible root yaw changing by less than the 0.2 rad per-tick bound the
+/// walk tests assert, while still settling in about half a second.
+const TURN_EASE_STEP: f32 = 0.16;
+const TURN_SNAP: f32 = 1e-3;
 
 /// Per-step travel of a walking instance. Must stay below
 /// [`WANDER_ARRIVE_EPSILON`] for a walk to converge onto its target.
@@ -87,8 +103,11 @@ pub(super) fn initial_wander_state(id: InstanceId) -> WanderState {
     WanderState {
         phase: WanderPhase::Idle { remaining },
         facing: 1.0,
+        turn: 1.0,
+        turn_target: 1.0,
         rng,
         suspended: false,
+        moved_this_tick: false,
     }
 }
 
@@ -127,18 +146,23 @@ pub fn initialize_task_pool() {
     });
 }
 
-/// Builds the fixed-step schedule: wander, snapshot, poke reactions, poses.
+/// Builds the fixed-step schedule: social, wander, snapshot, poke reactions,
+/// attention, poses.
 ///
 /// The walk runs before the interaction snapshot so both the snapshot and the
 /// same frame's render describe the same (already-walked) position; the
-/// reaction step ages the poke reactions before the pose pass reads them.
+/// reaction step ages the poke reactions before the attention pass reads them
+/// for the streak, and the attention pass runs before the pose pass so its
+/// drive and presentation pair are the same tick's.
 pub fn build_schedule() -> Schedule {
     let mut schedule = Schedule::default();
     schedule.add_systems(
         (
+            super::social::step,
             wander_step,
             interaction_snapshot,
             reaction_step,
+            super::attention::step,
             advance_poses,
         )
             .chain(),
@@ -159,11 +183,34 @@ pub fn build_schedule() -> Schedule {
 /// An instance found outside the walkable range (an external placement, or
 /// bounds that shrank) walks back in immediately instead of waiting out its
 /// idle pause, so it can never sit off-screen for a whole idle period.
+///
+/// The walk direction is expressed differently per kind, because a 3D root
+/// must never mirror: a mirror would flip asymmetric details such as a scarf
+/// print. A 2D sprite flips its mirror `facing`; a 3D skeleton eases a body
+/// `turn` that reflects the authored three-quarter stance about the model's
+/// front axis, so it faces the way it walks as a rotation rather than a
+/// reversed copy of its own geometry.
 pub fn wander_step(
-    mut query: Query<(&InstanceTag, &mut Position, &mut WanderState, &PokeReaction)>,
+    mut query: Query<(
+        &InstanceTag,
+        &ModelHandle,
+        &mut Position,
+        &mut WanderState,
+        &PokeReaction,
+        &super::social::SocialState,
+    )>,
     bounds: Res<WanderBoundsRes>,
+    regions: Res<WanderRegionsRes>,
     mut events: ResMut<WanderEventsRes>,
 ) {
+    // This is a tick output, including when bounds are disabled. Never let a
+    // previous walk survive an early return as an in-place walk animation.
+    // The body turn eases here as well, so a turn still finishes settling on
+    // ticks that do not walk (idle pauses, a suspended instance, no bounds).
+    for (_, _, _, mut wander, _, _) in query.iter_mut() {
+        wander.moved_this_tick = false;
+        ease_turn(&mut wander);
+    }
     let Some(bounds) = bounds.0 else {
         return;
     };
@@ -178,12 +225,27 @@ pub fn wander_step(
         (lo, hi)
     };
 
-    for (tag, mut position, mut wander, reaction) in query.iter_mut() {
-        if wander.suspended || reaction.elapsed < POKE_REACTION_SECONDS {
+    for (tag, handle, mut position, mut wander, reaction, social) in query.iter_mut() {
+        if wander.suspended || reaction.elapsed < POKE_REACTION_SECONDS || social.active.is_some() {
             continue;
         }
         let id = tag.0;
         let x = position.0.x;
+        let (lo, hi) = if let Some(regions) = &regions.0 {
+            let Some(segment) = visible_segment(regions, x, position.0.y, bounds) else {
+                continue;
+            };
+            let left = segment.left + WANDER_EDGE_MARGIN;
+            let right = segment.right - WANDER_EDGE_MARGIN;
+            if left > right {
+                let middle = segment.left + (segment.right - segment.left) * 0.5;
+                (middle, middle)
+            } else {
+                (left, right)
+            }
+        } else {
+            (lo, hi)
+        };
         let outside = x < lo || x > hi;
 
         let (target, started) = match wander.phase {
@@ -212,6 +274,7 @@ pub fn wander_step(
         let delta = target - x;
         if delta.abs() <= WANDER_ARRIVE_EPSILON {
             position.0.x = target;
+            wander.moved_this_tick = position.0.x != x;
             wander.phase = WanderPhase::Idle {
                 remaining: random_idle(&mut wander.rng),
             };
@@ -239,9 +302,54 @@ pub fn wander_step(
         }
         let step = delta.clamp(-WANDER_STEP, WANDER_STEP);
         position.0.x += step;
-        wander.facing = if step >= 0.0 { 1.0 } else { -1.0 };
+        wander.moved_this_tick = position.0.x != x;
+        // A 3D skeleton never mirrors: a mirror would flip asymmetric details
+        // such as the scarf print. Its walk direction is expressed as a body
+        // turn instead, which faces the authored three-quarter stance along
+        // the step without reversing any geometry; see `apply_root_turn`.
+        // Only 2D sprites turn by flipping the mirror.
+        if handle.model.kind() == ModelKind::Sprite2d {
+            wander.facing = if step >= 0.0 { 1.0 } else { -1.0 };
+        } else {
+            wander.turn_target = if step >= 0.0 { 1.0 } else { -1.0 };
+        }
         wander.phase = WanderPhase::Walking { target_x: target };
     }
+}
+
+/// Merge the visible horizontal slice before applying the character margin:
+/// adjacent monitors form one walkable span, disconnected monitors do not.
+fn visible_segment(
+    regions: &[super::WorldRect],
+    x: f32,
+    y: f32,
+    bounds: super::WorldXBounds,
+) -> Option<super::WorldXBounds> {
+    let mut intervals: Vec<_> = regions
+        .iter()
+        .filter(|rect| rect.bottom < y && y <= rect.top)
+        .map(|rect| (rect.left, rect.right))
+        .collect();
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Option<(f32, f32)> = None;
+    let mut selected = None;
+    for (left, right) in intervals {
+        match merged {
+            Some((lo, hi)) if left <= hi => merged = Some((lo, hi.max(right))),
+            Some((lo, hi)) => {
+                if lo <= x && x <= hi {
+                    selected = Some((lo, hi));
+                    break;
+                }
+                merged = Some((left, right));
+            }
+            None => merged = Some((left, right)),
+        }
+    }
+    let (left, right) = selected.or_else(|| merged.filter(|&(lo, hi)| lo <= x && x <= hi))?;
+    let left = left.max(bounds.left);
+    let right = right.min(bounds.right);
+    (left <= right && left <= x && x <= right).then_some(super::WorldXBounds { left, right })
 }
 
 /// Chooses a walk target inside `[lo, hi]`: one uniform draw, replaced by the
@@ -259,6 +367,21 @@ fn pick_target(rng: &mut u64, x: f32, lo: f32, hi: f32) -> f32 {
         if x < lo + (hi - lo) * 0.5 { hi } else { lo }
     } else {
         target
+    }
+}
+
+/// Eases the 3D body turn one step toward the walk direction it targets.
+///
+/// Exponential approach with an exact snap, so a settled instance carries
+/// the exact `+1.0`/`-1.0` endpoints and never a permanent 1e-7 residue that
+/// would keep a tiny rotation alive forever. Sprites keep `turn = +1.0`.
+fn ease_turn(wander: &mut WanderState) {
+    if wander.turn == wander.turn_target {
+        return;
+    }
+    wander.turn += (wander.turn_target - wander.turn) * TURN_EASE_STEP;
+    if (wander.turn_target - wander.turn).abs() <= TURN_SNAP {
+        wander.turn = wander.turn_target;
     }
 }
 
@@ -433,6 +556,7 @@ fn advanced_weight(weight: f32, target: f32) -> f32 {
 /// [`Simulation::advance`](super::Simulation::advance) to surface as a
 /// visible error; the deterministic failure repeats on the next tick instead
 /// of silently degrading.
+#[allow(clippy::type_complexity)]
 pub fn advance_poses(
     mut query: Query<(
         &InstanceTag,
@@ -442,46 +566,103 @@ pub fn advance_poses(
         &PokeReaction,
         &mut TimeState,
         &mut PoseState,
+        &mut ActionState,
+        &super::social::SocialState,
+        Option<&super::attention::AttentionState>,
     )>,
     mut status: ResMut<TickStatus>,
+    mut events: ResMut<ActionEvents>,
 ) {
-    let slot = Arc::new(Mutex::new(None::<(InstanceId, SimError)>));
+    let slot = Arc::new(Mutex::new((None::<(InstanceId, SimError)>, Vec::new())));
     let worker_slot = Arc::clone(&slot);
 
     query.par_iter_mut().for_each(
-        move |(tag, handle, interaction, wander, reaction, mut time, mut pose)| {
+        move |(
+            tag,
+            handle,
+            interaction,
+            wander,
+            reaction,
+            mut time,
+            mut pose,
+            mut action,
+            social,
+            attention,
+        )| {
             let id = tag.0;
             let next_time = time.time + FIXED_DT_SECONDS;
-            // An active poke reaction wins over the neighbour reaction; once
-            // it ends this falls back to the interaction drive.
+            // Priority: an active poke reaction wins outright, then an active
+            // social lock, then the opt-in attention drive (pointer, edge or
+            // idle), then the existing nearest-neighbour reaction. The
+            // attention drive is `None` whenever attention is disabled or
+            // neutral, so the default path is unchanged.
             let drive = if reaction.elapsed < POKE_REACTION_SECONDS {
-                DriveInput::from_reaction(reaction, wander.facing)
+                DriveInput::from_reaction(reaction, wander.facing, wander.turn)
+            } else if let Some(active) = social.active {
+                // A paired pet looks at its partner, not an unrelated nearest neighbour.
+                DriveInput::from_state(
+                    &InteractionState {
+                        neighbor: Some(active.partner),
+                        offset: social.direction,
+                        weight: interaction.weight,
+                    },
+                    wander.facing,
+                    wander.turn,
+                )
+            } else if let Some(drive) =
+                attention.and_then(|attention| attention.drive(wander.facing, wander.turn))
+            {
+                drive
             } else {
-                DriveInput::from_state(interaction, wander.facing)
+                DriveInput::from_state(interaction, wander.facing, wander.turn)
             };
-            match sample_pose(&handle.model, next_time, &drive, id) {
-                Ok(next) => {
+            match actions::advance(
+                &handle.model,
+                &action,
+                wander.moved_this_tick,
+                social.active,
+                reaction,
+                &drive,
+                next_time,
+                id,
+            ) {
+                Ok((next_action, next_pose, event)) => {
                     time.time = next_time;
-                    pose.prev = std::mem::replace(&mut pose.curr, next);
+                    pose.prev = std::mem::replace(&mut pose.curr, next_pose);
+                    *action = next_action;
+                    if let Some(event) = event {
+                        let mut slot = match worker_slot.lock() {
+                            Ok(slot) => slot,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        slot.1.push(event);
+                    }
                 }
                 Err(error) => {
                     let mut slot = match worker_slot.lock() {
                         Ok(slot) => slot,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    let dominated = slot.as_ref().is_some_and(|(existing, _)| *existing <= id);
+                    let dominated = slot.0.as_ref().is_some_and(|(existing, _)| *existing <= id);
                     if !dominated {
-                        *slot = Some((id, error));
+                        slot.0 = Some((id, error));
                     }
                 }
             }
         },
     );
 
-    let recorded = match slot.lock() {
-        Ok(mut slot) => slot.take(),
-        Err(poisoned) => poisoned.into_inner().take(),
+    let (recorded, mut committed) = match slot.lock() {
+        Ok(mut slot) => (slot.0.take(), std::mem::take(&mut slot.1)),
+        Err(poisoned) => {
+            let mut slot = poisoned.into_inner();
+            (slot.0.take(), std::mem::take(&mut slot.1))
+        }
     };
+    committed.sort_by_key(|event| event.instance);
+    for event in committed {
+        events.push(event);
+    }
     if let Some((_, error)) = recorded {
         status.error = Some(error);
     }
@@ -493,6 +674,75 @@ mod tests {
     use super::*;
     use crate::model::{LoadLimits, ModelData, load_model_bytes, try_sample_parameters};
     use bevy_ecs::entity::Entity;
+
+    #[test]
+    fn visible_slice_merges_before_inset_and_keeps_half_open_vertical_edges() {
+        use super::super::{WorldRect, WorldXBounds};
+        let bounds = WorldXBounds {
+            left: -10.0,
+            right: 10.0,
+        };
+        let regions = [
+            WorldRect {
+                left: 0.0,
+                right: 4.0,
+                bottom: -2.0,
+                top: 2.0,
+            },
+            WorldRect {
+                left: -4.0,
+                right: 0.0,
+                bottom: 0.0,
+                top: 2.0,
+            },
+            WorldRect {
+                left: 6.0,
+                right: 9.0,
+                bottom: -2.0,
+                top: 2.0,
+            },
+        ];
+        assert_eq!(
+            visible_segment(&regions, -1.0, 2.0, bounds),
+            Some(WorldXBounds {
+                left: -4.0,
+                right: 4.0
+            })
+        );
+        assert_eq!(visible_segment(&regions, -1.0, 0.0, bounds), None);
+        assert_eq!(
+            visible_segment(&regions, 1.0, 0.0, bounds),
+            Some(WorldXBounds {
+                left: 0.0,
+                right: 4.0
+            })
+        );
+        assert_eq!(visible_segment(&regions, 1.0, -2.0, bounds), None);
+        assert_eq!(visible_segment(&regions, 5.0, 1.0, bounds), None);
+        assert_eq!(
+            visible_segment(&regions, 7.0, 1.0, bounds),
+            Some(WorldXBounds {
+                left: 6.0,
+                right: 9.0
+            })
+        );
+        assert_eq!(
+            visible_segment(
+                &regions,
+                1.0,
+                1.0,
+                WorldXBounds {
+                    left: -2.0,
+                    right: 2.0
+                }
+            ),
+            Some(WorldXBounds {
+                left: -2.0,
+                right: 2.0
+            })
+        );
+        assert_eq!(visible_segment(&[], 0.0, 1.0, bounds), None);
+    }
 
     #[test]
     fn poke_envelope_rises_and_decays() {

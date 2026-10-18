@@ -33,6 +33,11 @@ pub(crate) struct DriveInput {
     /// flips the world direction of every local rotation around Y and of
     /// every horizontal gaze sign, so the drive must multiply through it.
     pub facing: f32,
+    /// Eased 3D presentation turn in `-1.0..=1.0`: `+1.0` keeps the authored
+    /// root orientation, `-1.0` reflects its yaw about the model's front
+    /// axis so the skeleton faces the other way without mirroring geometry.
+    /// 2D sprites use [`Self::facing`] instead and keep `+1.0`.
+    pub turn: f32,
 }
 
 impl Default for DriveInput {
@@ -41,6 +46,7 @@ impl Default for DriveInput {
             direction: Vec3::ZERO,
             weight: 0.0,
             facing: 1.0,
+            turn: 1.0,
         }
     }
 }
@@ -52,16 +58,18 @@ impl DriveInput {
     }
 
     /// Reads the reaction from an instance's interaction state under its
-    /// current mirror facing.
-    pub fn from_state(state: &InteractionState, facing: f32) -> Self {
+    /// current mirror facing and presentation turn.
+    pub fn from_state(state: &InteractionState, facing: f32, turn: f32) -> Self {
         match state.neighbor {
             Some(_) if state.weight > 0.0 => Self {
                 direction: state.offset,
                 weight: state.weight.clamp(0.0, 1.0),
                 facing,
+                turn,
             },
             _ => Self {
                 facing,
+                turn,
                 ..Self::none()
             },
         }
@@ -71,11 +79,12 @@ impl DriveInput {
     /// mirror facing. The weight follows the poke envelope, so the turn
     /// fades in and out on its own; a dead-zone'd direction (a poke on the
     /// centre) yields no turn at all.
-    pub fn from_reaction(reaction: &PokeReaction, facing: f32) -> Self {
+    pub fn from_reaction(reaction: &PokeReaction, facing: f32, turn: f32) -> Self {
         Self {
             direction: reaction.direction,
             weight: super::systems::poke_envelope(reaction.elapsed).clamp(0.0, 1.0),
             facing,
+            turn,
         }
     }
 }
@@ -102,6 +111,45 @@ pub(crate) fn sample_pose(
             let mut locals = try_sample_joints(skeleton, time)?;
             apply_skeleton_drive(model, skeleton, &mut locals, drive, id)?;
             Ok(Pose::Skeleton3d(locals))
+        }
+    }
+}
+
+/// Applies the current drive once, after the undriven action pose is blended.
+pub(crate) fn apply_pose_drive(
+    model: &CompiledModel,
+    pose: &mut Pose,
+    drive: &DriveInput,
+    id: InstanceId,
+) -> Result<(), SimError> {
+    match (&model.data, pose) {
+        (ModelData::Sprite2d(sprite), Pose::Sprite2d(parameters)) => {
+            apply_sprite_drive(model, sprite, parameters, drive, id)
+        }
+        (ModelData::Skeleton3d(skeleton), Pose::Skeleton3d(locals)) => {
+            apply_skeleton_drive(model, skeleton, locals, drive, id)
+        }
+        _ => Err(SimError::Inconsistent {
+            instance: id,
+            detail: "action pose kind differs from its model".to_string(),
+        }),
+    }
+}
+
+/// Blends local action poses using the same rules as render interpolation.
+pub(crate) fn blend_pose(
+    model: &CompiledModel,
+    source: &Pose,
+    target: &Pose,
+    alpha: f32,
+    id: InstanceId,
+) -> Result<Pose, SimError> {
+    match &model.data {
+        ModelData::Sprite2d(sprite) => {
+            interpolated_parameters(sprite, source, target, alpha, id).map(Pose::Sprite2d)
+        }
+        ModelData::Skeleton3d(skeleton) => {
+            interpolated_locals(skeleton, source, target, alpha, id).map(Pose::Skeleton3d)
         }
     }
 }
@@ -152,8 +200,9 @@ fn apply_sprite_drive(
     Ok(())
 }
 
-/// 3D drive: yaw the head joint toward the neighbour, at most
-/// [`HEAD_YAW_LIMIT`] around local Y.
+/// 3D drive: turn the articulated base toward the walk direction, then yaw
+/// the head joint toward the neighbour, at most [`HEAD_YAW_LIMIT`] around
+/// local Y.
 ///
 /// The model must declare `interaction.head_joint`; a stale index (possible
 /// with hand-built compiled data) is reported instead of being ignored.
@@ -164,13 +213,11 @@ fn apply_skeleton_drive(
     drive: &DriveInput,
     id: InstanceId,
 ) -> Result<(), SimError> {
-    if !active_direction(drive) {
-        return Ok(());
-    }
-    let Some(joint_index) = model.interaction.head_joint else {
-        return Ok(());
-    };
-    if joint_index >= skeleton.joints.len() || joint_index >= locals.len() {
+    let turn = clamped_turn(drive.turn);
+    let head = model.interaction.head_joint;
+    if let Some(joint_index) = head
+        && (joint_index >= skeleton.joints.len() || joint_index >= locals.len())
+    {
         return Err(SimError::Inconsistent {
             instance: id,
             detail: format!(
@@ -179,21 +226,97 @@ fn apply_skeleton_drive(
             ),
         });
     }
+    // The base turn runs first so the head aim below can cancel it on the
+    // head's own root: the neighbour lies in world space, while the head yaw
+    // is applied locally and is inherited from that root.
+    let inherited = head
+        .and_then(|joint| root_of(skeleton, joint))
+        .map_or(0.0, |root| root_turn_yaw(&locals[root], turn));
+    apply_root_turn(skeleton, locals, turn);
+    if !active_direction(drive) {
+        return Ok(());
+    }
+    let Some(joint_index) = head else {
+        return Ok(());
+    };
     // The model faces +Z; a positive rotation around Y turns +Z toward +X
     // (right-hand rule), so `atan2(dx, dz)` is the yaw that faces the
     // neighbour, clamped to the authored limit and scaled by the weight.
     // The instance root is a translation times a horizontal mirror, so a
     // mirrored root flips the world direction of every yaw: multiplying by
     // the facing keeps the same local rotation pointing at the neighbour.
+    // The base turn has already moved the head in world space, so its own
+    // contribution is subtracted before the limit applies.
     let direction = drive.direction.normalize_or_zero();
-    let yaw = direction
-        .x
-        .atan2(direction.z)
-        .clamp(-HEAD_YAW_LIMIT, HEAD_YAW_LIMIT);
+    let yaw = (direction.x.atan2(direction.z) - inherited).clamp(-HEAD_YAW_LIMIT, HEAD_YAW_LIMIT);
     let yaw = yaw * drive.weight * drive.facing;
     let local = &mut locals[joint_index];
     local.rotation = (Quat::from_rotation_y(yaw) * local.rotation).normalize();
     Ok(())
+}
+
+/// Clamps a presentation turn to its authored range; a non-finite value
+/// falls back to the neutral `+1.0` instead of poisoning the pose.
+fn clamped_turn(turn: f32) -> f32 {
+    if turn.is_finite() {
+        turn.clamp(-1.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Yaw the base turn adds to one root joint: zero at `turn = +1.0`, and the
+/// reflection of the root's authored yaw about the model's front axis at
+/// `turn = -1.0`.
+fn root_turn_yaw(local: &JointTransform, turn: f32) -> f32 {
+    if turn == 1.0 {
+        return 0.0;
+    }
+    let forward = local.rotation * Vec3::Z;
+    if forward.x * forward.x + forward.z * forward.z <= 1e-12 {
+        // A root whose front is vertical has no defined facing.
+        return 0.0;
+    }
+    forward.x.atan2(forward.z) * (turn - 1.0)
+}
+
+/// The root joint `joint` descends from, if the hierarchy is well formed.
+fn root_of(skeleton: &CompiledSkeleton3d, joint: usize) -> Option<usize> {
+    let mut current = joint;
+    // Parents always have a smaller index, so the walk terminates even for a
+    // hand-built hierarchy; the bound is a defensive backstop only.
+    for _ in 0..skeleton.joints.len() {
+        match skeleton.joints.get(current)?.parent {
+            Some(parent) => current = parent,
+            None => return Some(current),
+        }
+    }
+    None
+}
+
+/// Reflects every root joint's authored yaw so the skeleton faces its walk
+/// direction while keeping its geometry unmirrored.
+///
+/// The authored root joint may hold a small yaw (the bundled Bangboo holds
+/// +25 degrees in its walk clip) so the character is drawn three-quarter on.
+/// Facing the other way must then reflect that yaw about the model's own
+/// front axis instead of reversing its geometry: a mirror would also reverse
+/// asymmetric details such as a scarf print. `turn` is `+1.0` for the
+/// authored orientation, `-1.0` for the reflected one, and eases in between.
+fn apply_root_turn(skeleton: &CompiledSkeleton3d, locals: &mut [JointTransform], turn: f32) {
+    if turn == 1.0 {
+        return;
+    }
+    for (joint, local) in skeleton.joints.iter().zip(locals.iter_mut()) {
+        if joint.parent.is_some() {
+            continue;
+        }
+        let extra = root_turn_yaw(local, turn);
+        if extra == 0.0 {
+            continue;
+        }
+        local.rotation = (Quat::from_rotation_y(extra) * local.rotation).normalize();
+    }
 }
 
 /// Whether a reaction should be applied at all.
@@ -382,6 +505,7 @@ mod tests {
             direction: Vec3::new(1.0, 0.0, 0.0),
             weight: 1.0,
             facing: 1.0,
+            turn: 1.0,
         };
         let mut positive = locals.clone();
         apply_skeleton_drive(&model, skeleton, &mut positive, &drive_right, 1).unwrap();
@@ -415,21 +539,22 @@ mod tests {
         let mut reaction = PokeReaction {
             direction: Vec3::new(1.0, 0.0, 0.0),
             elapsed: 0.0,
+            revision: 0,
         };
         // A fresh poke has an all-but-zero weight, the peak is 1 and the end
         // of the reaction is exactly zero again.
-        assert!(DriveInput::from_reaction(&reaction, 1.0).weight < 1e-6);
+        assert!(DriveInput::from_reaction(&reaction, 1.0, 1.0).weight < 1e-6);
         reaction.elapsed = super::super::POKE_REACTION_SECONDS * 0.15;
-        let active = DriveInput::from_reaction(&reaction, 1.0);
+        let active = DriveInput::from_reaction(&reaction, 1.0, 1.0);
         assert!((active.weight - 1.0).abs() < 1e-6);
         assert_eq!(active.direction, Vec3::new(1.0, 0.0, 0.0));
         reaction.elapsed = super::super::POKE_REACTION_SECONDS;
-        assert_eq!(DriveInput::from_reaction(&reaction, 1.0).weight, 0.0);
+        assert_eq!(DriveInput::from_reaction(&reaction, 1.0, 1.0).weight, 0.0);
         // A dead-zone'd direction never carries a turn, even at full weight:
         // the pose gate refuses it.
         reaction.elapsed = super::super::POKE_REACTION_SECONDS * 0.15;
         reaction.direction = Vec3::ZERO;
-        let centred = DriveInput::from_reaction(&reaction, 1.0);
+        let centred = DriveInput::from_reaction(&reaction, 1.0, 1.0);
         assert!(centred.weight > 0.0);
         assert!(!active_direction(&centred));
     }
@@ -444,6 +569,7 @@ mod tests {
             direction: Vec3::new(x, 0.0, 0.0),
             weight: 1.0,
             facing,
+            turn: 1.0,
         };
         let probe = |drive: &DriveInput| {
             let mut parameters = vec![0.0f32; sprite.parameters.len()];

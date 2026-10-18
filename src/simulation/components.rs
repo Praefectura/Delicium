@@ -77,6 +77,8 @@ pub(crate) struct PokeReaction {
     /// Seconds since the poke; the reaction is over at
     /// [`POKE_REACTION_SECONDS`](super::POKE_REACTION_SECONDS).
     pub elapsed: f32,
+    /// Accepted poke generation; consumed only after successful pose sampling.
+    pub revision: u64,
 }
 
 impl Default for PokeReaction {
@@ -84,6 +86,7 @@ impl Default for PokeReaction {
         Self {
             direction: Vec3::ZERO,
             elapsed: super::POKE_REACTION_SECONDS,
+            revision: 0,
         }
     }
 }
@@ -98,14 +101,29 @@ pub(crate) struct WanderState {
     /// Current phase of the idle/walk cycle.
     pub phase: WanderPhase,
     /// Mirror sign, always exactly `+1.0` (as authored) or `-1.0` (mirrored
-    /// horizontally around the instance's own vertical centre line).
+    /// horizontally around the instance's own vertical centre line). Only 2D
+    /// sprites mirror; a 3D skeleton keeps `+1.0` so its authored orientation
+    /// (and asymmetric details such as a scarf print) never flips, and turns
+    /// through `WanderState::turn` instead.
     pub facing: f32,
+    /// 3D presentation turn in `-1.0..=1.0`, eased per tick toward
+    /// `WanderState::turn_target`. `+1.0` keeps the authored orientation;
+    /// `-1.0` reflects the authored root yaw about the model's front axis.
+    /// Reflecting the yaw as a rotation is what faces a skeleton along its
+    /// walk direction without mirroring its geometry, so asymmetric prints
+    /// stay readable. 2D sprites keep `+1.0` and use `facing`.
+    pub turn: f32,
+    /// Walk direction the turn eases toward: `+1.0` right, `-1.0` left. The
+    /// last walked direction is kept while idling, exactly like `facing`.
+    pub turn_target: f32,
     /// Per-instance splitmix64 stream, seeded from the instance id so the
     /// walk is deterministic and independent of tick order or thread count.
     pub rng: u64,
     /// Set while a user gesture owns the instance (drag press or control
     /// window position edit); a suspended instance never moves on its own.
     pub suspended: bool,
+    /// Whether this tick actually changed X through autonomous walking.
+    pub moved_this_tick: bool,
 }
 
 /// The idle/walk cycle of one wandering instance.
@@ -121,6 +139,10 @@ pub(crate) enum WanderPhase {
 /// entirely (the default, so headless tests and pinned workloads stay put).
 #[derive(Resource, Default, Clone, Copy, Debug)]
 pub(crate) struct WanderBoundsRes(pub Option<super::WorldXBounds>);
+
+/// Optional physical-desktop visibility expressed in world coordinates.
+#[derive(Resource, Default)]
+pub(crate) struct WanderRegionsRes(pub Option<Vec<super::WorldRect>>);
 
 /// Observable wander transitions produced by the last tick, drained by the
 /// application layer for logging. The simulation never reads them back, so

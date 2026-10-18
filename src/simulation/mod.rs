@@ -8,18 +8,23 @@
 //! # Ticks
 //!
 //! [`Simulation::advance`] consumes whole [`FIXED_DT`] steps, at most
-//! [`MAX_SUBSTEPS`] per call. One tick runs four systems in a fixed order:
+//! [`MAX_SUBSTEPS`] per call. One tick runs six systems in a fixed order:
 //!
-//! 1. the wander step: every instance advances its idle/walk state machine
+//! 1. the social step: deterministically pair opted-in neighbours and pause
+//!    their autonomous walking without touching user drag suspension;
+//! 2. the wander step: every instance advances its idle/walk state machine
 //!    inside [`Simulation::wander_bounds`] and may write its own position;
-//! 2. an interaction snapshot: every instance finds its nearest neighbour
+//! 3. an interaction snapshot: every instance finds its nearest neighbour
 //!    inside [`INTERACTION_RADIUS`] and eases its reaction weight;
-//! 3. the poke reaction step: every active poke reaction ages by one step
+//! 4. the poke reaction step: every active poke reaction ages by one step
 //!    and turns its instance toward the poke point;
-//! 4. the pose evaluation: animation sampling (2D parameters or 3D joint
-//!    locals) plus the interaction or poke drive.
+//! 5. the opt-in attention step: a deterministic presentation pass that
+//!    resolves the pointer, desktop edges or the idle variant; it returns
+//!    before touching the world while attention is disabled (the default);
+//! 6. the pose evaluation: animation sampling (2D parameters or 3D joint
+//!    locals) plus the reaction, social or attention drive.
 //!
-//! The walk runs first so the snapshot and the same frame's render agree on
+//! The walk precedes the snapshot so it and the same frame's render agree on
 //! where every instance is.
 //!
 //! Backlog beyond the step budget is dropped and counted in
@@ -41,10 +46,16 @@
 //! only then applies the model's forward kinematics and deformation. Skin
 //! matrices are never linearly blended, so they stay rigid.
 
+mod actions;
 mod assets;
+mod attention;
 mod components;
 mod pose;
+mod social;
 mod systems;
+pub use attention::{AttentionEvent, AttentionSnapshot, AttentionSource};
+pub use social::{SocialEvent, SocialInfo, SocialPhase};
+use social::{SocialEvents, SocialState};
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -57,11 +68,13 @@ use crate::{
     renderer::{InstanceDraw, RenderFrame},
 };
 
+use actions::{ActionEvents, ActionState};
+use attention::{AttentionRes, AttentionState};
 use components::{
     InstanceTag, InteractionState, InteractionsRes, ModelHandle, PokeReaction, PoseState, Position,
-    TickStatus, TimeState, WanderBoundsRes, WanderEventsRes, WanderState,
+    TickStatus, TimeState, WanderBoundsRes, WanderEventsRes, WanderRegionsRes, WanderState,
 };
-use pose::{DriveInput, Pose, clamp, interpolated_locals, interpolated_parameters, sample_pose};
+use pose::{DriveInput, Pose, clamp, interpolated_locals, interpolated_parameters};
 
 pub use assets::render_asset;
 
@@ -165,6 +178,37 @@ const MAX_DEFAULT_ASSETS: usize = 2;
 /// defaults must fit at the same time.
 const MAX_ASSETS: usize = MAX_INSTANCES + MAX_PENDING_LOADS + MAX_DEFAULT_ASSETS;
 
+/// Semantic action selected by an explicitly bound model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionKind {
+    Idle,
+    Walk,
+    Reaction,
+    Greet,
+    Play,
+}
+
+impl ActionKind {
+    /// Stable log label shared by the application and GUI assertions.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Walk => "walk",
+            Self::Reaction => "reaction",
+            Self::Greet => "greet",
+            Self::Play => "play",
+        }
+    }
+}
+
+/// A committed action change or repeated reaction, never a per-frame sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActionEvent {
+    pub instance: InstanceId,
+    pub action: ActionKind,
+    pub restarted: bool,
+}
+
 /// Read-only snapshot of one live instance.
 #[derive(Clone, Debug)]
 pub struct InstanceInfo {
@@ -182,6 +226,10 @@ pub struct InstanceInfo {
     pub neighbor: Option<InstanceId>,
     /// Current animation time in seconds.
     pub animation_time: f64,
+    /// Selected semantic action, or `None` for legacy all-animation playback.
+    pub action: Option<ActionKind>,
+    /// Reciprocal social activity; independent of user drag suspension.
+    pub social: Option<SocialInfo>,
 }
 
 /// Horizontal world range autonomous walking is confined to.
@@ -194,6 +242,16 @@ pub struct InstanceInfo {
 pub struct WorldXBounds {
     pub left: f32,
     pub right: f32,
+}
+
+/// A visible world rectangle. Its top is inclusive and bottom exclusive,
+/// matching physical desktop rows. Both dimensions must be strictly positive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldRect {
+    pub left: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub top: f32,
 }
 
 /// One observed wander transition, drained by the application layer and
@@ -267,6 +325,15 @@ pub enum SimError {
     #[error("wander bounds ({left}, {right}) are not finite and ordered")]
     InvalidWanderBounds { left: f32, right: f32 },
 
+    /// A desktop visibility rectangle is non-finite, empty or reversed.
+    #[error("wander region {index} is not finite and strictly ordered")]
+    InvalidWanderRegion { index: usize },
+
+    /// An attention environment snapshot is invalid. The whole previous
+    /// snapshot (screens, work areas and windows) stays in effect.
+    #[error("attention environment is invalid: {detail}")]
+    InvalidAttentionEdges { detail: String },
+
     /// Instance state does not match its model (only reachable with
     /// hand-built, unvalidated compiled data).
     #[error("instance {instance} is inconsistent with its model: {detail}")]
@@ -278,6 +345,10 @@ pub enum SimError {
     /// Model evaluation failed.
     #[error("model evaluation failed: {0}")]
     Model(#[from] ModelError),
+
+    /// A poke cannot be accepted without reusing a consumed generation.
+    #[error("poke generation exhausted for instance {instance}")]
+    PokeRevisionExhausted { instance: InstanceId },
 
     /// The monotonic identifier space is exhausted.
     #[error("identifier space exhausted")]
@@ -312,7 +383,12 @@ impl Simulation {
         world.insert_resource(InteractionsRes::default());
         world.insert_resource(TickStatus::default());
         world.insert_resource(WanderBoundsRes::default());
+        world.insert_resource(WanderRegionsRes::default());
         world.insert_resource(WanderEventsRes::default());
+        world.insert_resource(ActionEvents::default());
+        world.insert_resource(SocialEvents::default());
+        world.insert_resource(AttentionRes::default());
+        world.register_component::<SocialState>();
         // Register the instance components up front, so the schedule can be
         // initialised even when it runs before the first spawn.
         world.register_component::<ModelHandle>();
@@ -323,6 +399,8 @@ impl Simulation {
         world.register_component::<InteractionState>();
         world.register_component::<WanderState>();
         world.register_component::<PokeReaction>();
+        world.register_component::<ActionState>();
+        world.register_component::<AttentionState>();
         Self {
             world,
             schedule: systems::build_schedule(),
@@ -414,7 +492,11 @@ impl Simulation {
         let time = id as f64 * CLONE_PHASE_STEP_SECONDS;
         // Sample before committing: a model whose data cannot produce a pose
         // must not create a half-initialised instance.
-        let pose = sample_pose(&model, time, &DriveInput::none(), id)?;
+        let reaction = PokeReaction::default();
+        let (action, pose) =
+            actions::initialize(&model, time, time, &reaction, &DriveInput::none(), id)?;
+        let attention = attention::initial_state(id, &model);
+        let initial_action = action.0.as_ref().map(|playback| playback.kind);
         self.next_instance_id = id.checked_add(1).ok_or(SimError::IdExhausted)?;
         let entity = self
             .world
@@ -429,10 +511,20 @@ impl Simulation {
                 },
                 InteractionState::default(),
                 systems::initial_wander_state(id),
-                PokeReaction::default(),
+                reaction,
+                action,
+                SocialState::default(),
+                attention,
             ))
             .id();
         self.entities.insert(id, entity);
+        if let Some(action) = initial_action {
+            self.world.resource_mut::<ActionEvents>().push(ActionEvent {
+                instance: id,
+                action,
+                restarted: false,
+            });
+        }
         Ok(id)
     }
 
@@ -444,7 +536,9 @@ impl Simulation {
         let Some(entity) = self.entities.remove(&id) else {
             return false;
         };
+        social::cancel(&mut self.world, id);
         self.world.despawn(entity);
+        attention::forget_instance(&mut self.world, id);
         if let Some(mut interactions) = self.world.get_resource_mut::<InteractionsRes>() {
             interactions
                 .0
@@ -482,6 +576,7 @@ impl Simulation {
             .get_mut::<Position>(entity)
             .ok_or(SimError::UnknownInstance(id))?;
         slot.0 = position;
+        social::cancel(&mut self.world, id);
         if let Some(mut wander) = self.world.get_mut::<WanderState>(entity) {
             systems::cancel_walk(&mut wander);
         }
@@ -510,6 +605,26 @@ impl Simulation {
         Ok(())
     }
 
+    /// Restricts walking to the visible segment containing each instance at
+    /// its current height. `None` preserves the original bounds-only behavior;
+    /// `Some(vec![])` pauses all walking. Invalid input preserves the old value.
+    pub fn set_wander_regions(&mut self, regions: Option<Vec<WorldRect>>) -> Result<(), SimError> {
+        if let Some(regions) = &regions {
+            for (index, rect) in regions.iter().enumerate() {
+                if ![rect.left, rect.right, rect.bottom, rect.top]
+                    .iter()
+                    .all(|v| v.is_finite())
+                    || rect.left >= rect.right
+                    || rect.bottom >= rect.top
+                {
+                    return Err(SimError::InvalidWanderRegion { index });
+                }
+            }
+        }
+        self.world.resource_mut::<WanderRegionsRes>().0 = regions;
+        Ok(())
+    }
+
     /// Reads the current wander bounds, if walking is enabled.
     pub fn wander_bounds(&self) -> Option<WorldXBounds> {
         self.world
@@ -532,6 +647,7 @@ impl Simulation {
             .ok_or(SimError::UnknownInstance(id))?;
         wander.suspended = true;
         systems::cancel_walk(&mut wander);
+        social::cancel(&mut self.world, id);
         Ok(())
     }
 
@@ -580,9 +696,152 @@ impl Simulation {
             .world
             .get_mut::<PokeReaction>(entity)
             .ok_or(SimError::UnknownInstance(id))?;
+        let revision = reaction
+            .revision
+            .checked_add(1)
+            .ok_or(SimError::PokeRevisionExhausted { instance: id })?;
         reaction.direction = direction;
         reaction.elapsed = 0.0;
+        reaction.revision = revision;
+        social::cancel(&mut self.world, id);
+        if self.attention_enabled() {
+            attention::record_poke(&mut self.world, entity);
+        }
         Ok(())
+    }
+
+    // -- attention ----------------------------------------------------------
+
+    /// Enables or disables the opt-in attention presentation.
+    ///
+    /// Disabled is the default and leaves every headless and benchmark run
+    /// bit-exact. Disabling immediately clears the presentation, the pointer,
+    /// the environment snapshot, the event buffer and every streak; no pose
+    /// drive or root presentation survives.
+    pub fn set_attention_enabled(&mut self, enabled: bool) {
+        if let Some(mut res) = self.world.get_resource_mut::<AttentionRes>() {
+            res.enabled = enabled;
+        }
+        if !enabled {
+            attention::disable(&mut self.world);
+        }
+    }
+
+    /// Sets (or clears) the world-space pointer target. `None` removes the
+    /// target and lets the pointer weight decay.
+    ///
+    /// The point is validated like any other world position; an invalid point
+    /// is rejected and the previous target stays untouched.
+    pub fn set_pointer_world(&mut self, point: Option<Vec3>) -> Result<(), SimError> {
+        if let Some(point) = point {
+            validate_position(point)?;
+        }
+        if let Some(mut res) = self.world.get_resource_mut::<AttentionRes>() {
+            res.pointer = point;
+        }
+        Ok(())
+    }
+
+    /// Replaces the desktop environment used for edge attention.
+    ///
+    /// Every rectangle must be finite, bounded by the simulation coordinate
+    /// limit (10000 world units) and strictly ordered; the groups are capped
+    /// at 64 screen, 64 work and 32 window rectangles. Any invalid input
+    /// rejects the whole call and the previous snapshot stays in effect.
+    /// Empty slices clear that group.
+    pub fn set_attention_edges(
+        &mut self,
+        screens: &[WorldRect],
+        work: &[WorldRect],
+        windows: &[WorldRect],
+    ) -> Result<(), SimError> {
+        attention::validate_edges(screens, work, windows)?;
+        attention::store_edges(&mut self.world, screens, work, windows);
+        Ok(())
+    }
+
+    /// Starts drag presentation feedback for an instance.
+    ///
+    /// Presentation only: the caller already suspends wandering, so this never
+    /// touches position, wander, reactions or actions. It is meant to be
+    /// called after the drag threshold is crossed.
+    pub fn begin_drag_feedback(&mut self, id: InstanceId) -> Result<(), SimError> {
+        let entity = *self
+            .entities
+            .get(&id)
+            .ok_or(SimError::UnknownInstance(id))?;
+        if !self.attention_enabled() {
+            // No effects while attention is disabled.
+            return Ok(());
+        }
+        let position = self
+            .world
+            .get::<Position>(entity)
+            .ok_or(SimError::UnknownInstance(id))?
+            .0;
+        let mut state = self
+            .world
+            .get_mut::<AttentionState>(entity)
+            .ok_or(SimError::UnknownInstance(id))?;
+        state.begin_drag(position);
+        Ok(())
+    }
+
+    /// Ends drag presentation feedback.
+    ///
+    /// With `settle` and an actually active drag, the shear and squash damp
+    /// out over 0.20 s; every other case returns to neutral immediately.
+    pub fn end_drag_feedback(&mut self, id: InstanceId, settle: bool) -> Result<(), SimError> {
+        let entity = *self
+            .entities
+            .get(&id)
+            .ok_or(SimError::UnknownInstance(id))?;
+        if !self.attention_enabled() {
+            return Ok(());
+        }
+        let mut state = self
+            .world
+            .get_mut::<AttentionState>(entity)
+            .ok_or(SimError::UnknownInstance(id))?;
+        state.end_drag(settle);
+        Ok(())
+    }
+
+    /// Snapshot of one instance's attention and root presentation.
+    pub fn attention_snapshot(&self, id: InstanceId) -> Option<AttentionSnapshot> {
+        let entity = *self.entities.get(&id)?;
+        self.world
+            .get::<AttentionState>(entity)
+            .map(AttentionState::snapshot)
+    }
+
+    /// Takes the presentation-source transitions since the last drain.
+    /// Draining is observational and can never change simulation state.
+    pub fn drain_attention_events(&mut self) -> Vec<AttentionEvent> {
+        self.world
+            .get_resource_mut::<AttentionRes>()
+            .map(|mut res| std::mem::take(&mut res.event_buffer))
+            .unwrap_or_default()
+    }
+
+    fn attention_enabled(&self) -> bool {
+        self.world
+            .get_resource::<AttentionRes>()
+            .is_some_and(|res| res.enabled)
+    }
+
+    /// Takes pair transitions; draining is observational and never drives playback.
+    pub fn drain_social_events(&mut self) -> Vec<SocialEvent> {
+        std::mem::take(&mut self.world.resource_mut::<SocialEvents>().0)
+    }
+
+    /// Takes committed action changes since the last drain, including initial
+    /// bound states at spawn and replacement. Draining never affects playback.
+    pub fn drain_action_events(&mut self) -> Vec<ActionEvent> {
+        self.world
+            .get_resource_mut::<ActionEvents>()
+            .map(|mut events| std::mem::take(&mut events.0))
+            .unwrap_or_default()
     }
 
     /// Takes every wander transition recorded since the last drain. The
@@ -601,10 +860,11 @@ impl Simulation {
     /// The new asset must already exist and its initial pose (sampled at the
     /// instance's current animation time, including the current interaction
     /// reaction) must be valid; otherwise the instance keeps its old asset,
-    /// pose and time. On success, scalar parameters that exist in both models
-    /// *by name* keep their current value (clamped to the new range); joint
-    /// indices and joint poses are never copied, and the kind may change
-    /// between 2D and 3D.
+    /// pose and time. For an unbound target, scalar parameters that exist in
+    /// both models *by name* keep their current value (clamped to the new
+    /// range). A bound target starts fresh action playback, or joins the
+    /// current poke. Joint poses, clip indices and transition snapshots are
+    /// never copied; the kind may change between 2D and 3D.
     ///
     /// The caller prepares the renderer-side resources for `asset` first and
     /// calls this to commit the swap.
@@ -641,21 +901,42 @@ impl Simulation {
                 .world
                 .get::<InteractionState>(entity)
                 .ok_or(SimError::UnknownInstance(id))?;
-            let facing = self
+            let facing = if model.kind() == ModelKind::Sprite2d {
+                self.world
+                    .get::<WanderState>(entity)
+                    .map_or(1.0, |wander| wander.facing)
+            } else {
+                1.0
+            };
+            let turn = self
                 .world
                 .get::<WanderState>(entity)
-                .map_or(1.0, |wander| wander.facing);
-            DriveInput::from_state(interaction, facing)
+                .map_or(1.0, |wander| wander.turn);
+            let reaction = self
+                .world
+                .get::<PokeReaction>(entity)
+                .ok_or(SimError::UnknownInstance(id))?;
+            if model.actions.is_some() && reaction.elapsed < POKE_REACTION_SECONDS {
+                DriveInput::from_reaction(reaction, facing, turn)
+            } else {
+                DriveInput::from_state(interaction, facing, turn)
+            }
         };
 
-        // Everything is computed before anything is written, so a failed call
-        // leaves asset, pose and time exactly as they were.
-        let mut next = sample_pose(&model, time, &drive, id)?;
-        if let (
-            ModelData::Sprite2d(old_sprite),
-            ModelData::Sprite2d(new_sprite),
-            Pose::Sprite2d(new_parameters),
-        ) = (&old.data, &model.data, &mut next)
+        // Everything is computed before anything is written, including the
+        // model-shaped action state. No old transition survives a swap.
+        let reaction = self
+            .world
+            .get::<PokeReaction>(entity)
+            .ok_or(SimError::UnknownInstance(id))?;
+        let (action, mut next) = actions::initialize(&model, 0.0, time, reaction, &drive, id)?;
+        let initial_action = action.0.as_ref().map(|playback| playback.kind);
+        if model.actions.is_none()
+            && let (
+                ModelData::Sprite2d(old_sprite),
+                ModelData::Sprite2d(new_sprite),
+                Pose::Sprite2d(new_parameters),
+            ) = (&old.data, &model.data, &mut next)
             && let Pose::Sprite2d(current_parameters) = &current
         {
             for (index, parameter) in new_sprite.parameters.iter().enumerate() {
@@ -671,20 +952,28 @@ impl Simulation {
             }
         }
 
-        {
-            let mut handle = self
-                .world
-                .get_mut::<ModelHandle>(entity)
-                .ok_or(SimError::UnknownInstance(id))?;
-            handle.asset = asset;
-            handle.model = model;
+        social::cancel(&mut self.world, id);
+        let attention_model = Arc::clone(&model);
+        self.world.entity_mut(entity).insert((
+            ModelHandle { asset, model },
+            PoseState {
+                prev: next.clone(),
+                curr: next,
+            },
+            action,
+        ));
+        // Only after the successful commit: the new model's rest extents
+        // replace the cached ones, and every model-shaped presentation value
+        // (drag, settle, pointer/edge/idle and the poke streak) starts over.
+        // A failed swap above returns before this and keeps the old state.
+        attention::reset_for_model(&mut self.world, entity, &attention_model);
+        if let Some(action) = initial_action {
+            self.world.resource_mut::<ActionEvents>().push(ActionEvent {
+                instance: id,
+                action,
+                restarted: false,
+            });
         }
-        let mut pose = self
-            .world
-            .get_mut::<PoseState>(entity)
-            .ok_or(SimError::UnknownInstance(id))?;
-        pose.prev = next.clone();
-        pose.curr = next;
         Ok(())
     }
 
@@ -711,6 +1000,13 @@ impl Simulation {
             position,
             neighbor: interaction.neighbor,
             animation_time: time,
+            action: self
+                .world
+                .get::<ActionState>(entity)?
+                .0
+                .as_ref()
+                .map(|playback| playback.kind),
+            social: self.world.get::<SocialState>(entity)?.active,
         })
     }
 
@@ -776,6 +1072,7 @@ impl Simulation {
     /// skin matrices. No JSON is parsed and no GPU resource is touched here.
     pub fn render_frame(&self) -> Result<RenderFrame, SimError> {
         let alpha = self.alpha();
+        let attention_enabled = self.attention_enabled();
         let mut instances = Vec::with_capacity(self.entities.len());
         for (&id, &entity) in &self.entities {
             let handle = self
@@ -794,18 +1091,42 @@ impl Simulation {
             // Translation times a horizontal mirror around the instance's
             // own centre line; the facing is exactly ±1.0, so the matrix is
             // exact and needs no epsilon anywhere.
-            let facing = self
-                .world
-                .get::<WanderState>(entity)
-                .map_or(1.0, |wander| wander.facing);
+            //
+            // Only 2D sprites mirror. A 3D skeleton keeps the authored root
+            // orientation so asymmetric details (the scarf print, for
+            // example) never appear reversed; the walk direction is conveyed
+            // by the walk clip and the pose drive. Enforcing it here as well
+            // keeps a stale or externally built state from reintroducing the
+            // mirror.
+            let facing = if handle.model.kind() == ModelKind::Sprite2d {
+                self.world
+                    .get::<WanderState>(entity)
+                    .map_or(1.0, |wander| wander.facing)
+            } else {
+                1.0
+            };
             // The poke hop is a presentation-only vertical offset; the
             // instance position itself never moves.
             let hop = self
                 .world
                 .get::<PokeReaction>(entity)
                 .map_or(0.0, |reaction| systems::poke_hop(reaction.elapsed));
-            let transform = Mat4::from_translation(position + Vec3::new(0.0, hop, 0.0))
+            let mut transform = Mat4::from_translation(position + Vec3::new(0.0, hop, 0.0))
                 * Mat4::from_scale(Vec3::new(facing, 1.0, 1.0));
+            // Opt-in root presentation: one bounded shear/scale pair around
+            // the model's rest bottom. A neutral presentation returns exactly
+            // `(0.0, 1.0)`, so the original matrix expression stays untouched
+            // (no identity multiply, no changed signed zeros).
+            if attention_enabled && let Some(state) = self.world.get::<AttentionState>(entity) {
+                let (shear, scale_y) = state.interpolated_presentation(alpha);
+                if shear != 0.0 || scale_y != 1.0 {
+                    // The presentation is local to the model, which the
+                    // mirror above may flip; compensating with the exact
+                    // `facing` sign keeps the world-space lean direction.
+                    transform *=
+                        attention::presentation_matrix(state.base_y, shear * facing, scale_y);
+                }
+            }
             match &handle.model.data {
                 ModelData::Sprite2d(sprite) => {
                     let parameters =
