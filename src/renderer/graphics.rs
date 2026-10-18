@@ -60,6 +60,18 @@ pub struct Graphics {
     device_lost: Arc<AtomicBool>,
 }
 
+fn validate_surface_size(size: PhysicalSize<u32>, limit: u32) -> Result<(), RenderError> {
+    if size.width > limit || size.height > limit {
+        return Err(RenderError::SurfaceUnsupported {
+            details: format!(
+                "surface {}x{} exceeds device max_texture_dimension_2d={limit}",
+                size.width, size.height
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl Graphics {
     /// Creates the device and both window surfaces.
     ///
@@ -190,6 +202,15 @@ impl Graphics {
             });
         }
 
+        let limit = device.limits().max_texture_dimension_2d;
+        validate_surface_size(
+            PhysicalSize::new(overlay_config.width, overlay_config.height),
+            limit,
+        )?;
+        validate_surface_size(
+            PhysicalSize::new(control_config.width, control_config.height),
+            limit,
+        )?;
         overlay_surface.configure(&device, &overlay_config);
         control_surface.configure(&device, &control_config);
 
@@ -471,10 +492,11 @@ impl Graphics {
     ///
     /// A zero-sized (minimized) window is left configured as-is; the current
     /// size is restored when a nonzero size arrives.
-    pub fn resize(&mut self, id: WindowId, size: PhysicalSize<u32>) {
+    pub fn resize(&mut self, id: WindowId, size: PhysicalSize<u32>) -> Result<(), RenderError> {
         if size.width == 0 || size.height == 0 {
-            return;
+            return Ok(());
         }
+        validate_surface_size(size, self.device.limits().max_texture_dimension_2d)?;
         if id == self.overlay_id {
             self.overlay_config.width = size.width;
             self.overlay_config.height = size.height;
@@ -486,6 +508,7 @@ impl Graphics {
             self.control_surface
                 .configure(&self.device, &self.control_config);
         }
+        Ok(())
     }
 
     // -- surface acquisition -------------------------------------------------
@@ -631,5 +654,20 @@ fn pick_present_mode(modes: &[wgpu::PresentMode]) -> Result<wgpu::PresentMode, R
             .ok_or_else(|| RenderError::SurfaceUnsupported {
                 details: "surface advertises no presentation modes".into(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PhysicalSize, validate_surface_size};
+
+    #[test]
+    fn surface_size_rejects_either_dimension_before_configuration() {
+        assert!(validate_surface_size(PhysicalSize::new(4160, 2560), 8192).is_ok());
+        assert!(validate_surface_size(PhysicalSize::new(8192, 8192), 8192).is_ok());
+        for size in [PhysicalSize::new(8193, 1), PhysicalSize::new(1, 8193)] {
+            let error = validate_surface_size(size, 8192).unwrap_err().to_string();
+            assert!(error.contains("max_texture_dimension_2d=8192"));
+        }
     }
 }
