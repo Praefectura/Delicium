@@ -67,6 +67,7 @@ pub const WS_MINIMIZEBOX: u32 = 0x0002_0000;
 pub const WS_CHILD: u32 = 0x4000_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_TABSTOP: u32 = 0x0001_0000;
+pub const WS_BORDER: u32 = 0x0080_0000;
 
 /// Static-control styles.
 pub const SS_LEFT: u32 = 0x0000_0000;
@@ -75,6 +76,21 @@ pub const SS_LEFTNOWORDWRAP: u32 = 0x0000_000C;
 /// Button styles.
 pub const BS_PUSHBUTTON: u32 = 0x0000_0000;
 pub const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
+
+/// Edit-control styles and messages.
+pub const ES_AUTOHSCROLL: u32 = 0x0080;
+pub const ES_PASSWORD: u32 = 0x0020;
+pub const EM_SETLIMITTEXT: u32 = 0x00C5;
+
+/// Combo-box styles and messages.
+pub const CBS_DROPDOWNLIST: u32 = 0x0003;
+pub const CB_ADDSTRING: u32 = 0x0143;
+pub const CB_RESETCONTENT: u32 = 0x014B;
+pub const CB_GETCURSEL: u32 = 0x0147;
+pub const CB_SETCURSEL: u32 = 0x014E;
+
+/// Notification codes in `HIWORD(wParam)` of [`WM_COMMAND`].
+pub const CBN_SELCHANGE: u16 = 1;
 
 /// `ShowWindow` commands.
 pub const SW_SHOWNORMAL: i32 = 1;
@@ -277,6 +293,8 @@ unsafe extern "system" {
     pub fn GetWindowThreadProcessId(window: Hwnd, pid: *mut u32) -> u32;
     pub fn SetProcessDpiAwarenessContext(context: isize) -> i32;
     pub fn GetDlgItem(window: Hwnd, id: i32) -> Hwnd;
+    pub fn GetWindowTextW(window: Hwnd, text: *mut u16, max: i32) -> i32;
+    pub fn GetWindowTextLengthW(window: Hwnd) -> i32;
     pub fn PostQuitMessage(code: i32);
     pub fn LoadCursorW(instance: Hinstance, name: *const u16) -> Hcursor;
     pub fn GetSysColorBrush(index: i32) -> Hbrush;

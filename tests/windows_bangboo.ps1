@@ -3,7 +3,9 @@ param(
     [switch]$ValidateOnly
 )
 
-# Stable two-pet acceptance: --no-wander pins positions, not social playback.
+# Stable pet acceptance: --no-wander pins positions, not social playback. The
+# scene starts with one character; the second is added from the model library
+# so the pairing assertions run against a real two-character scene.
 # Reuse only the trusted actions harness's C# and named helper definitions;
 # never dot-source its top-level launch/input code. All input/capture guards
 # therefore stay identical to the existing independently checked helpers.
@@ -146,11 +148,10 @@ try {
     } while ([DateTime]::Now -lt $deadline)
     Assert-Test ($script:scene -ne [IntPtr]::Zero -and $script:controls -ne [IntPtr]::Zero) 'PID-scoped scene and controls exist'
     Assert-Test (([ActionsNative]::Owner($script:scene) -eq $script:process.Id) -and ([ActionsNative]::Owner($script:controls) -eq $script:process.Id)) 'Both handles belong to the launched process'
-    Wait-Log 'spawn instance=\d+ asset=\d+ kind=skeleton3d' 2 15000
-    Assert-Test ((Count-Log 'spawn instance=') -eq 2) 'Bangboo mode spawns exactly two 3D pets'
+    Wait-Log 'spawn instance=\d+ asset=\d+ kind=skeleton3d' 1 15000
+    Assert-Test ((Count-Log 'spawn instance=') -eq 1) 'Bangboo mode starts with exactly one 3D pet'
     $initialAsset = [regex]::Match([string](@(Get-LogLines | Select-String 'spawn instance=1 ') | Select-Object -Last 1), 'asset=(\d+)')
     Assert-Test $initialAsset.Success 'The initial bundled Bangboo asset is identifiable'
-    Wait-Log 'social pair first=1 second=2 phase=greet' 1 10000
     Wait-Log 'hit_region mode=pixel' 1 10000
     $script:rectangle = [ActionsNative]::Client($script:scene)
     Assert-Test (-not [ActionsNative]::SpansPrimaryMonitor($script:rectangle)) 'Capture is bounded and cannot cover the desktop'
@@ -164,6 +165,16 @@ try {
     [ActionsNative]::Raise($script:scene); [ActionsNative]::Raise($script:controls)
     Start-Sleep -Milliseconds 150
     Assert-Test ([ActionsNative]::Hit($script:rectangle.Left+40,$script:rectangle.Top+40) -eq $script:backdrop) 'Empty scene passes through to the owned backdrop'
+
+    # Add the second pet from the model library. The Eous row sits at logical
+    # y=277 in the one-character layout (the instance list holds a single row);
+    # its asset must be the already-loaded one, not a reload.
+    $addFrom = (Get-LogLines).Count
+    Click-Control 59 277
+    $second = Wait-Fresh $addFrom 'spawn instance=2 asset=(\d+) kind=library' 5000
+    $secondAsset = [regex]::Match($second, 'asset=(\d+)')
+    Assert-Test ($secondAsset.Groups[1].Value -eq $initialAsset.Groups[1].Value) 'The library adds the second pet from the same resident asset'
+    Wait-Log 'social pair first=1 second=2 phase=greet' 1 10000
 
     # Setup can outlast the first greeting. Synchronize on a new cycle rather
     # than treating any historical startup event as the current capture phase.
@@ -198,8 +209,9 @@ try {
     Start-Sleep -Milliseconds 250
     $idle = Shot 'scene-idle.png'
 
-    # No overlapping silhouettes: the two model centers are 1.3 world units apart.
-    $point = Anchor -0.65
+    # The initial pet sits at the scene center; the added one is 1.1 world
+    # units to its left, so their silhouettes never overlap.
+    $point = Anchor 0.0
     $from = (Get-LogLines).Count
     Press $point
     Start-Sleep -Milliseconds 80
@@ -210,7 +222,7 @@ try {
     Start-Sleep -Milliseconds 150
     $reaction = Shot 'scene-reaction.png'
     Assert-Test ([ActionsNative]::Difference($idle,$reaction) -gt 40) 'Physical 3D click produces a visibly different reaction'
-    $point = Anchor -0.65
+    $point = Anchor 0.0
     $repeatFrom = (Get-LogLines).Count
     Press $point
     Start-Sleep -Milliseconds 60
@@ -223,7 +235,7 @@ try {
     # Wait for a new pair, then interrupt it with an actual held/moved drag.
     $pairFrom = (Get-LogLines).Count
     [void](Wait-Fresh $pairFrom 'social pair first=1 second=2 phase=greet' 18000)
-    $point = Anchor -0.65
+    $point = Anchor 0.0
     $dragFrom = (Get-LogLines).Count
     $pokesBefore = Count-Log 'poke instance='
     Press $point
@@ -243,21 +255,25 @@ try {
     Release
     $released = Wait-Fresh $releaseFrom 'drag release instance=1 x=(-?[0-9.]+)'
     $releaseX = [double]::Parse(([regex]::Match($released,'x=(-?[0-9.]+)')).Groups[1].Value,$invariant)
-    Assert-Test ($releaseX -gt -0.55 -and $releaseX -lt -0.2) 'Drag changes the actual pet world position by the expected small distance'
+    Assert-Test ($releaseX -gt 0.1 -and $releaseX -lt 0.45) 'Drag changes the actual pet world position by the expected small distance'
     Assert-Test ((Count-Log 'poke instance=') -eq $pokesBefore) 'A real drag does not accidentally trigger a click'
     [void](Shot 'scene-after-drag.png')
     [void](Wait-Fresh $releaseFrom 'social pair first=1 second=2 phase=greet' 18000)
     Assert-Test $true 'Both pets can pair again after drag release and cooldown'
 
-    # Exercise the real controls: another 3D pet must reuse the bundled asset,
-    # while Add 2D must retain the existing textured 2D source.
+    # Exercise the real controls. The engine no longer special-cases Add 3D
+    # for the pet: the pet's own character comes from the model library, so
+    # the "Eous Add" row must reuse the already-resident asset (no reload),
+    # while Add 2D must still add the separate textured 2D example. The Add
+    # 2D/3D row sits at logical y=122 below the two checkboxes; with two
+    # characters in the list, the library's first row is at logical y=298.
     $addFrom = (Get-LogLines).Count
-    Click-Control 91 101
-    $added3d = Wait-Fresh $addFrom 'spawn instance=3 asset=(\d+) kind=skeleton3d' 5000
+    Click-Control 59 298
+    $added3d = Wait-Fresh $addFrom 'spawn instance=3 asset=(\d+) kind=library' 5000
     $asset3d = [regex]::Match($added3d, 'asset=(\d+)')
-    Assert-Test ($asset3d.Groups[1].Value -eq $initialAsset.Groups[1].Value) 'Add 3D adds another Bangboo from the same bundled asset'
+    Assert-Test ($asset3d.Groups[1].Value -eq $initialAsset.Groups[1].Value) 'The library adds a third Bangboo from the same resident asset'
     $addFrom = (Get-LogLines).Count
-    Click-Control 34 101
+    Click-Control 33 122
     $added2d = Wait-Fresh $addFrom 'spawn instance=4 asset=(\d+) kind=sprite2d' 10000
     $asset2d = [regex]::Match($added2d, 'asset=(\d+)')
     Assert-Test ($asset2d.Groups[1].Value -ne $initialAsset.Groups[1].Value) 'Add 2D retains the separate textured 2D asset'

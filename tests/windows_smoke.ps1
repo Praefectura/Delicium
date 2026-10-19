@@ -499,18 +499,23 @@ try {
     $pokeDelta = [Math]::Abs($pokeX - [double]$releaseMatch.Groups[2].Value)
     Assert-Test ($pokeDelta -lt 0.001) ('A poke does not move the character: delta ' + $pokeDelta)
 
-    # Add buttons spawn immediately from the loaded examples.
+    # Add buttons spawn immediately from the loaded examples. Coordinates are
+    # measured from a 380-logical-wide capture of this layout; the Add row
+    # sits below the hit-region and wander checkboxes.
     $spawnBaseline = Count-Log 'spawn instance='
-    Click-Control 34 101 'Add 2D'
-    Click-Control 91 101 'Add 3D'
+    Click-Control 33 122 'Add 2D'
+    Click-Control 92 122 'Add 3D'
     Start-Sleep -Milliseconds 300
     Assert-Test ((Count-Log 'spawn instance=') -eq ($spawnBaseline + 2)) 'Add 2D and Add 3D each spawn one character'
 
-    # Select the first list row, then reload it.
-    Click-Control 30 149 'character list row 1'
+    # Select the first list row, then reload it. Offsets from the path field
+    # center are layout-stable: adding characters grows the list until its
+    # 120px cap, and every widget below it (path field included) moves by the
+    # same amount.
+    Click-Control 30 170 'character list row 1'
     $field = Get-FieldRow
     $replaceBaseline = Count-Log 'replace instance=1\b'
-    Click-Control 57 ($field.LogicalY - 48) 'Reload selected'
+    Click-Control 58 ($field.LogicalY - 193) 'Reload selected'
     Assert-Test (Wait-Increase 'replace instance=1\b' $replaceBaseline 1 4000) 'Reload selected replaces the selected character'
 
     # Pasted local path: Load as new spawns a new character.
@@ -519,7 +524,7 @@ try {
     $field = Get-FieldRow
     Set-FieldText $copy $field
     $spawnBaseline = Count-Log 'spawn instance='
-    Click-Control 47 ($field.LogicalY + 23) 'Load as new'
+    Click-Control 47 ($field.LogicalY + 22) 'Load as new'
     Assert-Test (Wait-Increase 'spawn instance=' $spawnBaseline 1 5000) 'Load as new spawns the pasted model'
 
     # Pasted invalid path: Replace selected must fail and keep the character.
@@ -528,7 +533,7 @@ try {
     $field = Get-FieldRow
     Set-FieldText $invalid $field
     $replaceBaseline = Count-Log 'replace instance='
-    Click-Control 147 ($field.LogicalY + 23) 'Replace selected'
+    Click-Control 148 ($field.LogicalY + 22) 'Replace selected'
     Assert-Test (Wait-Increase 'invalid-2d' 0 1 5000) 'A failed replace reports an error for the rejected model'
     Start-Sleep -Milliseconds 300
     Assert-Test ((Count-Log 'replace instance=') -eq $replaceBaseline) 'A failed replace does not replace any character'
@@ -537,7 +542,7 @@ try {
     # failed replace. (It is instance 1, re-selected via list row 1.)
     $field = Get-FieldRow
     $removeBaseline = Count-Log 'remove instance='
-    Click-Control 169 ($field.LogicalY - 48) 'Remove selected'
+    Click-Control 169 ($field.LogicalY - 193) 'Remove selected'
     Assert-Test (Wait-Increase 'remove instance=1\b' $removeBaseline 1 4000) 'Remove selected removes the character that survived the failed replace'
 
     Assert-Test ((Count-Log 'hit_region mode=fallback') -eq 0) 'All GUI coverage completed without hit-region fallback'
