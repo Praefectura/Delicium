@@ -71,9 +71,9 @@
 
 - **离线门**：`fmt --check`、`clippy --all-targets -D warnings`、274 项 lib 测试（19 项按设计忽略）、七个非 GPU 集成目标、八项硬件 GPU 测试与 release 构建，共 390 通过、0 失败；两个 `GetGuiResources` 泄漏测试在独立进程中通过；八套 Windows GUI 验收脚本通过；启动器与设置页的握手用跨进程探针实测通过；版本保留在合成安装根上完成 16 项端到端断言（含二次启动幂等）。
 - **对话传输**：会话面板与 OpenAI 兼容客户端只在本机回环夹具上验证过，含拒绝重定向与错误状态；**未联系任何真实第三方 LLM 服务**。可选的 API key 以明文存放在 `%APPDATA%\Delicium\config.json`。
-- **发布流水线**：tag `v0.1.0` 与 `v0.1.1` 各自触发 `.github/workflows/release.yml` 在 `windows-latest` 上运行，两次均全绿，各发布三个资产：`delicium-launcher.exe`、`delicium.exe`、`latest.json`。未认证请求 `releases/latest/download/latest.json` 能拿到清单；该请求重定向到 `objects.githubusercontent.com`，由客户端的 WinHTTP 重定向策略跟随。推送到 `main` 会跑同样的 fmt/clippy/build/test 步骤并把两个 exe 作为工作流产物上传，但不发布 Release。
+- **发布流水线**：每个 tag 触发 `.github/workflows/release.yml` 在 `windows-latest` 上运行，均全绿并发布三个资产：`delicium-launcher.exe`、`delicium.exe`、`latest.json`。`v0.1.2` 的 tag run（`39221001049`）与 main push run（`39220976113`）都成功；后者上传 11.2 MB 工作流产物并跳过发布步骤，因此合并到 `main` 不会创建 Release。三个 `v0.1.2` 资产均为 `state=uploaded`，其 digest 与匿名清单逐条一致（清单里 `min_launcher_version "0.1.2"`）；该请求重定向到 `objects.githubusercontent.com`，由客户端的 WinHTTP 重定向策略跟随。
 - **从已发布 Release 安装**：把 `v0.1.0` 的启动器下载到本机，指向一个空安装根，经网络取清单与引擎、校验 SHA-256、装入 `app/0.1.0/delicium.exe` 并运行至干净退出；落盘引擎哈希与清单一致。第二次启动报告 `Up to date (0.1.0)`，未重复安装。同样的两阶段在 `v0.1.1` 上用全新空根跑通：清单、24.7 MB 下载、SHA-256 与 size 匹配、`app/0.1.1`、引擎启动确认、干净退出，再到 `Up to date (0.1.1)` 且只保留一个版本目录，24 项断言全过，耗时 36 秒。
-- **仍未完成**：上述端到端都是在开发机上用隔离的 `DELICIUM_INSTALL_ROOT` 跑的，不是在全新机器上。`v0.1.2` 把 `min_launcher_version` 提到 `0.1.2`，已安装的 `0.1.1` 启动器会先替换自身镜像再装新引擎；这条自替换路径是本版新增。双屏实机验收未做。
+- **仍未完成**：上述端到端都是在开发机上用隔离的 `DELICIUM_INSTALL_ROOT` 跑的，不是在全新机器上。`v0.1.2` 把 `min_launcher_version` 提到 `0.1.2`，已安装的 `0.1.1` 启动器会先替换自身镜像再装新引擎；这条分支已随版本发布，但还没有在预置 0.1.1 的安装根上实际执行过。双屏实机验收未做。
 
 请把更新器理解为"已实现并端到端跑通过一次"，而不是"久经考验"。
 

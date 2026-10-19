@@ -148,13 +148,14 @@ actually been run:
   against a loopback HTTP fixture owned by the test, including refusal of redirects and
   error statuses. **No real third-party LLM service has been contacted**, and the optional
   API key is stored in plain text in `%APPDATA%\Delicium\config.json`.
-- **Release pipeline.** Tags `v0.1.0` and `v0.1.1` each triggered
-  `.github/workflows/release.yml` on `windows-latest`; every run finished green and published
-  three assets: `delicium-launcher.exe`, `delicium.exe` and `latest.json`. An anonymous
-  request to `releases/latest/download/latest.json` returns the manifest, which redirects to
+- **Release pipeline.** Each tag triggered `.github/workflows/release.yml` on
+  `windows-latest`; every run finished green and published three assets:
+  `delicium-launcher.exe`, `delicium.exe` and `latest.json`. For `v0.1.2` the tag run
+  (`39221001049`) and the `main` push run (`39220976113`) both succeeded; the latter uploaded
+  an 11.2 MB workflow artifact and skipped the publish step, so merging to `main` never
+  creates a Release. The three `v0.1.2` assets report `state=uploaded` and their digests match
+  the anonymous manifest (`min_launcher_version "0.1.2"`), which redirects to
   `objects.githubusercontent.com` and is followed by the client's WinHTTP redirect policy.
-  Pushes to `main` run the same format/lint/build/test steps and upload both executables as
-  workflow artifacts, but never publish.
 - **Install from the published Release.** The `v0.1.0` launcher downloaded from the Release,
   pointed at an empty installation root, fetched the manifest and the engine over the
   network, verified SHA-256, installed `app/0.1.0/delicium.exe`, and ran it to a clean exit.
@@ -166,8 +167,8 @@ actually been run:
 - **Still outstanding.** Those end-to-end runs happened on the development machine with an
   isolated `DELICIUM_INSTALL_ROOT`, not on a pristine machine. `v0.1.2` raises
   `min_launcher_version` to `0.1.2` so that an installed `0.1.1` launcher replaces its own
-  image first; that self-replacement path is new in this release. Dual-monitor acceptance is
-  untested.
+  image first; that branch is shipped but has not been executed against a pre-seeded `0.1.1`
+  installation root. Dual-monitor acceptance is untested.
 
 Treat the updater as implemented and exercised end to end once, not as battle-tested.
 

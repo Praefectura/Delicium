@@ -513,4 +513,8 @@ v19 的 8 项实际资产测试、9600 帧持续待机/恢复中再次点击采�
 
 **main 构建。** `release.yml` 增加 `push: branches: [main]` 触发：分支构建跑同样的 fmt/clippy/build/test，把两个 exe 与 `latest.json` 作为工作流产物上传，但不创建 Release；只有 `vX.Y.Z` tag 才发布。版本解析拆成单独一步，分支构建从 `Cargo.toml` 取版本且不声明 tag，tag 构建仍校验 tag 与 `Cargo.toml` 一致、拒绝预发布格式。
 
-口径：E2E 仍是在开发机上用隔离 `DELICIUM_INSTALL_ROOT` 跑的，不是全新机器；未在真实用户安装根上执行任何覆盖或删除。`min_launcher_version` 自替换路径在 v0.1.2 发布后需要单独验证。
+**发布核实。** 两次 workflow 均 `completed/success`：`main` push 的 run `39220976113` 的 `Publish` 步骤为 `skipped`，只上传了 11,209,153 字节的 `delicium-0.1.2-b2830a1eefd025b57689ab652171eff4652fe8e7` artifact；tag run `39221001049` 发布了 `v0.1.2`（`draft=false`、`prerelease=false`），三个资产 `delicium-launcher.exe` 2,126,848 B、`delicium.exe` 24,724,480 B、`latest.json` 685 B 均为 `state=uploaded`，GitHub API 报告的 digest 与匿名拉取的清单逐条一致。清单内容为 `version 0.1.2`、`min_launcher_version "0.1.2"`、launcher sha256 `fd3f7bb3bbd9df9e30324fff1b523877ddd48b4b3f20bdb62e7b64719ac646c0`、engine sha256 `32f6508c3b204ad009ad20d81ceaa2baada3c2dd4aff5e2a9a85ea61fba4bfcd`。本地 release 构建的启动器哈希（`d9e80072…`）与 CI 产物不同，属工具链与路径元数据差异，以 CI 产物为准。
+
+**拉取清单时的连通性现象。** 匿名 `curl` 首次失败（`(28) Connection timed out`）。`Resolve-DnsName github.com` 解析到 `20.205.243.166`，该地址连接超时；`140.82.112.3`、`140.82.113.3`、`140.82.114.3` 均返回 `302`；`netsh winhttp show proxy` 显示直连、无环境代理。用 `--resolve github.com:443:140.82.112.3` 后成功。这说明 push "时好时坏"取决于本次命中的 A 记录，不能因为某次直连成功就认为连通性已恢复。
+
+口径：E2E 仍是在开发机上用隔离 `DELICIUM_INSTALL_ROOT` 跑的，不是全新机器；未在真实用户安装根上执行任何覆盖或删除。`min_launcher_version` 自替换路径目前是"已发布、未执行"——`install_launcher` 分支还没有在预置旧启动器的隔离安装根上跑过，需要在连通性可用时单独验证 `launcher.json` 生成与二次启动装新引擎。
