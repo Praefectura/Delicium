@@ -47,28 +47,56 @@ def finite_vector(value, size, label):
 
 
 def walk_angles(phase):
-    """Sagittal steps; the stance foot and swing foot exchange every half-cycle."""
+    """Stiff-legged waddle; the stance and swing legs exchange every half-cycle.
+
+    The visible step comes from the hip swing, not from knee flexion: both
+    knees hold the source idle's 44-degree crouch for the whole cycle, so the
+    leg reads as one stiff rod that pivots under the body. The torso leans
+    over the planted foot and the head counter-rolls, which is what sells the
+    waddle. The knee angle is still authored per key (constant) so a re-export
+    reproduces every track explicitly.
+    """
     require(math.isfinite(phase), "Invalid walk phase")
     # Enter with neutral hip swing rather than maximum leg separation.
     phase = (phase + 0.25) % 1.0
     wave = math.sin(phase * 2 * math.pi)
     stride = math.cos(phase * 2 * math.pi)
-    angles = {"hips": ("Y", 25.0), "spine_01": ("Y", 3 * wave)}
+    angles = {
+        "hips": [("Y", 25.0)],
+        # Roll peaks with the stance foot, so the body rocks over it; the head
+        # keeps half of its upright attitude instead of following the torso.
+        "spine_01": [("Z", -10 * wave), ("Y", 2 * wave), ("X", 2 * abs(wave))],
+        "head": [("Z", 5 * wave)],
+    }
     for side, sign in (("left", 1), ("right", -1)):
         swing = max(0.0, -sign * wave)
-        # A moderate crouch bridges both the bent source idle and the straight
-        # reaction's return. Grounded clip endpoints alone do not guarantee
-        # clearance inside their TRS/slerp crossfades.
-        hip = -22 - sign * 13 * stride
-        knee = 44 + 18 * swing ** 2
-        angles[side + "Leg"] = ("X", hip)
-        angles[side + "Knee"] = ("X", knee)
+        hip = -28 - sign * 16 * stride
+        knee = 44.0
+        angles[side + "Leg"] = [("X", hip)]
+        angles[side + "Knee"] = [("X", knee)]
         # The source has no foot vertex weights: this terminal joint track is
-        # authored consistently, but visible sole clearance comes from the knee.
-        angles[side + "Foot"] = ("X", -hip - knee - 4 * swing ** 2)
-        angles[side + "Arm"] = ("X", sign * 12 * stride)
-        angles[side + "Ear_02"] = ("X", sign * 5 * wave)
+        # authored consistently, but the visible sole follows the knee.
+        angles[side + "Foot"] = [("X", -hip - knee)]
+        angles[side + "Arm"] = [("X", sign * 12 * stride),
+                                ("Z", sign * 6 * (0.4 + 0.6 * swing))]
+        # A quarter-second of ear lag trails the body instead of matching it.
+        lagged = math.sin((phase - 0.12) * 2 * math.pi)
+        angles[side + "Ear_02"] = [("X", sign * 5 * lagged)]
     return angles
+
+
+def walk_lifts(phase):
+    """Hip-local swing-foot lift; clearance without knee flexion.
+
+    Applied to each thigh joint's local translation, so the whole leg (thigh,
+    knee and sole) rises together and the planted foot keeps the ground. The
+    amplitude is the measured step height in world units.
+    """
+    require(math.isfinite(phase), "Invalid walk phase")
+    phase = (phase + 0.25) % 1.0
+    wave = math.sin(phase * 2 * math.pi)
+    return {"leftLeg": 0.010 * max(0.0, -wave) ** 2,
+            "rightLeg": 0.010 * max(0.0, wave) ** 2}
 
 
 def top_four(influences):
@@ -612,8 +640,11 @@ def convert(args):
             locals_[0].translation += Vector((0, amount, 0))
 
         if name == "walk":
-            for bone, (axis, angle) in walk_angles(phase).items():
-                turn(bone, axis, angle)
+            for bone, turns in walk_angles(phase).items():
+                for axis, angle in turns:
+                    turn(bone, axis, angle)
+            for bone, amount in walk_lifts(phase).items():
+                locals_[bone_index[bone]].translation += Vector((0, amount, 0))
         elif name == "reaction":
             envelope = max(0, math.sin(math.pi * phase))
             turn("head", "X", -8 * envelope)

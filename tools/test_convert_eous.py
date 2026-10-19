@@ -53,38 +53,59 @@ class ConversionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.valid = fixture()
 
-    def test_walk_is_sagittal_and_exchanges_stance_each_half_cycle(self):
+    def test_walk_is_a_stiff_legged_waddle_without_knee_flexion(self):
         for step in range(241):
             phase = step / 240
             a = CONVERTER.walk_angles(phase)
             b = CONVERTER.walk_angles(phase + 0.5)
-            self.assertEqual(a["hips"], ("Y", 25.0))
-            for suffix in ("Leg", "Knee", "Foot", "Arm", "Ear_02"):
-                self.assertEqual(a["left" + suffix][0], "X")
-                self.assertAlmostEqual(a["left" + suffix][1], b["right" + suffix][1])
-            self.assertAlmostEqual(a["leftLeg"][1] + a["rightLeg"][1], -44)
+            self.assertEqual(a["hips"], [("Y", 25.0)])
             for side in ("left", "right"):
-                self.assertGreaterEqual(a[side + "Knee"][1], 44)
-                self.assertLessEqual(a[side + "Knee"][1], 62)
-            self.assertAlmostEqual(min(a["leftKnee"][1], a["rightKnee"][1]), 44)
+                # The knee holds the source crouch all cycle: the visible step
+                # is the hip swing, not a pumping knee.
+                self.assertEqual(a[side + "Knee"], [("X", 44.0)])
+                # Feet stay flat on the ground by cancelling hip and knee.
+                hip = dict(a[side + "Leg"])["X"]
+                self.assertEqual(dict(a[side + "Foot"])["X"], -hip - 44.0)
+            for suffix in ("Leg", "Knee", "Foot", "Arm", "Ear_02"):
+                self.assertAlmostEqual(dict(a["left" + suffix])["X"],
+                                       dict(b["right" + suffix])["X"])
+            self.assertAlmostEqual(dict(a["spine_01"])["Z"],
+                                   -dict(b["spine_01"])["Z"])
+            self.assertAlmostEqual(dict(a["head"])["Z"], -dict(b["head"])["Z"])
+            self.assertAlmostEqual(dict(a["leftLeg"])["X"] + dict(a["rightLeg"])["X"], -56)
+            self.assertAlmostEqual(CONVERTER.walk_lifts(phase)["leftLeg"],
+                                   CONVERTER.walk_lifts(phase + 0.5)["rightLeg"])
         self.assertEqual(CONVERTER.walk_angles(0), CONVERTER.walk_angles(1))
-        self.assertEqual(CONVERTER.walk_angles(0)["leftKnee"][1], 44)
-        self.assertEqual(CONVERTER.walk_angles(0)["rightKnee"][1], 62)
-        self.assertEqual(CONVERTER.walk_angles(0.5)["leftKnee"][1], 62)
-        self.assertAlmostEqual(CONVERTER.walk_angles(0)["leftLeg"][1], -22)
-        self.assertAlmostEqual(CONVERTER.walk_angles(0)["rightLeg"][1], -22)
+        self.assertEqual(dict(CONVERTER.walk_angles(0)["leftLeg"])["X"], -28)
+        self.assertEqual(dict(CONVERTER.walk_angles(0.25)["leftLeg"])["X"], -12)
+        self.assertEqual(dict(CONVERTER.walk_angles(0.25)["rightLeg"])["X"], -44)
+        self.assertEqual(CONVERTER.walk_lifts(0)["leftLeg"], 0)
+        self.assertEqual(CONVERTER.walk_lifts(0)["rightLeg"], 0.010)
+        self.assertAlmostEqual(CONVERTER.walk_lifts(0.25)["rightLeg"], 0)
+        self.assertEqual(CONVERTER.walk_lifts(0.5)["leftLeg"], 0.010)
 
     def test_walk_is_finite_smooth_and_rejects_nonfinite_phase(self):
         previous = CONVERTER.walk_angles(-1 / 10000)
+        previous_lifts = CONVERTER.walk_lifts(-1 / 10000)
         for step in range(10001):
             current = CONVERTER.walk_angles(step / 10000)
-            for bone, (axis, angle) in current.items():
-                self.assertTrue(math.isfinite(angle))
-                self.assertLess(abs(angle - previous[bone][1]), 0.05)
+            lifts = CONVERTER.walk_lifts(step / 10000)
+            for bone, turns in current.items():
+                for axis, angle in turns:
+                    old = dict(previous[bone])[axis]
+                    self.assertTrue(math.isfinite(angle))
+                    self.assertLess(abs(angle - old), 0.05)
+            for bone, amount in lifts.items():
+                self.assertTrue(math.isfinite(amount))
+                self.assertGreaterEqual(amount, 0)
+                self.assertLess(abs(amount - previous_lifts[bone]), 1e-5)
             previous = current
+            previous_lifts = lifts
         for phase in (float("nan"), float("inf"), -float("inf")):
             with self.assertRaisesRegex(ValueError, "walk phase"):
                 CONVERTER.walk_angles(phase)
+            with self.assertRaisesRegex(ValueError, "walk phase"):
+                CONVERTER.walk_lifts(phase)
 
     def test_valid_contract_encodes(self):
         result = CONVERTER.validate_payload(self.valid)
