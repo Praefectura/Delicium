@@ -99,9 +99,30 @@ pub fn run() -> Result<(), String> {
         return Ok(());
     };
 
-    let state = load_state(&root);
+    let mut state = load_state(&root);
+    // Earlier builds recorded a version to fall back to. Nothing uses that
+    // slot any more and the retention policy deletes the directory, so the
+    // reference is dropped rather than left naming a directory that is gone.
+    if state.previous.take().is_some() {
+        log::info!("dropping the recorded fallback version; only one version is kept");
+        if let Err(error) = state.save(&root, unix_now()) {
+            log::warn!("cannot save the installation state: {error}");
+        }
+    }
     let installer = Installer::new(&root);
+    // A crash leaves a staging directory that nothing refers to, and every
+    // update leaves the previous engine version and launcher image behind.
+    // Start from the state, keep one launcher backup; everything else only
+    // costs disk.
+    installer.clear_staging();
+    let backups = update::prune_launcher_backups(&root, 1);
+    if !backups.is_empty() {
+        log::info!("pruned {} launcher backup(s)", backups.len());
+    }
     let target = update::target_version(&installer, &state);
+    // The scan fallback may have found a version installed but never recorded
+    // as pending; it is about to run, so it must survive the prune.
+    prune_engines(&installer, &state, target.as_ref());
     let shared = Arc::new(Shared::new(
         root.clone(),
         Some(paths::launcher_exe(&root)),
@@ -389,7 +410,7 @@ fn supervise(shared: Arc<Shared>, options: cli::Options) {
                 discard_pending,
             } => {
                 if discard_pending {
-                    discard_and_roll_back(&shared);
+                    discard_failed_version(&shared);
                 }
                 log::info!("restarting the engine in {} ms", after.as_millis());
                 next_start = now + after;
@@ -412,15 +433,24 @@ fn needs_installed_engine(options: &cli::Options, shared: &Shared) -> bool {
     options.engine.is_none() && shared.target().is_none()
 }
 
-/// The engine's command line: the pet scene unless the caller was explicit.
-fn engine_arguments(options: &cli::Options) -> Vec<OsString> {
+/// The engine's command line: the configured pet unless the caller was
+/// explicit.
+fn engine_arguments(options: &cli::Options, default_model: &str) -> Vec<OsString> {
     if options.engine_args.is_empty() {
-        // The product is the pet: a double click starts the bundled Bangboo
-        // scene, not the developer's example scene.
-        vec![OsString::from("--bangboo")]
+        // The product is the pet: a double click starts the character chosen
+        // on the settings page, not the developer's example scene.
+        vec![OsString::from("--pet"), OsString::from(default_model)]
     } else {
         options.engine_args.clone()
     }
+}
+
+/// The default character from the shared configuration, falling back to the
+/// bundled pet when the file is missing or unusable.
+fn configured_pet() -> String {
+    crate::preferences::read()
+        .map(|preferences| preferences.default_model)
+        .unwrap_or_else(|| crate::preferences::DEFAULT_PET.to_owned())
 }
 
 /// Starts the engine: the `--engine` override, or the installed target.
@@ -445,7 +475,8 @@ fn start_engine(shared: &Arc<Shared>, options: &cli::Options) -> Result<process:
         .launcher()
         .map(Path::to_path_buf)
         .ok_or_else(|| "The launcher path is unknown".to_owned())?;
-    process::Engine::spawn(&executable, &engine_arguments(options), &launcher)
+    let arguments = engine_arguments(options, &configured_pet());
+    process::Engine::spawn(&executable, &arguments, &launcher)
 }
 
 /// Runs one update check and records everything the page shows.
@@ -502,6 +533,11 @@ fn run_check(shared: &Arc<Shared>, fetcher: &WinHttpFetcher) -> bool {
 }
 
 /// Commits a pending version once its first run proved healthy.
+///
+/// The engine is running right now, so the running image is in use and a
+/// delete would fail on it. The version it replaces is deleted here anyway:
+/// a live image does not block deleting another version's directory, and the
+/// pending directory is kept by name.
 fn confirm_healthy(shared: &Arc<Shared>) {
     let mut state = shared.state();
     if state.pending.is_none() {
@@ -519,28 +555,57 @@ fn confirm_healthy(shared: &Arc<Shared>) {
         log::error!("cannot save the installation state: {error}");
     }
     shared.set_pending_start(false);
+    // The version this one replaced has no fallback role any more: delete its
+    // directory now rather than at the next start.
+    let installer = Installer::new(shared.root());
+    prune_engines(&installer, &state, None);
     shared.post(contract::WM_UPDATE_READY);
 }
 
-/// Drops a pending version that failed three times and returns to the
-/// version that worked before it.
-fn discard_and_roll_back(shared: &Arc<Shared>) {
+/// Drops a pending version that failed three times.
+///
+/// The failed build is not the one that was running before the update, so
+/// nothing is "rolled back": the version that was already current simply
+/// stays current. Its directory and the failed build are pruned, and the
+/// target comes from the state alone, because the directory scan would find
+/// the failed build again and start it.
+fn discard_failed_version(shared: &Arc<Shared>) {
     let now = unix_now();
     let mut state = shared.state();
-    if let Some(failed) = state.discard_pending() {
-        log::warn!("discarding {} after repeated early crashes", failed.version);
-    }
-    if let Err(error) = state.roll_back(now) {
-        // Nothing to fall back to: the current version stays and the caller
-        // reports the failure.
-        log::warn!("cannot roll back: {error}");
-    }
+    let Some(failed) = state.discard_pending() else {
+        return;
+    };
+    log::warn!("discarding {} after repeated early crashes", failed.version);
     if let Err(error) = state.save(shared.root(), now) {
         log::error!("cannot save the installation state: {error}");
     }
     shared.set_pending_start(false);
     let installer = Installer::new(shared.root());
-    shared.set_target(update::target_version(&installer, &state));
+    let target = update::state_target(shared.root(), &state);
+    prune_engines(&installer, &state, target.as_ref());
+    shared.set_target(target);
+}
+
+/// Deletes the engine versions the state does not name.
+fn prune_engines(
+    installer: &Installer,
+    state: &InstallState,
+    target: Option<&crate::update::InstalledVersion>,
+) {
+    let mut keep: Vec<String> = [&state.current, &state.pending]
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.version.clone())
+        .collect();
+    if let Some(target) = target {
+        keep.push(target.version.clone());
+    }
+    keep.sort();
+    keep.dedup();
+    let removed = installer.prune_versions(&keep);
+    if !removed.is_empty() {
+        log::info!("pruned engine version(s): {}", removed.join(", "));
+    }
 }
 
 #[cfg(test)]
@@ -548,11 +613,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_plain_launch_starts_the_pet_scene() {
+    fn a_plain_launch_starts_the_configured_pet() {
         let options = cli::Options::default();
         assert_eq!(
-            engine_arguments(&options),
-            vec![OsString::from("--bangboo")]
+            engine_arguments(&options, crate::preferences::DEFAULT_PET),
+            vec![
+                OsString::from("--pet"),
+                OsString::from(crate::preferences::DEFAULT_PET)
+            ]
+        );
+        // The configured character replaces the bundled default, not the
+        // whole argument shape: the engine still sees a standalone pet launch.
+        assert_eq!(
+            engine_arguments(&options, "my-pet"),
+            vec![OsString::from("--pet"), OsString::from("my-pet")]
         );
     }
 
@@ -563,7 +637,7 @@ mod tests {
             ..cli::Options::default()
         };
         assert_eq!(
-            engine_arguments(&options),
+            engine_arguments(&options, "my-pet"),
             vec![OsString::from("--smoke-test"), OsString::from("--frames")]
         );
     }
@@ -583,5 +657,51 @@ mod tests {
             ..cli::Options::default()
         };
         assert!(!needs_installed_engine(&options, &shared));
+    }
+
+    #[test]
+    fn pruning_keeps_the_state_target_even_when_the_state_does_not_name_it() {
+        let root = std::env::temp_dir().join(format!(
+            "delicium-run-prune-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let digest = "0".repeat(64);
+        for version in ["0.1.0", "0.1.1", "0.1.2"] {
+            let directory = root.join("app").join(version);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("delicium.exe"), b"engine").unwrap();
+            let marker = serde_json::json!({
+                "schema": 1,
+                "version": version,
+                "manifest_sha256": digest,
+                "files": [{ "path": "delicium.exe", "size": 6, "sha256": digest }],
+                "installed_at": 1
+            });
+            std::fs::write(
+                directory.join(crate::update::install::MARKER_NAME),
+                serde_json::to_vec(&marker).unwrap(),
+            )
+            .unwrap();
+        }
+        // Recovered from the directory scan: the state is empty, but 0.1.2 is
+        // the version that is about to run, so it must not be pruned.
+        let mut state = InstallState::default();
+        assert_eq!(state.current, None);
+        let target = update::target_version(&Installer::new(&root), &state).unwrap();
+        assert_eq!(target.version, "0.1.2");
+        prune_engines(&Installer::new(&root), &state, Some(&target));
+        assert!(root.join("app/0.1.2").exists());
+        assert!(!root.join("app/0.1.1").exists());
+        assert!(!root.join("app/0.1.0").exists());
+        // With the state naming it, no target is needed.
+        state.current = Some(target);
+        prune_engines(&Installer::new(&root), &state, None);
+        assert!(root.join("app/0.1.2").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

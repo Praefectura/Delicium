@@ -17,7 +17,7 @@
 //!    a rollback), and on the stable channel. Then its files are downloaded,
 //!    verified, and committed to `app\<version>`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -243,12 +243,60 @@ fn same_path(left: &Path, right: &Path) -> bool {
 /// The installed engine this installation should run, preferring a version
 /// that was installed but never started.
 pub fn target_version(installer: &Installer, state: &InstallState) -> Option<InstalledVersion> {
-    for candidate in [&state.pending, &state.current].into_iter().flatten() {
-        if candidate.parsed().is_ok() && engine_path(installer.root(), candidate).is_file() {
-            return Some(candidate.clone());
+    state_target(installer.root(), state).or_else(|| installer.scan_installed().into_iter().next())
+}
+
+/// The version the state names, without falling back to a directory scan.
+///
+/// Used after a version was discarded: the directory scan would find the
+/// same directory again and start the build that just failed.
+pub fn state_target(root: &Path, state: &InstallState) -> Option<InstalledVersion> {
+    [&state.pending, &state.current]
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.parsed().is_ok() && engine_path(root, candidate).is_file())
+        .cloned()
+}
+
+/// Removes all but the newest `keep` launcher backups.
+///
+/// A backup exists so a broken launcher image can be put back by hand;
+/// nothing in the launcher reads it, so leaving every replaced image behind
+/// costs about 2 MiB per update. Only files named
+/// `delicium-launcher-<unix>.exe` are considered.
+pub fn prune_launcher_backups(root: &Path, keep: usize) -> Vec<PathBuf> {
+    let directory = paths::backup_dir(root);
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut backups: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| backup_stamp(&path).map(|stamp| (stamp, path)))
+        .collect();
+    backups.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut removed = Vec::new();
+    for (_, path) in backups.into_iter().skip(keep) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                log::info!("removed launcher backup {}", path.display());
+                removed.push(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!("cannot remove {}: {error}", path.display()),
         }
     }
-    installer.scan_installed().into_iter().next()
+    removed
+}
+
+/// The Unix stamp in `delicium-launcher-<stamp>.exe`, when the name matches.
+fn backup_stamp(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("delicium-launcher-")?
+        .strip_suffix(".exe")?
+        .parse()
+        .ok()
 }
 
 /// The engine binary of an installed version.
@@ -468,6 +516,65 @@ mod tests {
         assert!(error.contains("self-update is skipped"), "{error}");
         // The staging copy is not executed and the engine was not installed.
         assert!(!root.join("app").join("0.2.0").join("delicium.exe").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn launcher_backups_are_pruned_to_the_newest() {
+        let root = temp_root("backups");
+        let directory = paths::backup_dir(&root);
+        std::fs::create_dir_all(&directory).unwrap();
+        for stamp in [100u64, 300, 200] {
+            std::fs::write(
+                directory.join(format!("delicium-launcher-{stamp}.exe")),
+                b"image",
+            )
+            .unwrap();
+        }
+        // Files that do not carry the stamp naming are not ours to remove.
+        std::fs::write(directory.join("notes.txt"), b"keep").unwrap();
+        std::fs::write(directory.join("delicium-launcher-latest.exe"), b"keep").unwrap();
+
+        let removed = prune_launcher_backups(&root, 1);
+        assert_eq!(
+            removed,
+            [
+                directory.join("delicium-launcher-200.exe"),
+                directory.join("delicium-launcher-100.exe")
+            ]
+        );
+        assert!(directory.join("delicium-launcher-300.exe").exists());
+        assert!(directory.join("notes.txt").exists());
+        assert!(directory.join("delicium-launcher-latest.exe").exists());
+        // Pruning again leaves the newest alone.
+        assert!(prune_launcher_backups(&root, 1).is_empty());
+        // Keep zero removes everything named like a backup, nothing else.
+        assert_eq!(prune_launcher_backups(&root, 0).len(), 1);
+        assert!(directory.join("notes.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_directory_scan_is_only_a_fallback_for_the_state() {
+        let root = temp_root("state-target");
+        let (manifest, payload, _) = release("0.2.0", "0.1.0", b"engine bytes");
+        let fetcher = fetcher_for(&manifest, &payload);
+        let Outcome::EngineInstalled { installed, .. } =
+            check_and_install(&root, &InstallState::default(), &fetcher).unwrap()
+        else {
+            panic!("expected an install");
+        };
+        // A discarded version is not a target again: the scan would find its
+        // directory, the state must not.
+        let state = InstallState::default();
+        assert!(state_target(&root, &state).is_none());
+        assert!(target_version(&Installer::new(&root), &state).is_some());
+        // The state naming it wins.
+        let state = InstallState {
+            current: Some(installed.clone()),
+            ..InstallState::default()
+        };
+        assert_eq!(state_target(&root, &state), Some(installed));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

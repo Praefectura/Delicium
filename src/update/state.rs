@@ -116,7 +116,12 @@ pub struct InstallState {
     pub schema: u32,
     /// The version to launch.
     pub current: Option<InstalledVersion>,
-    /// The version a crash loop falls back to.
+    /// A second slot older state files still carry.
+    ///
+    /// Nothing writes it any more: a version whose first start fails is
+    /// discarded, and the version that was already running stays current, so
+    /// there is nothing to fall back to. The field stays in the format so a
+    /// `state.json` written by an earlier build still parses.
     pub previous: Option<InstalledVersion>,
     /// An installed version whose first start has not been confirmed yet.
     pub pending: Option<InstalledVersion>,
@@ -203,6 +208,8 @@ impl InstallState {
         }
         // `pending` is the only slot that may repeat a version: a failed
         // start leaves `current` in place and the same version pending.
+        // (`previous` is only read from older state files and is cleared on
+        // load by the launcher.)
         if let (Some(current), Some(previous)) = (&self.current, &self.previous)
             && current.version == previous.version
         {
@@ -233,8 +240,10 @@ impl InstallState {
 
     /// Marks the pending version as the one that launched successfully.
     ///
-    /// The previous version stays available for a crash-loop fallback, and
-    /// the watermark only moves forward.
+    /// The version being replaced is not kept: once the new one has run long
+    /// enough to count as healthy there is nothing left to roll back to, and
+    /// keeping its directory would make every update cost another 23 MiB.
+    /// The watermark only moves forward.
     pub fn confirm(&mut self, now_unix: u64) -> Result<OpenedVersion, UpdateError> {
         let Some(installed) = self.pending.take() else {
             return Err(UpdateError::state("there is no pending version to confirm"));
@@ -250,8 +259,8 @@ impl InstallState {
                 tag: version.tag(),
             });
         }
-        self.previous = self.current.take();
         self.current = Some(installed);
+        self.previous = None;
         self.updated_at = now_unix;
         Ok(if advanced {
             OpenedVersion::Confirmed
@@ -261,32 +270,11 @@ impl InstallState {
     }
 
     /// Drops a pending version whose start failed.
+    ///
+    /// `current` is untouched: it is the version that was running before the
+    /// update and it is still the one to launch.
     pub fn discard_pending(&mut self) -> Option<InstalledVersion> {
         self.pending.take()
-    }
-
-    /// Rolls back to the previous version, keeping it as current.
-    pub fn roll_back(&mut self, now_unix: u64) -> Result<InstalledVersion, UpdateError> {
-        let failed = self.current.take();
-        let Some(previous) = self.previous.take() else {
-            self.current = failed;
-            return Err(UpdateError::state(
-                "there is no previous version to fall back to",
-            ));
-        };
-        // The failed version must not become `previous`, or a rollback would
-        // immediately roll forward again on the next failure.
-        if let Some(failed) = failed {
-            log::warn!(
-                "Rolling back from {} to {}",
-                failed.version,
-                previous.version
-            );
-        }
-        self.current = Some(previous.clone());
-        self.pending = None;
-        self.updated_at = now_unix;
-        Ok(previous)
     }
 
     /// Builds a state from directories found on disk, newest first. Used when
@@ -302,9 +290,10 @@ impl InstallState {
             updated_at: now_unix,
             ..Self::default()
         };
+        // Older directories are not a fallback: the retention policy deletes
+        // them, so they are not recorded here either.
         let mut rest = installed.into_iter();
         state.current = rest.next();
-        state.previous = rest.next();
         let newest = state.current.as_ref().and_then(|entry| entry.parsed().ok());
         if let Some(version) = newest {
             state.watermark = Some(Watermark {
@@ -423,7 +412,10 @@ mod tests {
         state.record_pending(installed("0.1.1", 2)).unwrap();
         assert_eq!(state.confirm(10).unwrap(), OpenedVersion::Confirmed);
         assert_eq!(state.current.as_ref().unwrap().version, "0.1.1");
-        assert_eq!(state.previous.as_ref().unwrap().version, "0.1.0");
+        assert_eq!(
+            state.previous, None,
+            "the replaced version is not kept for a fallback"
+        );
         assert_eq!(state.pending, None);
         assert_eq!(
             state.watermark.as_ref().unwrap().version,
@@ -445,20 +437,26 @@ mod tests {
     }
 
     #[test]
-    fn roll_back_swaps_current_and_previous() {
+    fn discarding_a_failed_pending_version_keeps_current() {
         let mut state = InstallState {
-            current: Some(installed("0.1.1", 2)),
-            previous: Some(installed("0.1.0", 1)),
+            current: Some(installed("0.1.0", 1)),
             ..InstallState::default()
         };
-        let rolled = state.roll_back(20).unwrap();
-        assert_eq!(rolled.version, "0.1.0");
-        assert_eq!(state.current.as_ref().unwrap().version, "0.1.0");
+        state.record_pending(installed("0.1.1", 2)).unwrap();
+        assert_eq!(
+            state.discard_pending().map(|entry| entry.version),
+            Some("0.1.1".to_owned())
+        );
+        assert_eq!(
+            state.current.as_ref().unwrap().version,
+            "0.1.0",
+            "the version that was already running stays the one to launch"
+        );
+        assert_eq!(state.pending, None);
         assert_eq!(state.previous, None);
-        assert_eq!(state.updated_at, 20);
-        // With no previous, the failed version stays current.
-        assert!(state.roll_back(21).is_err());
-        assert_eq!(state.current.as_ref().unwrap().version, "0.1.0");
+        state.validate().unwrap();
+        // Nothing pending means nothing to discard.
+        assert_eq!(state.discard_pending(), None);
     }
 
     #[test]
@@ -473,7 +471,10 @@ mod tests {
             50,
         );
         assert_eq!(state.current.as_ref().unwrap().version, "0.2.0");
-        assert_eq!(state.previous.as_ref().unwrap().version, "0.1.5");
+        assert_eq!(
+            state.previous, None,
+            "older directories are pruned, not recorded as a fallback"
+        );
         assert_eq!(state.watermark.as_ref().unwrap().version, "0.2.0");
         assert_eq!(state.updated_at, 50);
         state.validate().unwrap();

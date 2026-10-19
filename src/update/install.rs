@@ -31,6 +31,12 @@ pub const MARKER_NAME: &str = ".install.json";
 /// Marker schema this build writes and reads.
 pub const MARKER_SCHEMA: u32 = 1;
 
+/// Prefix of a version directory renamed out of the way before deletion.
+///
+/// A directory name never starts with a dot, so a leftover is invisible to
+/// [`Installer::scan_installed`] and can be finished off on the next start.
+const TRASH_PREFIX: &str = ".removing-";
+
 /// One file recorded in a marker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -302,6 +308,66 @@ impl Installer {
         let directory = self.version_dir(version);
         if directory.is_dir() {
             remove_dir_quietly(&directory);
+        }
+    }
+
+    /// Deletes every installed version whose version string is not in
+    /// `keep`, returning the versions that were removed.
+    ///
+    /// Only directories [`Self::scan_installed`] accepts are candidates, so a
+    /// directory without a valid marker, or one whose name does not match its
+    /// marker, is left alone. Each candidate is first renamed inside `app\`
+    /// and only then deleted: a directory holding a running `delicium.exe`
+    /// cannot be renamed, so a still-running build is never partially erased.
+    /// A rename that fails leaves the version untouched and logs.
+    pub fn prune_versions(&self, keep: &[String]) -> Vec<String> {
+        let mut removed = Vec::new();
+        for installed in self.scan_installed() {
+            if keep.iter().any(|version| version == &installed.version) {
+                continue;
+            }
+            let Ok(version) = installed.parsed() else {
+                continue;
+            };
+            let directory = self.version_dir(&version);
+            let trash = self
+                .app_root()
+                .join(format!("{}{}-{}", TRASH_PREFIX, version, nanos()));
+            if let Err(error) = std::fs::rename(&directory, &trash) {
+                // Most likely the image is mapped by a still-running engine
+                // the launcher lost track of. Deleting it now would leave a
+                // half-removed version behind; the next start tries again.
+                log::warn!(
+                    "cannot remove engine version {}: {error}",
+                    installed.version
+                );
+                continue;
+            }
+            log::info!(
+                "removing engine version {} ({})",
+                installed.version,
+                directory.display()
+            );
+            remove_dir_quietly(&trash);
+            if !trash.exists() {
+                removed.push(installed.version);
+            }
+        }
+        self.clear_trash();
+        removed
+    }
+
+    /// Deletes leftovers of an interrupted prune.
+    pub fn clear_trash(&self) {
+        let app = self.app_root();
+        let Ok(entries) = std::fs::read_dir(&app) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(TRASH_PREFIX) && entry.path().is_dir() {
+                remove_dir_quietly(&entry.path());
+            }
         }
     }
 
@@ -790,6 +856,57 @@ mod tests {
             installer
                 .version_dir(&Version::parse("0.1.1").unwrap())
                 .exists()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pruning_keeps_the_named_versions_and_unknown_directories() {
+        let root = root("prune");
+        let installer = Installer::new(&root);
+        for version in ["0.1.0", "0.1.1", "0.1.2"] {
+            let manifest = manifest(version);
+            installer
+                .install_app(
+                    &manifest,
+                    &manifest_digest(&manifest),
+                    &fetcher(&manifest, ENGINE),
+                    5,
+                )
+                .unwrap();
+        }
+        // Directories scan_installed refuses are not ours to delete.
+        std::fs::create_dir_all(installer.app_root().join("9.9.9")).unwrap();
+        // A leftover of an interrupted prune is finished off.
+        let trash = installer.app_root().join(format!("{TRASH_PREFIX}0.0.1-1"));
+        std::fs::create_dir_all(&trash).unwrap();
+
+        let removed = installer.prune_versions(&["0.1.2".to_owned()]);
+        assert_eq!(removed, ["0.1.1", "0.1.0"]);
+        assert!(
+            !installer
+                .version_dir(&Version::parse("0.1.0").unwrap())
+                .exists()
+        );
+        assert!(
+            !installer
+                .version_dir(&Version::parse("0.1.1").unwrap())
+                .exists()
+        );
+        assert!(
+            installer
+                .version_dir(&Version::parse("0.1.2").unwrap())
+                .exists()
+        );
+        assert!(installer.app_root().join("9.9.9").exists());
+        assert!(!trash.exists());
+        // Nothing left to remove is not an error.
+        assert!(installer.prune_versions(&["0.1.2".to_owned()]).is_empty());
+        // Keeping everything removes nothing.
+        assert!(
+            installer
+                .prune_versions(&["0.1.2".to_owned(), "0.9.9".to_owned()])
+                .is_empty()
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
