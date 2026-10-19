@@ -36,18 +36,54 @@ pub struct Options {
     pub exit_after: Option<Duration>,
     pub smoke_test: bool,
     pub bench: Option<BenchOptions>,
-    /// `--bangboo` replaces the default scene with the two bundled pet
-    /// characters; it is a standalone mode and rejects `--model`,
-    /// `--smoke-test` and `--bench`.
-    pub bangboo: bool,
+    /// `--pet ID|PATH` starts the scene with the named library character
+    /// instead of the default scene; it is a standalone mode and rejects
+    /// `--model`, `--smoke-test` and `--bench`. `--bangboo` is kept as an
+    /// alias for `--pet bangboo-eous`.
+    pub pet: Option<PetRequest>,
     /// Autonomous wandering is on for ordinary launches; `--no-wander` turns
     /// it off. `--smoke-test` always normalizes it off, and `--bench`
     /// normalizes it off unless `--bench-wander` selects the wandering
     /// workload, so the pinned workloads stay deterministic by default.
     pub wander: bool,
+    /// Whether `--no-wander` was given explicitly. An explicit command line
+    /// wins over the configured preference; without it the pet follows the
+    /// settings page.
+    pub wander_explicit: bool,
     /// `--bench-wander` runs the `--bench` workload with autonomous wandering
     /// enabled; it is only meaningful together with `--bench`.
     pub bench_wander: bool,
+}
+
+/// What `--pet` asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PetRequest {
+    /// A library id, bundled or in the user model directory.
+    Library(String),
+    /// An explicit model file.
+    File(PathBuf),
+}
+
+impl PetRequest {
+    /// A value is a path only when it ends in `.json`: separators alone do
+    /// not make one, so `../escape` is rejected as an invalid id instead of
+    /// being opened. Everything else is a library id, which also keeps a
+    /// mistyped path from silently becoming an id.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err("--pet requires a library id or a model path".into());
+        }
+        if trimmed.to_ascii_lowercase().ends_with(".json") {
+            Ok(Self::File(PathBuf::from(trimmed)))
+        } else if crate::preferences::valid_id(trimmed) {
+            Ok(Self::Library(trimmed.to_owned()))
+        } else {
+            Err(format!(
+                "Invalid pet library id `{trimmed}`: use letters, digits, '-' or '_', up to 64 characters"
+            ))
+        }
+    }
 }
 
 impl Default for Options {
@@ -59,10 +95,18 @@ impl Default for Options {
             exit_after: None,
             smoke_test: false,
             bench: None,
-            bangboo: false,
+            pet: None,
             wander: true,
+            wander_explicit: false,
             bench_wander: false,
         }
+    }
+}
+
+impl Options {
+    /// Whether the run starts the single-character pet scene.
+    pub fn pet_mode(&self) -> bool {
+        self.pet.is_some()
     }
 }
 
@@ -82,8 +126,10 @@ Usage: delicium [OPTIONS]\n\n\
                           characters keep their native size)\n\
   --exit-after SECONDS     Exit after 0.1 to 600 seconds, useful for smoke tests\n\
   --smoke-test             Use bundled examples; no --model; exit >= 10 seconds\n\
-  --bangboo                Start with two bundled interactive pets; no --model,\n\
-                          --smoke-test or --bench\n\
+  --pet ID|PATH           Start with a library character (default: bangboo-eous\n\
+                          when launched by the launcher) or a model file; no\n\
+                          --model, --smoke-test or --bench\n\
+  --bangboo                Alias for --pet bangboo-eous\n\
   --no-wander              Disable autonomous character wandering\n\
   --bench 4|16|32|64       Run a local bundled-model benchmark\n\
   --bench-mode pixel|interactive\n\
@@ -93,10 +139,13 @@ Usage: delicium [OPTIONS]\n\n\
   --bench-wander           Run the benchmark with autonomous wandering enabled\n\
   -h, --help              Show this help\n\n\
 Without --model, the two bundled example models are loaded.\n\
-Character hit regions are enabled by default; empty scene areas pass clicks through.\n\
-The control window remains interactive in either scene input mode.\n\
-Ordinary launches let characters wander horizontally; --smoke-test keeps them\n\
-stationary, and --bench does too unless --bench-wander is given.\n";
+--pet starts one character from the model library: bundled ids such as\n\
+bangboo-eous, puppet2d or robot3d, or the stem of a file in\n\
+%APPDATA%\\Delicium\\models. Character hit regions are enabled by default;\n\
+empty scene areas pass clicks through. The control window remains interactive\n\
+in either scene input mode. Ordinary launches let characters wander\n\
+horizontally; --smoke-test keeps them stationary, and --bench does too unless\n\
+--bench-wander is given.\n";
 
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParseResult, String> {
     let mut args = args.into_iter();
@@ -150,8 +199,27 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParseResul
                 options.exit_after = Some(Duration::from_secs_f64(seconds));
             }
             Some("--smoke-test") => options.smoke_test = true,
-            Some("--bangboo") => options.bangboo = true,
-            Some("--no-wander") => options.wander = false,
+            Some("--pet") => {
+                let value = next_text(&mut args, "--pet")?;
+                let request = PetRequest::parse(&value)?;
+                if options.pet.is_some() {
+                    return Err("--pet may be given only once".into());
+                }
+                options.pet = Some(request);
+            }
+            Some("--bangboo") => {
+                // Kept for the released launcher and for scripts: the shipped
+                // pet is just the default library entry now.
+                let request = PetRequest::Library(crate::preferences::DEFAULT_PET.to_owned());
+                if options.pet.is_some() {
+                    return Err("--bangboo cannot be combined with --pet".into());
+                }
+                options.pet = Some(request);
+            }
+            Some("--no-wander") => {
+                options.wander = false;
+                options.wander_explicit = true;
+            }
             Some("--bench-wander") => bench_wander = true,
             Some("--bench") => {
                 let count = next_text(&mut args, "--bench")?
@@ -238,18 +306,18 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParseResul
             options.exit_after = Some(Duration::from_secs(12));
         }
     }
-    if options.bangboo {
+    if options.pet.is_some() {
         // The pet scene is a standalone bundled mode: it replaces both the
         // default scene and any explicit model list, and it cannot drive the
         // automated workloads.
         if !options.models.is_empty() {
-            return Err("--bangboo cannot be combined with --model".into());
+            return Err("--pet cannot be combined with --model".into());
         }
         if options.smoke_test {
-            return Err("--bangboo cannot be combined with --smoke-test".into());
+            return Err("--pet cannot be combined with --smoke-test".into());
         }
         if options.bench.is_some() {
-            return Err("--bangboo cannot be combined with --bench".into());
+            return Err("--pet cannot be combined with --bench".into());
         }
     }
     // Ordinary launches span all monitors; the automated smoke test and
@@ -526,17 +594,22 @@ mod tests {
     }
 
     #[test]
-    fn bangboo_mode_defaults_and_standalone_combinations() {
-        // Plain --bangboo: enabled, no models, wandering keeps its default.
-        let ParseResult::Run(options) = parse(&["--bangboo"]).unwrap() else {
+    fn pet_mode_defaults_and_standalone_combinations() {
+        // Plain --pet: enabled, no models, wandering keeps its default.
+        let ParseResult::Run(options) = parse(&["--pet", "bangboo-eous"]).unwrap() else {
             panic!("expected run options");
         };
-        assert!(options.bangboo);
+        assert_eq!(
+            options.pet,
+            Some(PetRequest::Library("bangboo-eous".into()))
+        );
         assert!(options.models.is_empty());
         assert!(options.wander);
+        assert!(options.pet_mode());
         // The compatible modifiers are accepted and keep their meaning.
         let ParseResult::Run(options) = parse(&[
-            "--bangboo",
+            "--pet",
+            "puppet2d",
             "--no-wander",
             "--overlay-size",
             "960x640",
@@ -546,41 +619,90 @@ mod tests {
         .unwrap() else {
             panic!("expected run options");
         };
-        assert!(options.bangboo);
+        assert_eq!(options.pet, Some(PetRequest::Library("puppet2d".into())));
         assert!(!options.wander);
+        assert!(options.wander_explicit);
         assert_eq!(options.overlay_size, Some([960, 640]));
         assert_eq!(options.exit_after, Some(Duration::from_secs(120)));
         // It is a standalone scene: every automated or explicit-scene mode is
         // rejected in either order.
         for args in [
-            vec!["--bangboo", "--model", "first.json"],
-            vec!["--model", "first.json", "--bangboo"],
-            vec!["--bangboo", "--smoke-test"],
-            vec!["--smoke-test", "--bangboo"],
-            vec!["--bangboo", "--bench", "4"],
-            vec!["--bench", "4", "--bangboo"],
+            vec!["--pet", "robot3d", "--model", "first.json"],
+            vec!["--model", "first.json", "--pet", "robot3d"],
+            vec!["--pet", "robot3d", "--smoke-test"],
+            vec!["--smoke-test", "--pet", "robot3d"],
+            vec!["--pet", "robot3d", "--bench", "4"],
+            vec!["--bench", "4", "--pet", "robot3d"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }
         // A bare flag takes no value.
-        assert!(parse(&["--bangboo", "true"]).is_err());
+        assert!(parse(&["--pet"]).is_err());
+        assert!(parse(&["--pet", "bangboo-eous", "--pet", "puppet2d"]).is_err());
     }
 
     #[test]
-    fn bangboo_stays_off_by_default() {
+    fn pet_accepts_library_ids_and_explicit_paths() {
+        let ParseResult::Run(options) = parse(&["--pet", "my_pet-2"]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert_eq!(options.pet, Some(PetRequest::Library("my_pet-2".into())));
+        for value in [
+            "models/custom.dmodel.json",
+            r"models\custom.dmodel.json",
+            "C:/models/custom.json",
+            "custom.dmodel.json",
+        ] {
+            let ParseResult::Run(options) = parse(&["--pet", value]).unwrap() else {
+                panic!("expected run options");
+            };
+            assert!(matches!(options.pet, Some(PetRequest::File(_))), "{value}");
+        }
+        // Invalid ids fail closed instead of becoming a path.
+        for value in ["", "with space", "../escape", "a.b", &"x".repeat(65)] {
+            assert!(PetRequest::parse(value).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn bangboo_is_an_alias_for_the_default_pet() {
+        let ParseResult::Run(options) = parse(&["--bangboo"]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert_eq!(
+            options.pet,
+            Some(PetRequest::Library(crate::preferences::DEFAULT_PET.into()))
+        );
+        // The documented standalone combinations still hold.
+        for args in [
+            vec!["--bangboo", "--model", "first.json"],
+            vec!["--bangboo", "--smoke-test"],
+            vec!["--bangboo", "--bench", "4"],
+            vec!["--bangboo", "true"],
+            vec!["--bangboo", "--pet", "puppet2d"],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn pet_mode_stays_off_by_default() {
         let ParseResult::Run(options) = parse(&[]).unwrap() else {
             panic!("expected run options");
         };
-        assert!(!options.bangboo);
+        assert!(options.pet.is_none());
+        assert!(!options.pet_mode());
         // The smoke test and the benchmark do not enable it either.
         let ParseResult::Run(options) = parse(&["--smoke-test"]).unwrap() else {
             panic!("expected run options");
         };
-        assert!(!options.bangboo);
+        assert!(options.pet.is_none());
         let ParseResult::Run(options) = parse(&["--bench", "4"]).unwrap() else {
             panic!("expected run options");
         };
-        assert!(!options.bangboo);
+        assert!(options.pet.is_none());
+        // Wandering is not marked explicit unless --no-wander was given.
+        assert!(!options.wander_explicit);
     }
 
     #[test]

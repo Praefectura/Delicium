@@ -1,7 +1,10 @@
 pub mod app;
+pub mod i18n;
 pub mod launcher;
+pub mod library;
 pub mod model;
 pub mod platform;
+pub mod preferences;
 pub mod renderer;
 pub mod simulation;
 pub mod update;

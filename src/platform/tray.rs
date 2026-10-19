@@ -49,6 +49,15 @@ pub fn open_settings() -> Result<(), String> {
     win32::open_settings()
 }
 
+/// Sets the language of the context menu, read the next time it opens.
+#[cfg(target_os = "windows")]
+pub fn set_language(language: crate::preferences::Resolved) {
+    win32::set_language(language);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_language(_language: crate::preferences::Resolved) {}
+
 #[cfg(not(target_os = "windows"))]
 pub fn open_settings() -> Result<(), String> {
     Err("The system tray is not supported on this platform".to_owned())
@@ -147,6 +156,8 @@ mod win32 {
     static ACTIONS: AtomicU32 = AtomicU32::new(0);
     /// `RegisterWindowMessageW("TaskbarCreated")`, set once at install.
     static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+    /// The resolved language of the menu: `0` English, `1` Simplified Chinese.
+    static MENU_LANGUAGE: AtomicU32 = AtomicU32::new(0);
 
     /// `Shell_NotifyIconW` message ids.
     const NIM_ADD: u32 = 0;
@@ -745,8 +756,23 @@ mod win32 {
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
     }
 
+    /// Stores the language the next context menu is drawn in.
+    pub(super) fn set_language(language: crate::preferences::Resolved) {
+        MENU_LANGUAGE.store(
+            match language {
+                crate::preferences::Resolved::En => 0,
+                crate::preferences::Resolved::ZhHans => 1,
+            },
+            Ordering::SeqCst,
+        );
+    }
+
     /// Shows the tray context menu at the cursor and records the choice.
     fn show_menu(hwnd: Hwnd) {
+        let text = crate::i18n::text(match MENU_LANGUAGE.load(Ordering::SeqCst) {
+            1 => crate::preferences::Resolved::ZhHans,
+            _ => crate::preferences::Resolved::En,
+        });
         // SAFETY: every handle created here is also released here, and the
         // calls run on the window's own thread.
         unsafe {
@@ -754,13 +780,13 @@ mod win32 {
             if menu.is_null() {
                 return;
             }
-            let show_hide = wide("Show/Hide controls");
-            let quit = wide("Quit");
+            let show_hide = wide(text.toggle_controls);
+            let quit = wide(text.quit);
             AppendMenuW(menu, MF_STRING, MENU_SHOW_HIDE as usize, show_hide.as_ptr());
             // Only a launcher can show a settings page; a bare engine run
             // (acceptance scripts, `cargo run`) has nowhere to send it.
             if launcher_window().is_some() {
-                let settings = wide("Settings...");
+                let settings = wide(text.open_settings);
                 AppendMenuW(menu, MF_STRING, MENU_SETTINGS as usize, settings.as_ptr());
             }
             AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr());

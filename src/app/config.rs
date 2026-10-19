@@ -8,13 +8,16 @@
 //! both sides as an escape hatch.
 //!
 //! The launcher's settings page writes the same file while the pet runs, so
-//! a scaled-back reader ([`read_preferences`]) re-reads only the preferences
-//! when the file's modification time changes; the scene is applied once at
-//! startup and is never restarted mid-run.
+//! the shared preference reader (`crate::preferences`) re-reads the
+//! preferences when the file's modification time changes; the scene is
+//! applied once at startup and is never restarted mid-run.
 //!
 //! Writes go through a temporary file plus an atomic rename, so a crash or a
 //! full disk cannot leave a half-written file behind. A file that exists but
-//! cannot be parsed is left in place and the defaults take over.
+//! cannot be parsed is left in place and the defaults take over. Saving merges
+//! into the existing document instead of replacing it: the preference fields
+//! owned by the launcher (`wander`, `language`, `default_model`, `chat`) and
+//! any field a newer build wrote are preserved.
 
 use std::path::{Path, PathBuf};
 
@@ -56,14 +59,20 @@ pub(super) enum EntrySource {
     Example3d,
     TexturedExample2d,
     TexturedExample3d,
-    File { path: PathBuf },
+    File {
+        path: PathBuf,
+    },
+    /// A library id. The file behind a user model is resolved again at load
+    /// time, so a model directory that moved does not pin a stale path.
+    Library {
+        id: String,
+    },
 }
 
 impl EntrySource {
     /// The persistent form of a load source, when one exists: the validation
-    /// probe and the `--bangboo` pet scene cannot round-trip, and network
-    /// paths are rejected by the loader itself, so none is configuration
-    /// material.
+    /// probe cannot round-trip, and network paths are rejected by the loader
+    /// itself, so none is configuration material.
     pub(super) fn from_load_source(source: &LoadSource) -> Option<Self> {
         match source {
             LoadSource::Example2d => Some(Self::Example2d),
@@ -78,7 +87,10 @@ impl EntrySource {
                     Some(Self::File { path: path.clone() })
                 }
             }
-            LoadSource::Bangboo | LoadSource::ValidationProbe => None,
+            LoadSource::Library { id, .. } => {
+                crate::preferences::valid_id(id).then(|| Self::Library { id: id.clone() })
+            }
+            LoadSource::ValidationProbe => None,
         }
     }
 
@@ -90,17 +102,18 @@ impl EntrySource {
             Self::TexturedExample2d => LoadSource::TexturedExample2d,
             Self::TexturedExample3d => LoadSource::TexturedExample3d,
             Self::File { path } => LoadSource::File(path),
+            Self::Library { id } => LoadSource::Library { id, path: None },
         }
     }
 }
 
 /// Whether scene configuration may be read and written for these options.
 /// The smoke test and benchmarks must stay deterministic and operate on their
-/// own scenes; `--bangboo` likewise owns its fixed pet scene and must not
-/// read or overwrite the user's saved scene. `DELICIUM_NO_CONFIG` set to
-/// anything but the empty string or `0` disables persistence explicitly.
+/// own scenes; a `--pet` run likewise owns its fixed scene and must not read
+/// or overwrite the user's saved scene. `DELICIUM_NO_CONFIG` set to anything
+/// but the empty string or `0` disables persistence explicitly.
 pub(super) fn enabled(options: &Options) -> bool {
-    if options.smoke_test || options.bench.is_some() || options.bangboo {
+    if options.smoke_test || options.bench.is_some() || options.pet_mode() {
         return false;
     }
     !disabled_by_env()
@@ -109,9 +122,9 @@ pub(super) fn enabled(options: &Options) -> bool {
 /// Whether the preference fields may be read and followed.
 ///
 /// The pet owns its scene but not its preferences: the launcher's settings
-/// page writes `pixel_hittest` into this same file while the pet runs, and a
-/// checkbox that does nothing would be a lie. Bounded runs stay deterministic
-/// and still ignore the file entirely.
+/// page writes them into this same file while the pet runs, and a checkbox
+/// that does nothing would be a lie. Bounded runs stay deterministic and
+/// still ignore the file entirely.
 pub(super) fn preferences_enabled(options: &Options) -> bool {
     if options.smoke_test || options.bench.is_some() {
         return false;
@@ -124,45 +137,14 @@ fn disabled_by_env() -> bool {
     std::env::var_os("DELICIUM_NO_CONFIG").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
-/// `%APPDATA%\Delicium\config.json`; `None` without an `APPDATA` variable.
-pub(super) fn config_path() -> Option<PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(appdata).join("Delicium").join("config.json"))
-}
-
-/// The preference fields of the configuration file, as last read.
-///
-/// Only what the running pet can change from the outside: the scene comes
-/// from the same file but is applied at startup, so a live change to it is
-/// ignored rather than silently dropped instances.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Preferences {
-    pub pixel_hittest: bool,
-}
-
 /// `(modified, length)` of the configuration file, or `None` when it does not
 /// exist. The pair is enough to notice a rewrite: the launcher writes a new
 /// file and renames it into place, so both change on every write.
 pub(super) fn stamp() -> Option<(std::time::SystemTime, u64)> {
-    let path = config_path()?;
+    let path = crate::preferences::config_path()?;
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
     Some((modified, metadata.len()))
-}
-
-/// The preferences in the file as it is now; a missing, unreadable or
-/// unknown-version file yields `None` and changes nothing.
-pub(super) fn read_preferences() -> Option<Preferences> {
-    let text = std::fs::read_to_string(config_path()?).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let object = value.as_object()?;
-    if object.get("version").and_then(serde_json::Value::as_u64) != Some(VERSION as u64) {
-        return None;
-    }
-    let pixel_hittest = object
-        .get("pixel_hittest")
-        .and_then(serde_json::Value::as_bool)?;
-    Some(Preferences { pixel_hittest })
 }
 
 /// Loads the saved configuration, if any.
@@ -173,12 +155,12 @@ pub(super) fn read_preferences() -> Option<Preferences> {
 /// beyond [`MAX_INSTANCES`] are truncated and entries with invalid positions
 /// or non-local paths are dropped.
 pub(super) fn load() -> Option<Config> {
-    load_from(&config_path()?)
+    load_from(&crate::preferences::config_path()?)
 }
 
 /// Saves the configuration through a temporary file and an atomic rename.
 pub(super) fn save(config: &Config) -> Result<(), String> {
-    let path = config_path()
+    let path = crate::preferences::config_path()
         .ok_or_else(|| "APPDATA is not set; cannot locate the configuration file".to_owned())?;
     save_to(config, &path)
 }
@@ -222,7 +204,42 @@ fn save_to(config: &Config, path: &Path) -> Result<(), String> {
         std::fs::create_dir_all(directory)
             .map_err(|error| format!("Cannot create {}: {error}", directory.display()))?;
     }
-    let text = serde_json::to_string_pretty(config)
+    // Merge into the document on disk instead of replacing it: the launcher
+    // owns `wander`, `language`, `default_model` and `chat` in the same file,
+    // and a newer build may write fields this one cannot represent. Only the
+    // three fields this module owns are replaced.
+    let mut value = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value @ serde_json::Value::Object(_))
+                if value.get("version").and_then(serde_json::Value::as_u64)
+                    == Some(VERSION as u64) =>
+            {
+                value
+            }
+            // A file that cannot be parsed or belongs to another version is
+            // not configuration material; the defaults take over, which is
+            // what the load path already decided for this run.
+            _ => serde_json::to_value(config)
+                .map_err(|error| format!("Cannot serialize the configuration: {error}"))?,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::to_value(config)
+            .map_err(|error| format!("Cannot serialize the configuration: {error}"))?,
+        Err(error) => return Err(format!("Cannot read {}: {error}", path.display())),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "The configuration is not a JSON object".to_owned())?;
+    object.insert("version".into(), serde_json::Value::from(VERSION));
+    object.insert(
+        "pixel_hittest".into(),
+        serde_json::Value::Bool(config.pixel_hittest),
+    );
+    object.insert(
+        "instances".into(),
+        serde_json::to_value(&config.instances)
+            .map_err(|error| format!("Cannot serialize the configuration: {error}"))?,
+    );
+    let text = serde_json::to_string_pretty(&value)
         .map_err(|error| format!("Cannot serialize the configuration: {error}"))?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, text)
@@ -248,6 +265,7 @@ fn valid_entry(entry: &InstanceEntry) -> bool {
             let text = path.as_os_str().to_string_lossy();
             !text.is_empty() && !text.starts_with("\\\\") && !text.starts_with("//")
         }
+        EntrySource::Library { id } => crate::preferences::valid_id(id),
         EntrySource::Example2d
         | EntrySource::Example3d
         | EntrySource::TexturedExample2d
@@ -305,6 +323,9 @@ mod tests {
             EntrySource::File {
                 path: PathBuf::from("models/local.dmodel.json"),
             },
+            EntrySource::Library {
+                id: "bangboo-eous".into(),
+            },
         ];
         let config = Config {
             version: VERSION,
@@ -321,17 +342,86 @@ mod tests {
     }
 
     #[test]
-    fn bangboo_mode_disables_persistence_without_changing_the_format() {
+    fn pet_mode_disables_persistence_without_changing_the_format() {
         // The pet scene must not read or overwrite the user's file, whatever
         // DELICIUM_NO_CONFIG says.
         let options = Options {
-            bangboo: true,
+            pet: Some(crate::app::cli::PetRequest::Library(
+                crate::preferences::DEFAULT_PET.into(),
+            )),
             ..Options::default()
         };
         assert!(!enabled(&options));
-        // The persistent format gains no Bangboo entry: the pet scene is not
-        // configuration material, so it never round-trips.
-        assert_eq!(EntrySource::from_load_source(&LoadSource::Bangboo), None);
+        // The persistent format records the pet as a library entry, so a
+        // saved scene that contains it round-trips like any other model.
+        let source = LoadSource::Library {
+            id: crate::preferences::DEFAULT_PET.into(),
+            path: None,
+        };
+        let entry = EntrySource::from_load_source(&source).expect("library entries round-trip");
+        assert_eq!(
+            entry,
+            EntrySource::Library {
+                id: crate::preferences::DEFAULT_PET.into()
+            }
+        );
+        assert_eq!(
+            entry.into_load_source().library_id(),
+            Some(crate::preferences::DEFAULT_PET)
+        );
+        assert_eq!(
+            EntrySource::from_load_source(&LoadSource::ValidationProbe),
+            None
+        );
+    }
+
+    #[test]
+    fn native_pet_mode_needs_no_persistence_either() {
+        // Explicit `--pet` runs are standalone scenes, like `--bangboo`.
+        let options = Options {
+            pet: Some(crate::app::cli::PetRequest::File(PathBuf::from("pet.json"))),
+            ..Options::default()
+        };
+        assert!(!enabled(&options));
+        // A file pet still persists as an explicit file when saved from an
+        // ordinary run; the mode only decides whether the scene is read.
+        assert_eq!(
+            EntrySource::from_load_source(&LoadSource::File(PathBuf::from("pet.json"))),
+            Some(EntrySource::File {
+                path: PathBuf::from("pet.json")
+            })
+        );
+    }
+
+    #[test]
+    fn saving_preserves_preferences_owned_by_the_launcher() {
+        // The launcher writes `wander`, `language`, `default_model` and
+        // `chat` into the same file; a clean engine exit must not drop them.
+        let directory = test_dir("preserve");
+        let path = directory.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"pixel_hittest":true,"wander":false,"language":"zh_hans",
+                "default_model":"puppet2d","chat":{"enabled":true,"base_url":"https://x/v1",
+                "model":"m","api_key":""},"instances":[],"future":7}"#,
+        )
+        .unwrap();
+        let config = Config {
+            version: VERSION,
+            pixel_hittest: false,
+            instances: vec![entry(EntrySource::Example3d, [0.0, 0.0, 0.0])],
+        };
+        save_to(&config, &path).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["pixel_hittest"], false);
+        assert_eq!(value["instances"].as_array().unwrap().len(), 1);
+        assert_eq!(value["wander"], false);
+        assert_eq!(value["language"], "zh_hans");
+        assert_eq!(value["default_model"], "puppet2d");
+        assert_eq!(value["chat"]["enabled"], true);
+        assert_eq!(value["future"], 7);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod attention;
 mod benchmark;
+pub mod chat;
 pub mod cli;
 mod config;
 mod hit_region;
@@ -30,8 +31,8 @@ use crate::{
         screen_to_world_with,
     },
     simulation::{
-        AssetId, InstanceId, Simulation, WANDER_EDGE_MARGIN, WanderEvent, WorldRect, WorldXBounds,
-        render_asset,
+        AssetId, InstanceId, Simulation, SocialPhase, WANDER_EDGE_MARGIN, WanderEvent, WorldRect,
+        WorldXBounds, render_asset,
     },
 };
 
@@ -59,6 +60,64 @@ fn is_click_press(press: [f32; 2], release: [f32; 2]) -> bool {
     dx * dx + dy * dy < CLICK_TOLERANCE_PX * CLICK_TOLERANCE_PX
 }
 
+/// The loader source for a `--pet` request.
+///
+/// A library id resolves against the built-in table and the user directory;
+/// an unknown id becomes a `Library` source anyway and fails at load time
+/// with a reported error, which keeps startup from silently falling back to
+/// a different character. An explicit path stays a file source.
+fn pet_load_source(request: &cli::PetRequest) -> LoadSource {
+    match request {
+        cli::PetRequest::Library(id) => {
+            let directory = crate::library::user_directory();
+            match crate::library::resolve(id, directory.as_deref()) {
+                Some(model) => LoadSource::library(&model),
+                None => LoadSource::Library {
+                    id: id.clone(),
+                    path: None,
+                },
+            }
+        }
+        cli::PetRequest::File(path) => LoadSource::File(path.clone()),
+    }
+}
+
+/// Registers a CJK-capable system font as a fallback for both families.
+///
+/// egui's default fonts have no Chinese glyphs, so the Simplified Chinese
+/// interface would draw tofu boxes. The font is read from the Windows font
+/// directory at startup (no extra dependency, no embedded font file); when no
+/// CJK font is present the defaults stay, and English labels still render.
+fn install_cjk_font(context: &egui::Context) {
+    // Microsoft YaHei UI is the Windows 8+ default Chinese UI face; SimHei is
+    // the pre-Vista fallback. Either is licensed for use on this machine.
+    let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+    let candidates = ["msyh.ttc", "simhei.ttf", "msyh.ttf"];
+    let Some((path, bytes)) = candidates.iter().find_map(|name| {
+        let path = std::path::Path::new(&windir).join("Fonts").join(name);
+        std::fs::read(&path).ok().map(|bytes| (path, bytes))
+    }) else {
+        log::warn!("No CJK font found; Chinese labels may not render");
+        return;
+    };
+    let mut definitions = egui::FontDefinitions::default();
+    definitions.font_data.insert(
+        "cjk".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    // Appended, not prepended: the default faces stay primary for Latin text,
+    // and the CJK face is consulted only for glyphs they lack.
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        definitions
+            .families
+            .entry(family)
+            .or_default()
+            .push("cjk".to_owned());
+    }
+    context.set_fonts(definitions);
+    log::info!("cjk font path={}", path.display());
+}
+
 pub fn run() -> Result<(), String> {
     let options = match cli::parse_args(std::env::args_os().skip(1))? {
         ParseResult::Help => {
@@ -69,27 +128,49 @@ pub fn run() -> Result<(), String> {
     };
     let config_enabled = config::enabled(&options);
     let loaded = config_enabled.then(config::load).flatten();
+    // The preferences drive the pet even when its scene is not persisted
+    // (`--pet`): the settings page still owns wandering, language and chat.
+    // A bounded run must stay reproducible, so it keeps the command line.
+    let preferences = config::preferences_enabled(&options)
+        .then(crate::preferences::read)
+        .flatten();
+    let mut options = options;
+    if let Some(preferences) = &preferences {
+        // An explicit command line wins over the stored preference.
+        if !options.wander_explicit {
+            options.wander = preferences.wander;
+        }
+    }
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let mut application = Application::new(options)?;
+    application.language = preferences.as_ref().map_or_else(
+        || crate::preferences::Language::System.resolved(),
+        |p| p.language.resolved(),
+    );
+    application.ui.set_language(application.language);
+    application.chat = chat::session::ChatSession::new(
+        preferences
+            .as_ref()
+            .map(|p| p.chat.clone())
+            .unwrap_or_default(),
+        application.language,
+    );
     application.pending_pixel_hittest = loaded.as_ref().map(|config| config.pixel_hittest);
     application.config = loaded;
-    // A live pet follows the settings page; a bounded run must stay
-    // reproducible, and the scenes that ignore the file ignore it here too.
+    // The pet has no saved scene, but it still honours the preference:
+    // only `false` needs a command, since `true` is the default.
     if config::preferences_enabled(&application.options)
-        && application.config.is_none()
-        // The pet has no saved scene, but it still honours the preference:
-        // only `false` needs a command, since `true` is the default.
         && application.pending_pixel_hittest.is_none()
     {
-        application.pending_pixel_hittest = config::read_preferences().map(|p| p.pixel_hittest);
+        application.pending_pixel_hittest = preferences.as_ref().map(|p| p.pixel_hittest);
     }
     if config::preferences_enabled(&application.options)
-        && let Some((modified, length)) = config::stamp()
+        && let (Some(preferences), Some((modified, length))) = (preferences, config::stamp())
     {
         // The pet owns its scene, so its preference baseline comes from the
         // file rather than from `application.config`; before the first
         // write there is no file and nothing to follow.
-        application.config_watch = config::read_preferences().map(|preferences| ConfigWatch {
+        application.config_watch = Some(ConfigWatch {
             modified,
             length,
             preferences,
@@ -130,7 +211,7 @@ pub fn run() -> Result<(), String> {
 struct ConfigWatch {
     modified: std::time::SystemTime,
     length: u64,
-    preferences: config::Preferences,
+    preferences: crate::preferences::Preferences,
 }
 
 struct Runtime {
@@ -414,11 +495,14 @@ struct Application {
     latest_replacement: HashMap<InstanceId, u64>,
     sources: HashMap<InstanceId, LoadSource>,
     examples: [Option<AssetId>; 4],
-    /// The bundled Bangboo asset loaded by `--bangboo`; kept alive beyond its
-    /// instances so the controls can add another pet without a reload. It
-    /// never occupies one of the four example slots, whose meaning is pinned
-    /// by the smoke and benchmark workloads.
-    bangboo_asset: Option<AssetId>,
+    /// The source the `--pet` scene loaded, kept so the controls can add
+    /// another copy of the same character without re-resolving the library
+    /// (and so an explicit file stays bound to the file the user named).
+    pet_source: Option<LoadSource>,
+    /// The compiled pet asset; kept alive beyond its instances. It never
+    /// occupies one of the four example slots, whose meaning is pinned by
+    /// the smoke and benchmark workloads.
+    pet_asset: Option<AssetId>,
     next_request: u64,
     cursor: [f32; 2],
     /// Cursor position where the current drag gesture went down; only set
@@ -456,6 +540,13 @@ struct Application {
     /// smoke test, benchmarks, `--bangboo`, `DELICIUM_NO_CONFIG`, and any run
     /// where the file did not load).
     config_watch: Option<ConfigWatch>,
+    /// The resolved interface language, from the preferences.
+    language: crate::preferences::Resolved,
+    /// The library as listed at startup; rescanned when a model is added from
+    /// it, never per frame (the scan touches the filesystem).
+    library: Vec<crate::library::LibraryModel>,
+    /// Per-character conversation state and the optional remote endpoint.
+    chat: chat::session::ChatSession,
     scene_sample: Option<SceneSample>,
     fatal: Option<String>,
 }
@@ -477,7 +568,8 @@ impl Application {
             latest_replacement: HashMap::new(),
             sources: HashMap::new(),
             examples: [None; 4],
-            bangboo_asset: None,
+            pet_source: None,
+            pet_asset: None,
             next_request: 1,
             cursor: [0.0; 2],
             press_cursor: None,
@@ -504,6 +596,12 @@ impl Application {
             initial_config: VecDeque::new(),
             pending_pixel_hittest: None,
             config_watch: None,
+            language: crate::preferences::Language::System.resolved(),
+            library: crate::library::list(crate::library::user_directory().as_deref()),
+            chat: chat::session::ChatSession::new(
+                crate::preferences::ChatSettings::default(),
+                crate::preferences::Language::System.resolved(),
+            ),
             scene_sample: None,
             fatal: None,
         })
@@ -637,12 +735,15 @@ impl Application {
         ))
         .map_err(|error| error.to_string())?;
         self.ui.adapter = graphics.adapter_description().to_owned();
+        self.ui.wander = self.options.wander;
+        self.ui.pixel_hittest = self.hit_region.mode == RegionMode::Pixel;
         log::info!(
             "adapter={} transparency={:?}",
             self.ui.adapter,
             graphics.transparency_mode()
         );
         let egui_context = egui::Context::default();
+        install_cjk_font(&egui_context);
         let egui_input = egui_winit::State::new(
             egui_context.clone(),
             egui::ViewportId::ROOT,
@@ -684,6 +785,7 @@ impl Application {
         // The icon must not appear while a benchmark drives the windows;
         // scripts and harness runs assume closing a window ends the process.
         if self.benchmark.is_none() {
+            platform::tray::set_language(self.language);
             match platform::tray::install() {
                 Ok(tray) => {
                     log::info!("tray installed");
@@ -746,13 +848,16 @@ impl Application {
                     positions: benchmark::positions(options.instances, ModelKind::Skeleton3d),
                 },
             )?;
-        } else if self.options.bangboo {
-            // The pet scene: two instances of the same bundled asset at a
-            // fixed pair of positions, close enough to find each other.
+        } else if let Some(request) = &self.options.pet {
+            // The pet scene starts with one instance of the library character
+            // in the middle of the scene. A second one can be added from the
+            // model library; within pairing range the two then greet and play.
+            let source = pet_load_source(request);
+            self.pet_source = Some(source.clone());
             self.submit_load(
-                LoadSource::Bangboo,
+                source,
                 Operation::Spawn {
-                    positions: vec![Vec3::new(-0.65, 0.15, 0.0), Vec3::new(0.65, 0.15, 0.0)],
+                    positions: vec![Vec3::new(0.0, 0.15, 0.0)],
                 },
             )?;
         } else if !self.options.models.is_empty() {
@@ -989,9 +1094,14 @@ impl Application {
                 .map_err(|error| error.to_string()),
         };
         let succeeded = result.is_ok();
-        self.note_bangboo_load(&completed.source, asset, succeeded);
+        self.note_pet_load(&completed.source, asset, succeeded);
         match result {
-            Ok(()) => self.ui.status = format!("Loaded {}", model.name),
+            Ok(()) => {
+                self.ui.status = crate::i18n::named(
+                    crate::i18n::text(self.ui.language).status_loaded,
+                    &model.name,
+                )
+            }
             Err(error) => self.report_error(error),
         }
         self.collect_assets();
@@ -1003,18 +1113,18 @@ impl Application {
         }
     }
 
-    /// Remembers the bundled pet asset once a Bangboo load has actually been
+    /// Remembers the pet scene's asset once a matching load has actually been
     /// committed, so the cache outlives its instances and the controls can
     /// add another pet without a reload. Failed loads never reach this point.
-    fn note_bangboo_load(&mut self, source: &LoadSource, asset: AssetId, succeeded: bool) {
-        if succeeded && matches!(source, LoadSource::Bangboo) {
-            self.bangboo_asset.get_or_insert(asset);
+    fn note_pet_load(&mut self, source: &LoadSource, asset: AssetId, succeeded: bool) {
+        if succeeded && self.pet_source.as_ref() == Some(source) {
+            self.pet_asset.get_or_insert(asset);
         }
     }
 
     fn collect_assets(&mut self) {
         let mut keep: Vec<_> = self.examples.iter().flatten().copied().collect();
-        if let Some(asset) = self.bangboo_asset {
+        if let Some(asset) = self.pet_asset {
             keep.push(asset);
         }
         let removed = self.simulation.collect_unused_assets(&keep);
@@ -1048,29 +1158,6 @@ impl Application {
             return Err("Benchmark workload modified through the controls".into());
         }
         match command {
-            UiCommand::SpawnExample(kind)
-                if self.options.bangboo && kind == ModelKind::Skeleton3d =>
-            {
-                // The pet scene adds another Bangboo instead of the old robot.
-                let position = self.next_spawn_position();
-                if let Some(asset) = self.bangboo_asset {
-                    let instance = self
-                        .simulation
-                        .spawn(asset, position)
-                        .map_err(|error| error.to_string())?;
-                    self.sources.insert(instance, LoadSource::Bangboo);
-                    self.ui.selected = Some(instance);
-                    self.ui.status = "Added Bangboo".into();
-                    log::info!("spawn instance={instance} asset={asset} kind={kind}");
-                } else {
-                    self.submit_load(
-                        LoadSource::Bangboo,
-                        Operation::Spawn {
-                            positions: vec![position],
-                        },
-                    )?;
-                }
-            }
             UiCommand::SpawnExample(kind) => {
                 let (source, index) = match (kind, self.options.bench.is_some()) {
                     (ModelKind::Sprite2d, true) => (LoadSource::Example2d, 0),
@@ -1086,7 +1173,10 @@ impl Application {
                         .map_err(|error| error.to_string())?;
                     self.sources.insert(instance, source);
                     self.ui.selected = Some(instance);
-                    self.ui.status = format!("Added {kind}");
+                    self.ui.status = crate::i18n::named(
+                        crate::i18n::text(self.ui.language).status_added,
+                        &kind.to_string(),
+                    );
                     log::info!("spawn instance={instance} asset={asset} kind={kind}");
                 } else {
                     self.submit_load(
@@ -1095,6 +1185,48 @@ impl Application {
                             positions: vec![position],
                         },
                     )?;
+                }
+            }
+            UiCommand::AddLibrary(id) => {
+                let directory = crate::library::user_directory();
+                let Some(model) = crate::library::resolve(&id, directory.as_deref()) else {
+                    let message = crate::i18n::named(
+                        crate::i18n::text(self.ui.language).status_no_model,
+                        &id,
+                    );
+                    self.report_error(message);
+                    return Ok(());
+                };
+                let source = LoadSource::library(&model);
+                let position = self.next_spawn_position();
+                // The pet scene's asset is already resident: adding the same
+                // character again must not reload it (or, for an explicit
+                // file, re-read a file that may have changed under us).
+                if self.pet_source.as_ref() == Some(&source)
+                    && let Some(asset) = self.pet_asset
+                {
+                    let instance = self
+                        .simulation
+                        .spawn(asset, position)
+                        .map_err(|error| error.to_string())?;
+                    self.sources.insert(instance, source);
+                    self.ui.selected = Some(instance);
+                    self.ui.status = crate::i18n::named(
+                        crate::i18n::text(self.ui.language).status_added,
+                        &model.name,
+                    );
+                    log::info!("spawn instance={instance} asset={asset} kind=library");
+                } else {
+                    self.submit_load(
+                        source,
+                        Operation::Spawn {
+                            positions: vec![position],
+                        },
+                    )?;
+                    self.ui.status = crate::i18n::named(
+                        crate::i18n::text(self.ui.language).status_loading_model,
+                        &model.name,
+                    );
                 }
             }
             UiCommand::Remove(instance) => {
@@ -1159,6 +1291,34 @@ impl Application {
                 // line is only logged by the switch that reached it.
                 self.ui.pixel_hittest = enabled && self.hit_region.mode == RegionMode::Pixel;
             }
+            UiCommand::Wander(enabled) => {
+                self.options.wander = enabled;
+                self.options.wander_explicit = true;
+                if let Some(runtime) = &self.runtime {
+                    sync_wander_bounds(
+                        &mut self.simulation,
+                        enabled,
+                        runtime.scene_view,
+                        runtime.overlay.inner_size(),
+                    );
+                }
+                self.ui.wander = enabled;
+                log::info!("wander mode={}", if enabled { "on" } else { "off" });
+            }
+            UiCommand::ChatSend { instance, text } => {
+                let character = self
+                    .simulation
+                    .instance(instance)
+                    .map_or_else(|| "Eous".to_owned(), |info| info.name);
+                if let Some(reply) = self.chat.send(instance, &character, &text) {
+                    self.ui.status = format!("{}: {}", character, reply.text);
+                }
+            }
+            UiCommand::ChatClear(instance) => {
+                self.chat.clear_history(instance);
+                self.chat.clear_error();
+            }
+            UiCommand::ChatDismiss => self.chat.clear_error(),
             UiCommand::Quit => event_loop.exit(),
         }
         Ok(())
@@ -1216,6 +1376,16 @@ impl Application {
                 event.second,
                 event.phase.as_str()
             );
+            // Only the two conversation phases produce lines; End and Cancel
+            // close the pair and would otherwise duplicate the exchange.
+            let play = match event.phase {
+                SocialPhase::Greet => Some(false),
+                SocialPhase::Play => Some(true),
+                SocialPhase::End | SocialPhase::Cancel => None,
+            };
+            if let Some(play) = play {
+                self.chat.social(event.first, event.second, play);
+            }
         }
         for event in self.simulation.drain_attention_events() {
             log::info!(
@@ -1226,6 +1396,17 @@ impl Application {
         }
         self.ui.tick_count = self.simulation.tick_count();
         self.ui.interactions = self.simulation.interactions().len();
+        // Remote replies arrive on a worker thread; draining here keeps the
+        // panel current without blocking the frame.
+        while self.chat.poll().is_some() {}
+        // A character that no longer exists takes its conversation with it.
+        let alive: Vec<u64> = self
+            .simulation
+            .instances()
+            .into_iter()
+            .map(|info| info.id)
+            .collect();
+        self.chat.retain_instances(&alive);
         let timer = self.bench_clock();
         let generated = self.simulation.render_frame();
         if let Some(sample) = &mut self.scene_sample {
@@ -1318,7 +1499,7 @@ impl Application {
         if let Some(runtime) = &mut self.runtime {
             let input = runtime.egui_input.take_egui_input(&runtime.control);
             let mut output = runtime.egui_context.run_ui(input, |ui| {
-                commands = self.ui.draw(ui, &instances);
+                commands = self.ui.draw(ui, &instances, &self.library, &self.chat);
             });
             runtime
                 .egui_input
@@ -1980,8 +2161,10 @@ impl Application {
     /// The file is re-read only when its modification time or size changed;
     /// a scene whose loader would have to change is left alone, because
     /// restarting the scene mid-run would drop whatever the user was doing.
+    /// Wandering, language and the chat endpoint do not restart anything, so
+    /// they follow the file live.
     fn poll_config(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
-        // The watch is off for bounded runs, `--bangboo`, the smoke test and
+        // The watch is off for bounded runs, the smoke test and
         // `DELICIUM_NO_CONFIG`; this runs every frame, so it must not touch
         // the filesystem when nothing is watching.
         if self.config_watch.is_none() {
@@ -1998,12 +2181,11 @@ impl Application {
         }
         watch.modified = modified;
         watch.length = length;
-        let Some(preferences) = config::read_preferences() else {
+        let Some(preferences) = crate::preferences::read() else {
             return Ok(());
         };
-        let changed = preferences.pixel_hittest != watch.preferences.pixel_hittest;
-        watch.preferences = preferences;
-        if changed {
+        let previous = std::mem::replace(&mut watch.preferences, preferences.clone());
+        if preferences.pixel_hittest != previous.pixel_hittest {
             log::info!(
                 "applying the configured hit-test preference: pixel_hittest={}",
                 preferences.pixel_hittest
@@ -2012,6 +2194,30 @@ impl Application {
                 UiCommand::PixelHitTest(preferences.pixel_hittest),
                 event_loop,
             )?;
+        }
+        if preferences.wander != previous.wander && !self.options.wander_explicit {
+            log::info!(
+                "applying the configured wander preference: wander={}",
+                preferences.wander
+            );
+            self.apply_command(UiCommand::Wander(preferences.wander), event_loop)?;
+        }
+        let language = preferences.language.resolved();
+        if language != self.ui.language {
+            log::info!("applying the configured language: {language:?}");
+            self.language = language;
+            self.ui.set_language(language);
+            platform::tray::set_language(language);
+        }
+        if preferences.chat != previous.chat {
+            // The endpoint change only takes effect for the next send; an
+            // in-flight request keeps its own settings and finishes normally.
+            log::info!(
+                "applying the configured chat settings: enabled={} model={}",
+                preferences.chat.enabled,
+                preferences.chat.model
+            );
+            self.chat.configure(preferences.chat, language);
         }
         Ok(())
     }
@@ -2719,23 +2925,38 @@ mod tests {
     }
 
     #[test]
-    fn bangboo_cache_records_only_committed_bangboo_loads() {
+    fn pet_cache_records_only_committed_pet_loads() {
         let mut app = Application::new(Options::default()).unwrap();
+        let pet = LoadSource::Library {
+            id: crate::preferences::DEFAULT_PET.into(),
+            path: None,
+        };
+        app.pet_source = Some(pet.clone());
         // A failed load must not pollute the cache.
-        app.note_bangboo_load(&LoadSource::Bangboo, 7, false);
-        assert_eq!(app.bangboo_asset, None);
+        app.note_pet_load(&pet, 7, false);
+        assert_eq!(app.pet_asset, None);
         // A successful load of any other source is not the pet scene.
-        app.note_bangboo_load(&LoadSource::Example2d, 7, true);
-        assert_eq!(app.bangboo_asset, None);
-        // A committed Bangboo load is remembered exactly once.
-        app.note_bangboo_load(&LoadSource::Bangboo, 7, true);
-        assert_eq!(app.bangboo_asset, Some(7));
-        app.note_bangboo_load(&LoadSource::Bangboo, 8, true);
-        assert_eq!(app.bangboo_asset, Some(7));
+        app.note_pet_load(&LoadSource::Example2d, 7, true);
+        assert_eq!(app.pet_asset, None);
+        // A different library id is not this scene either.
+        app.note_pet_load(
+            &LoadSource::Library {
+                id: "puppet2d".into(),
+                path: None,
+            },
+            6,
+            true,
+        );
+        assert_eq!(app.pet_asset, None);
+        // A committed pet load is remembered exactly once.
+        app.note_pet_load(&pet, 7, true);
+        assert_eq!(app.pet_asset, Some(7));
+        app.note_pet_load(&pet, 8, true);
+        assert_eq!(app.pet_asset, Some(7));
     }
 
     #[test]
-    fn bangboo_cache_survives_instance_collection_and_never_takes_a_slot() {
+    fn pet_cache_survives_instance_collection_and_never_takes_a_slot() {
         let mut app = Application::new(Options::default()).unwrap();
         let model = load_model_bytes(
             include_bytes!("../../assets/examples/puppet2d.dmodel.json"),
@@ -2744,7 +2965,11 @@ mod tests {
         .unwrap();
         let asset = app.simulation.insert_asset(model).unwrap();
         let instance = app.simulation.spawn(asset, Vec3::ZERO).unwrap();
-        app.bangboo_asset = Some(asset);
+        app.pet_source = Some(LoadSource::Library {
+            id: "puppet2d".into(),
+            path: None,
+        });
+        app.pet_asset = Some(asset);
         // The cache is kept alive with no surviving instance...
         app.simulation.despawn(instance);
         app.collect_assets();
@@ -2752,7 +2977,7 @@ mod tests {
         // ...but only while it is still cached: dropping it releases the asset
         // and none of the four example slots ever held it.
         assert!(app.examples.iter().all(|slot| slot.is_none()));
-        app.bangboo_asset = None;
+        app.pet_asset = None;
         app.collect_assets();
         assert!(app.simulation.asset(asset).is_none());
         assert_eq!(app.simulation.asset_count(), 0);
