@@ -1,12 +1,17 @@
 name: Release
 
-# Pushing a tag `vX.Y.Z` builds both executables on a clean Windows runner,
-# checks them the same way the local offline gate does, and publishes them
-# with the update manifest the client reads. Nothing is published from a
-# branch, and a tag that disagrees with Cargo.toml fails before building.
+# Two triggers, one build definition:
+#
+# - A push to `main` builds and checks the same way the local offline gate does
+#   and uploads both executables as workflow artifacts. It never publishes.
+# - A push of a tag `vX.Y.Z` does the same build, then publishes the two
+#   executables with the update manifest the client reads. The tag must agree
+#   with Cargo.toml, and nothing is published from a branch.
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -17,15 +22,19 @@ permissions:
 # only when a release changes the manifest schema or the installation layout;
 # otherwise the launcher that is already installed can install the new engine
 # in a single launch.
+#
+# Raised to 0.1.2: that release carries the 30-minute asset download budget.
+# A launcher older than 0.1.2 still enforces the old 60-second single-request
+# budget, so it must replace itself before it can install the new engine.
 env:
-  MIN_LAUNCHER_VERSION: "0.1.0"
+  MIN_LAUNCHER_VERSION: "0.1.2"
 
 jobs:
   release:
     name: Build and publish
     runs-on: windows-latest
     steps:
-      - name: Check out the tagged commit
+      - name: Check out the pushed commit
         uses: actions/checkout@v4
 
       - name: Install the Rust toolchain
@@ -33,23 +42,33 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Check the tag against Cargo.toml
+      # A tag must name exactly the version Cargo.toml declares. Branch builds
+      # take the version from Cargo.toml and claim no tag.
+      - name: Resolve the version
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = $env:GITHUB_REF_NAME
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
-            throw "`$tag` must be vMAJOR.MINOR.PATCH; the client follows the stable channel and refuses pre-releases"
-          }
-          $version = $tag.Substring(1)
           $declared = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          if ($version -ne $declared) {
-            throw "tag $tag disagrees with Cargo.toml version $declared"
+          $isTag = $env:GITHUB_REF_TYPE -eq 'tag'
+          if ($isTag) {
+            $tag = $env:GITHUB_REF_NAME
+            if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+              throw "`$tag` must be vMAJOR.MINOR.PATCH; the client follows the stable channel and refuses pre-releases"
+            }
+            $version = $tag.Substring(1)
+            if ($version -ne $declared) {
+              throw "tag $tag disagrees with Cargo.toml version $declared"
+            }
+          } else {
+            $version = $declared
+            $tag = "v$version"
           }
           if ([version]$env:MIN_LAUNCHER_VERSION -gt [version]$version) {
             throw "MIN_LAUNCHER_VERSION $env:MIN_LAUNCHER_VERSION is newer than the release $version"
           }
           "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "is_tag=$($isTag.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
         id: version
 
       - name: Format check
@@ -71,7 +90,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $version = '${{ steps.version.outputs.version }}'
-          $tag = $env:GITHUB_REF_NAME
+          $tag = '${{ steps.version.outputs.tag }}'
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Copy-Item target/release/delicium.exe dist/delicium.exe -Force
           Copy-Item target/release/delicium-launcher.exe dist/delicium-launcher.exe -Force
@@ -115,15 +134,26 @@ jobs:
           )
           Get-Content dist/latest.json
 
+      # Branch builds stop here: the binaries are inspectable but nothing is
+      # published, so a merge cannot create or move a release.
+      - name: Upload the built files
+        if: steps.version.outputs.is_tag != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: delicium-${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+
       # Tags are immutable here: a release is created once, and re-running the
       # workflow must not clobber files a client may already have downloaded.
       - name: Publish
+        if: steps.version.outputs.is_tag == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = $env:GITHUB_REF_NAME
+          $tag = '${{ steps.version.outputs.tag }}'
           gh release create $tag `
             dist/delicium.exe `
             dist/delicium-launcher.exe `

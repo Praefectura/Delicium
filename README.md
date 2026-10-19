@@ -135,8 +135,8 @@ summary above.
 
 ## Status
 
-Pre-release, single platform, two tagged releases (`v0.1.0`, `v0.1.1`). What has actually
-been run:
+Pre-release, single platform, three tagged releases (`v0.1.0`, `v0.1.1`, `v0.1.2`). What has
+actually been run:
 
 - **Offline gate.** `fmt --check`, `clippy --all-targets -D warnings`, 274 library tests
   (19 ignored by design), seven non-GPU integration targets, eight hardware-GPU tests, and a
@@ -149,22 +149,24 @@ been run:
   error statuses. **No real third-party LLM service has been contacted**, and the optional
   API key is stored in plain text in `%APPDATA%\Delicium\config.json`.
 - **Release pipeline.** Tags `v0.1.0` and `v0.1.1` each triggered
-  `.github/workflows/release.yml` on `windows-latest`; both runs finished green and published
+  `.github/workflows/release.yml` on `windows-latest`; every run finished green and published
   three assets: `delicium-launcher.exe`, `delicium.exe` and `latest.json`. An anonymous
   request to `releases/latest/download/latest.json` returns the manifest, which redirects to
   `objects.githubusercontent.com` and is followed by the client's WinHTTP redirect policy.
+  Pushes to `main` run the same format/lint/build/test steps and upload both executables as
+  workflow artifacts, but never publish.
 - **Install from the published Release.** The `v0.1.0` launcher downloaded from the Release,
   pointed at an empty installation root, fetched the manifest and the engine over the
   network, verified SHA-256, installed `app/0.1.0/delicium.exe`, and ran it to a clean exit.
   The on-disk engine hash matches the manifest. A second launch reported
-  `Up to date (0.1.0)` and did not reinstall.
-- **Still outstanding.** That end-to-end run happened on the development machine with an
-  isolated `DELICIUM_INSTALL_ROOT`, not on a pristine machine. The `v0.1.1` auto-update was
-  released and verified by anonymous download, but the same end-to-end run has not been
-  repeated against it: on the link available while writing this, GitHub release assets
-  transferred at 50-70 KB/s, which does not finish a 25 MB engine in a reasonable time.
-  Self-replacement of the launcher image has not been exercised by a release that raises
-  `min_launcher_version`, because no such release exists yet. Dual-monitor acceptance is
+  `Up to date (0.1.0)` and did not reinstall. The same two-phase run against `v0.1.1` on an
+  empty root passed all 24 assertions in 36 seconds: manifest, 24.7 MB download, SHA-256 and
+  size match, `app/0.1.1`, engine start confirmation, clean exit, then
+  `Up to date (0.1.1)` with exactly one version directory kept.
+- **Still outstanding.** Those end-to-end runs happened on the development machine with an
+  isolated `DELICIUM_INSTALL_ROOT`, not on a pristine machine. `v0.1.2` raises
+  `min_launcher_version` to `0.1.2` so that an installed `0.1.1` launcher replaces its own
+  image first; that self-replacement path is new in this release. Dual-monitor acceptance is
   untested.
 
 Treat the updater as implemented and exercised end to end once, not as battle-tested.

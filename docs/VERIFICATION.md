@@ -498,3 +498,19 @@ v19 的 8 项实际资产测试、9600 帧持续待机/恢复中再次点击采�
 **未完成。** 真实网络 E2E 仍未跑通：本机到 Release 资产的链路在测速时只有 50–70 KB/s，本轮只放宽了预算，尚未换网络重跑两阶段脚本。因此"新版启动器在空安装根上自动下载 0.1.1 并进入 Up to date"仍没有新的实测证据。v0.1.1 的 tag、CI、Release 与未认证资产下载已核验（版本 0.1.1、引擎 24,724,480 字节 / `c7cce224…b14667`、启动器 2,126,848 字节 / `883bb734…0110a`）。
 
 口径：本轮改了下载预算常量与 README 文件组织，未改清单协议、版本门控、安装事务或保留策略；未在真实用户安装根上执行任何覆盖或删除。
+
+### v0.1.2：真实链路 E2E 通过、启动器自替换与 main 构建（2026-10-19）
+
+**真实链路 E2E 通过（补上一节的"未完成"）。** 换网络后同一 Release 资产实测 2.77–2.85 MB/s（24,724,480 字节 8.9 秒），比原先的 50–70 KB/s 快约 50 倍。用全新空根 `.artifacts/launcher-e2e-20261019/root3` 跑放宽预算后的 `target\release\delicium-launcher.exe`：
+
+- phase 1（空根真实安装）：8 秒完成清单获取、24.7 MB 引擎下载与逐文件 SHA-256/size 校验，装入 `app\0.1.1`，启动引擎并得到 `engine start confirmed: Confirmed`，12 秒后引擎 `code=0` 干净退出；`state.json` 为 `current.version=0.1.1`、`pending=null`。
+- phase 2（已装启动器二次启动）：报 `Up to date (0.1.1)`，未安装任何东西，`app\` 下仍只有 `0.1.1` 一个版本目录（单版本保留生效）。
+- 合计 36.2 秒，24 条断言全部 `[OK]`，`RESULT: PASS`；跑完无残留 `delicium*` 进程。安装树 5 个文件，`delicium.exe` sha256 `c7cce224107f1c00f22dbb1e50c98cc6678a0230f33785cf2b31f2a70ab14667` 与 Release 清单一致。
+
+**一处测试脚本误报（非产品缺陷）。** 首次复跑（`root2`）报 `exactly one engine version is kept` 失败，但同一行打印的 `engine versions present: 0.1.1` 与安装树都证明只有一份。根因是 PowerShell 的数组解卷：`$versions = if (...) { @(...) } else { @() }` 赋值时单元素数组仍被解卷成 `String`，`$versions[0]` 取到首字符 `'0'`。改为 `$versions = @()` 后另起 `if` 赋值即通过；产品行为本来就是对的。
+
+**v0.1.2 发布准备。** `Cargo.toml`/`Cargo.lock` 升到 `0.1.2`；`release.yml` 的 `MIN_LAUNCHER_VERSION` 由 `0.1.0` 提到 `0.1.2`。理由：下载预算修复只存在于启动器二进制里，而 `src/launcher/update.rs:116` 只有在 `min_launcher_version > 当前启动器版本` 时才替换启动器镜像；若该值不提，已安装的 0.1.1 启动器会一直用旧的 60 秒预算去下 24.7 MB 引擎。提高到 0.1.2 后，旧启动器会先替换自身镜像、下次启动再装引擎——这条自替换路径此前从未被真实发布触发过。
+
+**main 构建。** `release.yml` 增加 `push: branches: [main]` 触发：分支构建跑同样的 fmt/clippy/build/test，把两个 exe 与 `latest.json` 作为工作流产物上传，但不创建 Release；只有 `vX.Y.Z` tag 才发布。版本解析拆成单独一步，分支构建从 `Cargo.toml` 取版本且不声明 tag，tag 构建仍校验 tag 与 `Cargo.toml` 一致、拒绝预发布格式。
+
+口径：E2E 仍是在开发机上用隔离 `DELICIUM_INSTALL_ROOT` 跑的，不是全新机器；未在真实用户安装根上执行任何覆盖或删除。`min_launcher_version` 自替换路径在 v0.1.2 发布后需要单独验证。
