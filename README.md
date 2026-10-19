@@ -41,9 +41,19 @@ species picturae ante omnia, non convenientia cum formis alienis.
   saltat per circa unum secundum; motus est in pictura tantum, locus non mutatur.
 - Icona in area nuntiorum: sinistra preme ut fenestram imperii ostendas aut celes,
   dextra preme ut menu aperias.
-- Configuratio in `%APPDATA%\Delicium\config.json` servatur et in initio legitur.
-- Duo animalcula Bangboo (Eous) in `--bangboo` modo; formae propriae exempli etiam
-  adsunt.
+- Configuratio in `%APPDATA%\Delicium\config.json` servatur et in initio legitur: personae,
+  loci, mores (ictus regionum, vagatio), lingua, persona prima, et finis colloquii.
+- **Bibliotheca formarum**: machina nulli formae certae alligata est. Quinque formae
+  inclusae per id vocantur (`bangboo-eous`, `puppet2d`, `robot3d`, et varietates pictae);
+  quodlibet `*.dmodel.json` in `%APPDATA%\Delicium\models\` positum fit pars bibliothecae.
+- **Lingua duplex**: Sinica simplificata et Anglica, in pagina praeferentiarum electa aut ex
+  lingua Windows sumpta.
+- **Fenestra colloquii**: unaquaeque persona memoriam colloquii in fenestra imperii habet.
+  Sine fine constituto lineis localibus respondet; cum fine OpenAI-compatibili nuntium,
+  contextum et responsum mittit et ostendit. Colloquia inter personas eodem in indice
+  scribuntur.
+- Unum animalculum Bangboo (Eous) in `--bangboo` modo (idem ac `--pet bangboo-eous`);
+  alterum in fenestra imperii e bibliotheca additur; formae propriae exempli etiam adsunt.
 
 **Aedificare et agere** (Rust MSVC in Windows):
 
@@ -94,9 +104,22 @@ model formats: Delicium does not import GLB or other external formats.
   simulated position does not move.
 - **Tray icon.** Left click shows or hides the control window; right click opens a menu.
   Closing the control window hides it to the tray.
-- **Persistent configuration** in `%APPDATA%\Delicium\config.json`: instances, positions
-  and the hit-region preference are restored on the next launch.
-- **Two bundled Bangboo pets** (Eous) with `--bangboo`, plus self-made example assets.
+- **Persistent configuration** in `%APPDATA%\Delicium\config.json`: instances, positions,
+  the hit-region and wandering preferences, the interface language, the default character and
+  the chat endpoint are restored on the next launch.
+- **Model library.** No character is wired into the engine. Five bundled models are addressed
+  by id (`bangboo-eous`, `puppet2d`, `robot3d`, and textured variants), and any
+  `*.dmodel.json` dropped into `%APPDATA%\Delicium\models\` becomes a library entry. `--pet
+  ID|PATH` starts one of them; the controls list the library and add instances from it.
+- **Two interface languages.** Simplified Chinese and English, chosen in the settings page or
+  following the Windows UI language.
+- **Conversation panel.** Each character has an in-memory conversation in the control window.
+  Without a configured endpoint the pet answers with local lines; with an OpenAI-compatible
+  endpoint configured it sends the persona, the recent turns and the new message, and shows the
+  reply. Character-to-character social lines land in the same log.
+- **A bundled Bangboo pet** (Eous) with `--bangboo` (an alias for `--pet bangboo-eous`);
+  a second one is added from the model library in the control window. Self-made example
+  assets are included.
 
 ### Install
 
@@ -119,7 +142,13 @@ Requires a Rust MSVC toolchain on Windows and a Visual Studio build environment.
 `delicium-launcher.exe` is the stable entry point. On first start it copies itself into
 `%LOCALAPPDATA%\Delicium\`, then checks GitHub Releases for a newer build, installs it if
 there is one, and starts the pet. A double click goes straight to the pet — no window, no
-interruption. Settings open on demand from the tray menu.
+interruption. Settings open on demand from the tray menu (`--settings` opens them directly).
+
+The settings page carries the hit-region and wandering toggles, the interface language, the
+default character (a library id) and the conversation endpoint (base URL, model, API key).
+It writes only the fields it owns, through a temporary file and an atomic rename, so unknown
+fields and the engine's saved scene survive; the running pet polls the file and applies
+preference changes live.
 
 The layout is `%LOCALAPPDATA%\Delicium\` with `delicium-launcher.exe`, `state.json`,
 `launcher.json`, `logs\`, and one `app\<version>\delicium.exe` per installed version.
@@ -127,15 +156,21 @@ Each version gets its own directory, so an update never overwrites the build tha
 currently running. The launcher replaces its own image with `ReplaceFileW`, which Windows
 allows while the file is executing.
 
+Only one engine version is kept: a new version is recorded as pending, and once it has run
+long enough to count as healthy the version it replaced is deleted along with its directory.
+If the new version crashes early three times it is discarded and the version that was
+already running stays. A directory without a valid `.install.json` marker is never deleted,
+and neither are your own models in `%APPDATA%\Delicium\models\`.
+
 Updates are read from a fixed address
 (`.../releases/latest/download/latest.json`) and verified with SHA-256 over TLS. The
 manifest never supplies a URL: asset addresses are derived from the repository and the
 release tag, so a compromised manifest cannot redirect a download. A failed or interrupted
-update leaves the previous version in place and launches it.
+update installs nothing and the running version keeps starting.
 
 ### Command line
 
-The engine (`delicium.exe`) takes `--model`, `--bangboo`, `--overlay-size`,
+The engine (`delicium.exe`) takes `--model`, `--pet`, `--bangboo`, `--overlay-size`,
 `--exit-after`, `--no-wander`, `--backend`, the `--bench` family, and `--smoke-test`.
 The launcher takes `--settings`, `--no-update`, `--engine PATH`, and forwards everything
 after `--` to the engine. Full tables: [docs/USAGE.md](docs/USAGE.md).
@@ -172,10 +207,16 @@ summary above.
 
 Pre-release, single platform, one tagged release (`v0.1.0`). What has actually been run:
 
-- **Offline gate.** `fmt --check`, `clippy --all-targets -D warnings`, 222 library tests
-  (19 ignored by design), six non-GPU integration targets, eight hardware-GPU tests, and a
-  release build. Seven Windows GUI acceptance scripts pass. The launcher/settings handshake
-  was proved with a cross-process probe.
+- **Offline gate.** `fmt --check`, `clippy --all-targets -D warnings`, 274 library tests
+  (19 ignored by design), seven non-GPU integration targets, eight hardware-GPU tests, and a
+  release build: 390 passed, 0 failed. Both `GetGuiResources` leak tests pass in a dedicated
+  process. Eight Windows GUI acceptance scripts pass. The launcher/settings handshake
+  was proved with a cross-process probe, and version retention was exercised end to end on a
+  synthetic installation root (16 assertions, including a second start).
+- **Chat transport.** The conversation panel and its OpenAI-compatible client were exercised
+  against a loopback HTTP fixture owned by the test, including refusal of redirects and
+  error statuses. **No real third-party LLM service has been contacted**, and the optional
+  API key is stored in plain text in `%APPDATA%\Delicium\config.json`.
 - **Release pipeline.** Tag `v0.1.0` triggered `.github/workflows/release.yml` on
   `windows-latest`; the run finished green and published three assets:
   `delicium-launcher.exe`, `delicium.exe` and `latest.json`. An anonymous request to
@@ -196,10 +237,11 @@ Treat the updater as implemented and exercised end to end once, not as battle-te
 ### What is not here yet
 
 No GLB or other external format import; no visual editor; no IK, physics or morph targets;
-wandering is horizontal only, with no vertical movement or obstacle avoidance; no network,
-store, accounts, payment or SQLite in the runtime. Materials are basic GGX/Schlick without
-IBL, shadows, normal maps or mipmaps. Non-Windows platforms are out of scope for the first
-stage. See [docs/ROADMAP.md](docs/ROADMAP.md) for the current status list.
+wandering is horizontal only, with no vertical movement or obstacle avoidance; the only
+network feature is the optional, user-configured chat endpoint — there is no store, no
+account system, no payment and no SQLite in the runtime. Materials are basic GGX/Schlick
+without IBL, shadows, normal maps or mipmaps. Non-Windows platforms are out of scope for the
+first stage. See [docs/ROADMAP.md](docs/ROADMAP.md) for the current status list.
 
 ### Licence
 
@@ -227,8 +269,11 @@ with the rights holders.
 - **自主漫游**：角色在场景可见范围内按待机/行走状态机水平走动，`--no-wander` 关闭。
 - **点击反应**：原地按下并释放（位移 < 4px）→ 角色转向点击点并做一次约 1 秒的惊吓小跳。小跳是呈现偏移，模拟位置不变。
 - **系统托盘**：左键切换控制窗显隐，右键菜单；关闭控制窗 = 隐藏到托盘。
-- **配置持久化**：`%APPDATA%\Delicium\config.json` 保存实例、位置与命中区域偏好，下次启动恢复。
-- **两只邦布桌宠**（伊埃斯/Eous，`--bangboo`），另有自制示例资产。
+- **配置持久化**：`%APPDATA%\Delicium\config.json` 保存实例、位置、命中区域与漫游偏好、界面语言、默认角色与对话端点，下次启动恢复。
+- **模型库**：引擎不再绑定任何具体角色。五个内建模型按 id 寻址（`bangboo-eous`、`puppet2d`、`robot3d` 及贴图版），把 `*.dmodel.json` 放进 `%APPDATA%\Delicium\models\` 就成为库条目；`--pet ID|PATH` 启动其中一个，控制窗列出模型库并可从库中新增实例。
+- **两种界面语言**：简体中文与 English，在设置页选择，或跟随 Windows 界面语言。
+- **会话框**：每个角色在控制窗里有自己的内存会话。未配置端点时用内置本地台词回答；配置了 OpenAI 兼容端点后，请求携带角色提示词、最近若干轮与本次消息，并回显回复。角色之间的社交台词也进入同一份记录。
+- **一只邦布桌宠**（伊埃斯/Eous，`--bangboo`，等价 `--pet bangboo-eous`），第二只从控制窗的模型库 `Add` 加入，另有自制示例资产。
 
 ### 安装
 
@@ -245,15 +290,19 @@ with the rights holders.
 
 ### 启动器与自动更新
 
-`delicium-launcher.exe` 是稳定入口。首次启动时把自己复制进 `%LOCALAPPDATA%\Delicium\`，随后向 GitHub Releases 查询新版本，有则安装，然后拉起桌宠。双击直接进桌宠，不弹窗、不打断；设置页从托盘菜单按需打开。
+`delicium-launcher.exe` 是稳定入口。首次启动时把自己复制进 `%LOCALAPPDATA%\Delicium\`，随后向 GitHub Releases 查询新版本，有则安装，然后拉起桌宠。双击直接进桌宠，不弹窗、不打断；设置页从托盘菜单按需打开（`--settings` 直接打开）。
+
+设置页包含命中区域与漫游开关、界面语言、默认角色（库 id）和对话端点（Base URL、模型名、API Key）。它只写自己拥有的字段，经临时文件原子替换落盘，因此未知字段与引擎保存的场景都会保留；运行中的桌宠会轮询该文件并实时应用偏好改动。
 
 目录布局为 `%LOCALAPPDATA%\Delicium\`，其中有 `delicium-launcher.exe`、`state.json`、`launcher.json`、`logs\`，以及每个已安装版本各自的 `app\<version>\delicium.exe`。每个版本独占一个目录，更新不会覆盖正在运行的构建。启动器用 `ReplaceFileW` 替换自身镜像——Windows 允许替换正在执行的 exe。
 
-更新清单从固定地址读取（`.../releases/latest/download/latest.json`），经 TLS 传输并用 SHA-256 校验。清单**不提供任何 URL**：资产地址由仓库与 release tag 推导，因此被篡改的清单无法把下载重定向到别处。更新失败或中断时保留旧版本并继续启动它。
+只保留一个引擎版本：新版本先记为待确认，运行足够久确认为健康后，被替换的版本连同其目录一起删除；新版本若早期连续崩溃三次则被丢弃，原来能用的版本继续运行。没有有效 `.install.json` 标记的目录永不删除，`%APPDATA%\Delicium\models\` 里的自有模型也不参与清理。
+
+更新清单从固定地址读取（`.../releases/latest/download/latest.json`），经 TLS 传输并用 SHA-256 校验。清单**不提供任何 URL**：资产地址由仓库与 release tag 推导，因此被篡改的清单无法把下载重定向到别处。更新失败或中断时不安装任何东西，正在运行的版本继续启动。
 
 ### 命令行
 
-引擎（`delicium.exe`）接受 `--model`、`--bangboo`、`--overlay-size`、`--exit-after`、`--no-wander`、`--backend`、`--bench` 系列与 `--smoke-test`；启动器接受 `--settings`、`--no-update`、`--engine PATH`，`--` 之后的参数原样转交引擎。完整表格见 [docs/USAGE.md](docs/USAGE.md)。
+引擎（`delicium.exe`）接受 `--model`、`--pet`、`--bangboo`、`--overlay-size`、`--exit-after`、`--no-wander`、`--backend`、`--bench` 系列与 `--smoke-test`；启动器接受 `--settings`、`--no-update`、`--engine PATH`，`--` 之后的参数原样转交引擎。完整表格见 [docs/USAGE.md](docs/USAGE.md)。
 
 ### 测试
 
@@ -274,7 +323,8 @@ with the rights holders.
 
 预发布阶段，仅 Windows，已有一个带 tag 的发布（`v0.1.0`）。以下都是实际跑过的：
 
-- **离线门**：`fmt --check`、`clippy --all-targets -D warnings`、222 项 lib 测试（19 项按设计忽略）、六个非 GPU 集成目标、八项硬件 GPU 测试与 release 构建；七套 Windows GUI 验收脚本通过；启动器与设置页的握手用跨进程探针实测通过。
+- **离线门**：`fmt --check`、`clippy --all-targets -D warnings`、274 项 lib 测试（19 项按设计忽略）、七个非 GPU 集成目标、八项硬件 GPU 测试与 release 构建，共 390 通过、0 失败；两个 `GetGuiResources` 泄漏测试在独立进程中通过；八套 Windows GUI 验收脚本通过；启动器与设置页的握手用跨进程探针实测通过；版本保留在合成安装根上完成 16 项端到端断言（含二次启动幂等）。
+- **对话传输**：会话面板与 OpenAI 兼容客户端只在本机回环夹具上验证过，含拒绝重定向与错误状态；**未联系任何真实第三方 LLM 服务**。可选的 API key 以明文存放在 `%APPDATA%\Delicium\config.json`。
 - **发布流水线**：推 tag `v0.1.0` 触发 `.github/workflows/release.yml` 在 `windows-latest` 上运行，结果全绿，发布三个资产：`delicium-launcher.exe`、`delicium.exe`、`latest.json`。未认证请求 `releases/latest/download/latest.json` 能拿到清单；该请求重定向到 `objects.githubusercontent.com`，由客户端的 WinHTTP 重定向策略跟随。
 - **从已发布 Release 安装**：把 Release 里的启动器下载到本机，指向一个空安装根，经网络取清单与引擎、校验 SHA-256、装入 `app/0.1.0/delicium.exe` 并运行至干净退出；落盘引擎哈希与清单一致。第二次启动报告 `Up to date (0.1.0)`，未重复安装。
 - **仍未完成**：上述端到端是在开发机上用隔离的 `DELICIUM_INSTALL_ROOT` 跑的，不是在全新机器上。启动器镜像自替换尚未被"提高 `min_launcher_version` 的发布"实际触发过，因为还不存在这样的发布。双屏实机验收未做。
@@ -283,7 +333,7 @@ with the rights holders.
 
 ### 尚未包含
 
-无 GLB 或其他外部格式导入；无可视化编辑器；无 IK、物理与 morph；漫游只做水平方向，无竖直移动与避障；运行时无联网、商店、账号、支付或 SQLite。材质是基础 GGX/Schlick，尚无 IBL、阴影、法线贴图与 mipmap。第一阶段不承诺非 Windows 平台。当前状态与范围外清单见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+无 GLB 或其他外部格式导入；无可视化编辑器；无 IK、物理与 morph；漫游只做水平方向，无竖直移动与避障；运行时唯一的联网能力是用户自行配置的对话端点，无商店、账号、支付或 SQLite。材质是基础 GGX/Schlick，尚无 IBL、阴影、法线贴图与 mipmap。第一阶段不承诺非 Windows 平台。当前状态与范围外清单见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ### 许可
 

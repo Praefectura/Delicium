@@ -31,13 +31,15 @@ pwsh -NoProfile -File tests/windows_pixel_hit.ps1
 pwsh -NoProfile -File tests/windows_wander.ps1
 pwsh -NoProfile -File tests/windows_actions.ps1
 pwsh -NoProfile -File tests/windows_bangboo.ps1
+pwsh -NoProfile -File tests/windows_settings.ps1
+pwsh -NoProfile -File tests/windows_chat.ps1
 ```
 
 `windows_desktop.ps1` 验证普通启动的桌面范围：场景客户区等于所有显示器物理矩形的包围盒、`NonRudeHWND` 属性已设置、控制窗在屏内并按右上锚点定位、桌面模式拖拽越过旧有界窗口右边缘（12 步物理拖拽，世界位移与像素比一致）、释放后区域与空白穿透恢复、无 fallback；该脚本设计上不截图。`windows_smoke.ps1` 覆盖控制窗操作与完整 GUI 生命周期（显式 `--overlay-size 960x640` 保持有界布局），并覆盖一次原地点击：断言 `poke instance=` 日志 +1、press/release 各 +1、点击前后角色位置不变、点击与拖拽命中同一实例；该段拖拽向左（避免落入右侧同纹理傀儡的拾取重叠区），poke 锚点由拖拽锚点减去光标行程推导。`windows_pixel_hit.ps1` 专门检查默认轮廓模式下的空白/耳间/腿间穿透、角色拖拽、释放恢复、窗口层级与模式切换（同样显式有界）。这三个既有回归脚本显式传入 `--no-wander` 保持固定锚点；`windows_wander.ps1` 单独覆盖普通启动的自主水平游走、拖动期间暂停、释放后恢复，以及游走下的命中区域与穿透行为。四套脚本均设置 `DELICIUM_NO_CONFIG=1`，用户保存的配置不会泄漏进测试场景。两套截图脚本在客户区覆盖主显示器（含跨屏包围盒，每轴保留 8 物理像素守卫容差）时拒绝截图，防止把桌面范围误当成有界场景捕获；`windows_wander.ps1` 不截图。几何单测负责冻结帧的区域覆盖，动画截图仅验证角色存在和透明合成，不能替代同姿态无裁剪证明。
 
 `windows_actions.ps1` 是单屏动作专项：在启用漫游的有界普通窗口中，用真实输入覆盖两类角色的待机/行走/返回待机、点击优先与重复点击重启、拖拽挂起/释放恢复，并保存不同动作及步态相位的应用区域截图供目检。动作日志只是状态证据，不能代替画面检查；lib中的动作冻结帧测试还把实际GPU可见像素与同姿态GDI命中区域逐点对照。
 
-验证日志和应用区域截图保留在每次新建的 `.artifacts/` 子目录；测试背景与应用在结束时关闭，鼠标释放并恢复光标。上述六套脚本均支持 `-ValidateOnly`，只编译测试框架而不启动窗口。`windows_bangboo.ps1` 在有界场景固定世界位置，覆盖双方问候/玩耍的真实姿态、3D点击与重复点击、拖拽成对取消和冷却后重新配对，并保存各阶段截图；固定位置是专项测试参数，普通 `--bangboo` 启动仍默认漫游。
+验证日志和应用区域截图保留在每次新建的 `.artifacts/` 子目录；测试背景与应用在结束时关闭，鼠标释放并恢复光标。上述八套脚本均支持 `-ValidateOnly`，只编译测试框架而不启动窗口。`windows_bangboo.ps1` 在有界场景固定世界位置，覆盖双方问候/玩耍的真实姿态、3D点击与重复点击、拖拽成对取消和冷却后重新配对，并保存各阶段截图；固定位置是专项测试参数，普通 `--bangboo` 启动仍默认漫游。
 
 ### 贴图与基础材质验收（2026-10-14）
 
@@ -402,3 +404,82 @@ v19 的 8 项实际资产测试、9600 帧持续待机/恢复中再次点击采�
 
 本轮证据：`.artifacts/eous-grounded-reaction-20261018/01-findings.md`、`whole-run-v3/evaluation.json` 及 `whole-run-v3/comparison-provenance.json`（后两者均位于同工件根）。旧失败日志保留，未自动提交或推送，测试实例均已退出。
 
+
+### 伊埃斯 v21 直腿摇摆步：离线与实窗验收（2026-10-18）
+
+实机观感反馈"走路不太依靠膝盖"后，walk 片段由膝部 44..62 度泵动改为膝整周期固定 44 度、髋以 -28 度基线摆动 ±16 度，抬脚改为大腿局部约 10 毫米的摆动期平移；上身补 spine_01 反向侧倾（Z 10 度、Y 2 度、X 2 度）、head 反向侧倾 5 度、手臂随髋摆动、Ear_02 滞后 0.12 周期。改法同时落在 `tools/convert_eous.py` 的 `walk_angles` / `walk_lifts`（重新导出可复现）和 `tools/reauthor_eous_walk.py`（只重写成品 walk，其它四段与网格/骨架/贴图解包后摘要断言未变）。
+
+离线：`--test eous_asset` 10 项通过——前进摆幅 0.08982/0.08985、侧向 4.5e-8、间距 0.2139、支撑脚最高 0.002975、摆动抬脚 0.0100/0.0100、半周期分离 0.0902/0.0895；交叉渐变离线最差 idle→walk +0.000906、walk→idle -0.0000967，运行时 1800 tick 实测最低 +0.0000748；120 Hz 插值地板 +0.002669；循环首尾逐值相等。`tools/test_convert_eous.py` 12 项通过。release 全套 **333 通过、0 失败、19 ignored**（lib 222、attention 14、eous_asset 10、gpu_render 8、model_pipeline 25、render_coordinates 10、simulation 31、textured_model 13）；fmt 与 release all-targets 严格 clippy 干净。
+
+实窗（`target/release/delicium.exe`，SHA256 `e34d6c1bafc5ee60e6116cd4df454584705c93b5961214cb606631618f68bdfb`，24,466,944 字节）：smoke、pixel_hit、desktop、bangboo、wander、actions 六套 GUI 脚本全部通过；bounded 960x640 预览 24 张截图 + 48 次原生区域前后回读完成并自然退出（`captures=24 region_readbacks=48 input=none`），四个空白角始终在区域外；主代理亲看行走帧（scene-08/10/21/22），姿态为直腿摇摆、无膝部泵动、脚未穿地。`windows_bench.ps1 -Quick` 快速接线通过。
+
+口径：本轮未对照《绝区零》实机视频逐帧核对（会话无联网视频工具），"更接近游戏"仍需用户实机确认；未重跑性能对照，不声称端到端帧率变化；双屏实机继续后延。成品 6894987 字节、SHA256 `8fdeef3b…`，v20 备份 SHA256 `d4dbd78a…` 保留在 `.artifacts/eous-walk-reauthor-20261018/`；实窗证据在同目录 `preview/final-preview-20261018-233506-d289966c301c45b89cdafe187f51b2d0/`。
+
+### 模型库、设置开关、多语言与会话框：离线与实窗验收（2026-10-19）
+
+本轮把邦布从引擎里的特殊分支降为模型库中的一个条目，并新增启动器设置页开关、界面语言与桌宠会话框。范围与边界：模型库为内建清单加 `%APPDATA%\Delicium\models` 用户目录，不做元数据、缩略图或导入向导；语言只有简体中文与 English；会话接口为 OpenAI 兼容的 `/chat/completions`，另有不联网的本地台词兜底；没有下载任何游戏文件或外部资产。
+
+离线门（`fmt`、release all-targets 严格 clippy 与下列测试，全部 `EXIT_CODE=0`）：lib 270 通过 / 19 ignored，`attention` 14、`chat_loopback` 5、`eous_asset` 10、`gpu_render` 8、`model_pipeline` 25、`render_coordinates` 10、`simulation` 31、`textured_model` 13，共 **386 通过、0 失败、19 ignored**。两个 `GetGuiResources` 泄漏测试在独立进程中以 `--test-threads=1` 实跑：`repeated_builds_do_not_grow_the_process_gdi_object_count`、`repeated_chunked_builds_do_not_grow_the_process_gdi_object_count` 均通过（`2 passed; 0 failed; 287 filtered out`）。
+
+新增或改写的测试按模块分布在 lib 测试里：`library.rs` 5 项（内建 id、用户名合法性与上限、目录不递归、内建同名文件被忽略）、`preferences.rs` 8 项（偏好门控、未知字段保留、原子写）、`i18n.rs` 4 项（语言判定与切换）、`app/chat/mod.rs` 10 项（端点拼接、仅回环允许明文 http、恶意 URL 拒绝、key 不进 URL、上下文轮数与截断、OpenAI 响应解析、系统提示词）、`app/chat/session.rs` 9 项（本地兜底、空白消息、中文台词、不安全 URL、在途请求拒绝重发、双角色历史、历史上限与清空、完成回写）。`tests/chat_loopback.rs` 5 项走真实 WinHTTP 传输：回环请求成功、错误状态带端点消息、不跟随重定向、非 JSON 响应按错误处理、会话端到端追加。
+
+八套 Windows GUI 脚本全部通过，其中六套引擎脚本显式指向同一个 `target/release/delicium.exe`（SHA256 见下节）；逐项断言数：`windows_smoke.ps1` 60、`windows_pixel_hit.ps1` 44、`windows_bangboo.ps1` 33、`windows_wander.ps1` 63（另 1 项因本机无右邻副屏 `[SKIP]`）、`windows_desktop.ps1` 57（另 1 项跨屏拖拽 `[SKIP]`）、`windows_actions.ps1` 63、`windows_settings.ps1` 20（19 处断言 + 末尾通过行）、`windows_chat.ps1` 18（16 处断言调用点，其中输入守卫在两次发送各执行一次，另加末尾通过行）。`windows_bench.ps1 -ValidateOnly` 59 项自检通过，未跑基准用例。所有实窗运行均无命中区域 fallback。
+
+- 解耦的直接证据在 `windows_bangboo.ps1` 与 `windows_smoke.ps1`：`windows_smoke.ps1` 断言两个 Add 按钮合计新增恰好 2 个实例；`windows_bangboo.ps1` 进一步断言 `Add 2D` 得到贴图版 2D 示例（`kind=sprite2d`、资产 id 与邦布不同），而桌宠自身追加实例改由模型库 `Eous Add` 完成，日志为 `spawn instance=3 asset=<同一驻留资产> kind=library`，证明复用已驻留资产而不重新读盘。两套脚本的按钮坐标是本次重测修订的：加入命中区域/漫游复选框与模型库区后旧位置已下移，探针截图见 `.artifacts/gate-20261019/probe/control.png`。
+- `windows_settings.ps1` 验证设置页：英文标题与重本地化、命中区域/漫游/语言控件存在、未知顶层字段与 `chat` 内未知字段在保存后保留、非 https 远程地址被拒且不会启用远端、Base URL/模型名/API key 写入、已存实例不变、保存提示按页面语言显示。
+- `windows_chat.ps1` 默认指向 release 引擎并用临时 `APPDATA` 与本机回环 HTTP 夹具（`127.0.0.1`，由脚本自身持有）驱动真实会话面板：发送前零请求、请求行为 `POST /v1/chat/completions`、API key 只在 `Authorization: Bearer` 而不在请求行、配置的模型名与用户消息到达、等待/回复/本地兜底三态截图有可见差异、运行中把 `chat.enabled` 改为 false 后引擎打印 `applying the configured chat settings: enabled=false` 且不再发起请求、进程以 0 退出。用户真实配置与 APPDATA 未被读写。
+
+实窗证据（release 引擎复跑）：`.artifacts/windows-20261019-022216-6911/`（smoke）、`windows-pixel-20261019-022234-2357/`、`windows-bangboo-20261019-022241-2266-5d8fa9ef1a924cc79a40290b455eb7e4/`、`windows-wander-20261019-022326-6851-9f54180b1e7b42528d811e57eeee1e06/`、`windows-desktop-20261019-022407-6452/`、`windows-actions-20261019-022411-8590-2825e1687eb04bb29e8c7e65a7d2fd8b/`、`settings-page-20261019-020807-0083-5950aa2c0f1c495d86b14d3228864a4b/`、`chat-panel-20261019-021602-7433-61bfbf8be8a545cea77c6e8ae7122d39/`；离线与脚本日志在 `.artifacts/gate-20261019/`（`test.log`、`clippy.log`、`fmt2.log`、`gdi-leak.log`、`*-rerun.log`、`*-release.log`、`bench-validate.log`）。
+
+标准 release 为本轮构建：`target/release/delicium.exe` SHA256 `5558ECADF2D5800A4E4CEF15CC2BA79B589C217A134EA310107970EDC48C6C0C`（24,671,232 字节），`target/release/delicium-launcher.exe` SHA256 `477C66F6FB59FB2CB042DEF675314E3E6813233376A630BAFF2C5DDBF90AF831`（2,092,544 字节）。
+
+口径：会话传输只在回环夹具上验证，**未向任何真实第三方 LLM 服务发送过请求**；API key 以明文存放在 `%APPDATA%\Delicium\config.json`（仅 Debug 输出脱敏），应视为本机凭据。模型库不扫描子目录、不解析元数据；语言仅两种；双屏实机继续后延。本轮未重跑性能对照，不声称帧率变化；未自动提交或推送。
+
+### 单只默认桌宠与设置页非置顶：离线与实窗验收（2026-10-19）
+
+用户现场反馈三点：设置页看起来置顶；`--bangboo` 应默认只生成一只；设置页显示 `Engine: not installed` 且更新检查失败。本轮的实际改动只有两处：`--pet`/`--bangboo` 的起始场景从两只改为一只；设置页增加"非置顶"回归断言。其余两项经实测确认不是代码缺陷，结论见下。
+
+**单只默认。** `src/app/mod.rs` 的 pet 分支原先提交两个位置，现在只提交 `Vec3::new(0.0, 0.15, 0.0)` 一个实例；无参数普通启动仍是四个示例实例，未受影响。第二只不再由引擎预置，而是在控制窗模型库对 `Eous` 点 `Add` 加入：`UiCommand::AddLibrary` 命中同一来源时复用已驻留的 `pet_asset`，日志为 `spawn instance=2 asset=<同一资产> kind=library`。`next_spawn_position` 把第二个实例放在 x=-1.1，距居中的第一只 1.1 世界单位，落在 0.8–1.6 的配对带内，因此问候/玩耍仍按原逻辑触发。
+
+`tests/windows_bangboo.ps1` 相应改写：启动后断言 `spawn instance=` 恰好一次；先完成命中区域、场景视图与穿透背景的基线断言，再从模型库点加第二只，并断言其资产 id 与初始邦布相同；三处角色锚点由 `-0.65` 改为 `0.0`（初始邦布在场景中心，与左侧 1.1 单位的第二只轮廓不重叠）；拖拽释放的世界坐标区间改为 `(0.1, 0.45)`；后续第三次库添加与 `Add 2D` 的坐标随两行实例列表下移至逻辑 y=298 / y=122。整套 34 项断言（含 7 次截图采样）通过：`WINDOWS_RESULT pass=true artifacts=.artifacts/windows-bangboo-20261019-104208-9299-b2df557df9e541ecb492a3afc5382b32`。
+
+**设置页非置顶。** `src/launcher/settings.rs` 创建窗口用的是 `CreateWindowExW(0, ...)`，样式只有 `WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU`，本身没有 `WS_EX_TOPMOST`。实窗探针读取 `GetWindowLongPtrW(h, -20)` 得到 `exstyle=0x100 topmost=False`（`0x100` 是 `WS_EX_WINDOWEDGE`）；把一个普通记事本窗口移到页面中央后，`WindowFromPoint` 命中的是记事本而非页面，证明页面不在置顶带。用户看到的"置顶"来自早期演示截图脚本：它在 01:24:27Z 的捕获调用里用 `SetWindowPos(..., HWND_TOPMOST, ...)` 把页面临时提进置顶带且未恢复。`tests/windows_settings.ps1` 因此新增一条回归断言，在页面打开后直接读扩展样式并断言 `$extended -band 0x8` 为 0；实跑输出 `[OK] The page is not an always-on-top window (ex-style 0x100)`，全套 21 项断言通过（`.artifacts/settings-page-20261019-105112-3866-7adefcdca191437eb22e2fdb9ac9f950/`）。捕获辅助函数在截图期间临时提层的 `Raise`/`Lower` 保留，但它不再影响页面自身的样式。
+
+**`Engine: not installed` 与更新检查失败（诊断，非缺陷）。** 设置页的引擎行读的是 `Shared::target()`，即 `%LOCALAPPDATA%\Delicium\app` 下已安装的引擎版本；本机该目录与 `staging` 都是空的（只有被复用的启动器 exe、日志与备份），所以如实显示未安装。`--settings` 是独立模式（`standalone = options.settings`），不启动引擎，`--engine PATH` 只给"启动桌宠"提供二进制，不会改变引擎行——这是设计如此，不是本地引擎失联。更新检查失败是网络路径问题：本机 `curl https://github.com/...` 在 20–21 秒后返回 `http=000`（`api.github.com` 0.79 秒 200、`objects.githubusercontent.com` 0.95 秒 404 均正常，系统未设代理）；启动器日志对应 `WinHttpSendRequest: the request timed out`，清单解析成功的一次则报 `the transfer ... exceeded its 60 second budget`。除网络外还有一处独立限制：`src/update/winhttp.rs` 的 `TOTAL_BUDGET` 固定 60 秒，24.5 MB 的引擎资产在慢链路上即使连通也可能超时。本轮未改该预算，也未做任何网络配置改动。
+
+**离线门与其余验证。** 全部 `EXIT_CODE=0`：`cargo fmt --check`、release all-targets 严格 clippy、debug 与 release 构建、release 全套测试 **386 通过 / 0 失败 / 19 ignored**（与上一轮同数，本轮只改起始实例数与脚本）。`windows_settings.ps1` 21 项、`windows_bangboo.ps1` 34 项、`windows_chat.ps1` 18 项通过；smoke/pixel_hit/wander/desktop/actions 使用普通四实例场景，不受本轮改动影响，未重跑。
+
+标准 release 为本轮构建：`target/release/delicium.exe` SHA256 `C9C283916D8A69E0183C2CB5B2CBB8BF235EAFACC3FDBECBD42D4EA188C9E1AD`（24,671,232 字节），`target/release/delicium-launcher.exe` SHA256 `B21C66F00D6D20368755DCB5C65AB528E06FBD3DCD3253126FAD9D165B095178`（2,092,544 字节）。
+
+口径：第二只由模型库加入，不再有引擎预置的两只场景；README 三语与 `docs/USAGE.md` 已同步改述。更新检查的 60 秒预算与 `github.com` 可达性仅作诊断记录，未修改代码；未自动提交或推送。
+
+### 版本保留与数据清理：单版本策略与实窗验收（2026-10-19）
+
+用户指令：真实使用时必须销毁旧版本，否则占用空间持续增长；旧版本数据迁移后也要删除，包括旧版本配置文件；不复用或不向下兼容时就迁移并删除。本轮按此实施保留策略，并把一条既有缺陷一并修正。
+
+先澄清一个前提：本项目的磁盘结构里**没有每版本一份的配置或数据**。`%APPDATA%\Delicium` 下只有单一的 `config.json`（`version: 1`）与 `models\` 用户模型目录，所有引擎版本共享；引擎不在自身 exe 旁边写任何文件。因此"旧版本配置文件"在这里对应的是"单一配置文件的前向迁移"，不存在多份旧配置需要删除。真正按版本累积的是 `app\<version>\` 引擎目录（每份约 23.5 MiB）与 `backup\delicium-launcher-<unix>.exe` 启动器备份。
+
+**改动。**
+
+- **引擎版本：只保留状态文件点名的版本。** 新增 `Installer::prune_versions(&[String])`（`src/update/install.rs`）：只把 `scan_installed` 认可的目录（存在有效 `.install.json` 且目录名与标记版本一致）列为候选，先重命名进 `app\.removing-<version>-<nanos>` 再删除。重命名先行的意义是：正在运行的 `delicium.exe` 无法被重命名，所以仍在被映射的版本不会被部分擦除，失败只记警告并在下次启动重试。中断留下的 `.removing-*` 由 `clear_trash` 在下次 prune 时收尾。无标记目录（例如测试用的 `9.9.9`）永不被删除。
+- **调用点。** 启动时在 `load_state` 之后执行 `clear_staging()`、`prune_launcher_backups(root, 1)` 与 `prune_engines(...)`；保留集合为 `state.current`、`state.pending` 与"即将启动的 target"三者之并。最后一项是必要的：`target_version` 在状态为空时回退到目录扫描，扫到的版本尚未记为 pending，若不计入保留集合，第一次启动就会删掉刚安装的版本。版本确认健康（`confirm_healthy`）与丢弃失败版本（`discard_failed_version`）后各再 prune 一次。
+- **启动器备份：只保留最新一份。** 新增 `update::prune_launcher_backups(root, keep)`（`src/launcher/update.rs`），只匹配 `delicium-launcher-<十进制 Unix 时间戳>.exe`，同一目录下的其他文件不动。`LauncherRecord.backup` 至今没有消费者，保留一份只为手工恢复。
+- **修正崩溃回退语义。** 旧实现 `discard_and_roll_back` 在待确认版本连续早崩三次时调用 `InstallState::roll_back()`；但此时失败的是 `pending`，`current` 才是原本能用的版本，`roll_back` 却把 `current` 当失败版本丢掉、换成 `previous`，多回退一代。现在改为 `discard_failed_version`：只 `discard_pending()`，`current` 保持不变；目标改由新增的 `update::state_target`（只看 `state.pending` 与 `state.current`）决定，不再走目录扫描——否则扫描会再次找到刚失败的目录并继续启动它。`roll_back` 已删除。
+- **状态字段。** `InstallState::confirm` 不再把旧 `current` 写进 `previous`（这正是"每更新一次就多留一份"的来源），`from_installed` 也不再填该槽。字段本身保留在格式里，使旧 `state.json` 仍能解析；启动器读入后若发现 `previous` 非空，会清空并立即原子保存，日志为 `dropping the recorded fallback version; only one version is kept`。
+- **配置迁移。** 本轮不加迁移代码：格式只有 v1，`preferences.rs` 与 `app/config.rs` 都按"读时校验版本、未知版本拒绝改写"工作，写入为整文件合并加原子替换。规则固定为：将来出现更低版本时在内存迁移后重写同一文件；出现更高版本时不得改写（现有行为已是如此）。`models\` 是用户内容，不参与任何清理。
+
+**离线门**（`fmt`、release all-targets 严格 clippy、debug 与 release 构建、release 全套测试，全部 `EXIT=0`）：lib **274 通过 / 0 失败 / 19 ignored**（较上轮 273 增加 1 项），`attention` 14、`chat_loopback` 5、`eous_asset` 10、`gpu_render` 8、`model_pipeline` 25、`render_coordinates` 10、`simulation` 31、`textured_model` 13，合计 **390 通过 / 0 失败 / 19 ignored**。新增测试：`pruning_keeps_the_named_versions_and_unknown_directories`（保留集合生效、无标记目录不动、`.removing-*` 收尾、二次调用为空、keep 全集时不删）、`discarding_a_failed_pending_version_keeps_current`（丢弃后 `current` 不变、重复丢弃为空）、`launcher_backups_are_pruned_to_the_newest`（时间戳排序、非匹配文件名不动、keep 0 的边界）、`the_directory_scan_is_only_a_fallback_for_the_state`（状态为空时 `state_target` 为 `None` 而 `target_version` 仍能扫描到）、`pruning_keeps_the_state_target_even_when_the_state_does_not_name_it`（启动时必须保留即将运行的扫描结果）。`confirm_advances_current_previous_and_watermark` 与 `rebuilding_from_disk_orders_and_caps_the_slots` 改为断言 `previous` 为 `None`。
+
+**实窗验收**（`delicium-launcher.exe --settings --no-update`，合成安装根，临时 `APPDATA`）：预置 `app\0.1.0`、`app\0.1.1`、`app\0.1.2`（各有有效标记）、无标记的 `app\9.9.9`、`state.json`（`current=0.1.2`，`previous=0.1.1`，模拟旧版本写下的回退槽）、三份启动器备份（时间戳 100/200/300）与一份 `notes.txt`、一个残留 `staging\leftover`。启动后 16 项断言全部通过：
+
+- `app\0.1.2` 保留，`app\0.1.1` 与 `app\0.1.0` 被删除，`app\9.9.9` 原样保留；
+- `staging\leftover` 被清除；
+- `backup\delicium-launcher-300.exe` 保留，200 与 100 被删除，`notes.txt` 保留；
+- `state.json` 中 `previous` 写回为 `null`；
+- 关闭页面后进程以 0 退出；第二次启动幂等，目录只剩 `0.1.2` 与 `9.9.9`，备份只剩最新一份。
+
+证据目录 `.artifacts/retention-20261019-113842-8582/`（`run=...`，安装树与 `state.json` 均保留）。`tests/windows_settings.ps1` 21 项在改动后复跑通过（`.artifacts/settings-page-20261019-113509-5640-.../`），退出码 0。
+
+标准 release 为本轮构建（引擎二进制链接同一 lib，因此哈希随 lib 变化）：`target/release/delicium.exe` SHA256 `D934ED89C4A127159168F49AE68255B7EBDD0DF690C82472C5285F1756194E4C`（24,693,248 字节），`target/release/delicium-launcher.exe` SHA256 `DF62353235CC39A0F6E141C8996EC9512DAF4CD088C82952671E921A3F43FDF6`（2,125,824 字节）。
+
+口径：本轮未在真实安装根上执行删除（本机 `%LOCALAPPDATA%\Delicium` 未安装引擎，只有启动器、日志与备份），所有删除行为都在合成安装根上验证；日志按天分文件且单文件上限 2 MiB × 3 轮转，本轮未改；未改网络与更新判定，未自动提交或推送。

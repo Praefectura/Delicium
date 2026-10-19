@@ -21,9 +21,20 @@ PowerShell（不要求修改全局 PATH，按绝对路径调用 cargo；若 carg
 .\target\release\delicium.exe --bangboo
 ```
 
-此模式加载两只伊埃斯（Eous）3D桌宠：白色头罩、黑色面板、黄绿环眼及橙色“01”围巾，可点击反应、重复点击重启、拖拽移动。靠近时双方挥手问候，再一起弹跳玩耍；点击或拖走一只会结束双方互动。控制窗的添加3D角色在此模式下添加伊埃斯。此入口不读写已有用户配置，退出后不会覆盖原场景。
+等价于 `--pet bangboo-eous`。此模式在场景中央加载一只伊埃斯（Eous）3D桌宠：白色头罩、黑色面板、黄绿环眼及橙色“01”围巾，可点击反应、重复点击重启、拖拽移动。在控制窗模型库里对 `Eous` 点 `Add` 可再加一只（复用已驻留资产）：两只相距 1.1 世界单位，进入 0.8–1.6 的配对范围后挥手问候，再一起弹跳玩耍；点击或拖走一只会结束双方互动。此入口不读写场景配置，退出后不会覆盖原场景；设置页里的偏好（命中区域、漫游、语言、对话）仍会被读取并实时跟随。
+
+邦布只是模型库中的一个条目，引擎不再为它保留特殊分支：控制窗的 `Add 2D` / `Add 3D` 添加的是通用示例（贴图版 puppet 与 robot），桌宠自身再加一只走模型库的 `Eous Add`，复用已驻留的资产、不重新读盘。
 
 模型改编自 [OSad 的 Bangboo 01 - Eous](https://sketchfab.com/3d-models/bangboo-01-eous-a3dbb1c10b4c4f1b97a47fa798239af9)（原作页面声明 CC BY 4.0），保留22骨、内嵌2048像素角色贴图，运行时不加载外部图片或游戏客户端文件。成品为 `assets/examples/bangboo-eous.dmodel.json`，离线适配工具为 `tools/convert_eous.py`；来源、许可与改动见 [资产说明](../assets/examples/bangboo-eous.md)。旧自制九骨资产及 `tools/generate_bangboo.py` 保留。
+
+## 模型库
+
+引擎按库 id 定位角色，不再与任何具体模型绑定：
+
+- 内建条目：`bangboo-eous`（Eous）、`puppet2d`、`robot3d`、`puppet2d-textured`、`robot3d-textured`。
+- 用户目录：把 `*.dmodel.json` 放进 `%APPDATA%\Delicium\models\`，文件名去掉 `.dmodel.json` 就是库 id（如 `my-pet.dmodel.json` → `my-pet`）。目录不递归扫描，最多列出 200 条；id 只允许 ASCII 字母、数字、`-`、`_`；与内建 id 同名的文件被忽略，内建角色永远不会被用户文件顶替。
+
+`--pet ID` 用库 id，`--pet PATH` 用任意 `.dmodel.json` 路径；未提供的库 id 在加载时报错，不会静默换成别的角色。控制窗的 `Model library` 区列出全部可见条目，每行的 `Add` 新增一个实例；本地路径输入框与拖放仍然对任意文件有效。
 
 ## 命令行
 
@@ -32,7 +43,8 @@ PowerShell（不要求修改全局 PATH，按绝对路径调用 cargo；若 carg
 | 参数 | 说明 |
 | --- | --- |
 | `--model PATH` | 加载自包含的 `.dmodel.json` 模型，可重复，最多 64 个；不提供时加载两个内置示例 |
-| `--bangboo` | 加载两只可互动邦布，不读写用户配置；与 `--model`、`--smoke-test`、`--bench` 互斥 |
+| `--pet ID\|PATH` | 以单个库角色（如 `bangboo-eous`、`puppet2d`）或模型文件路径启动桌宠场景；与 `--model`、`--smoke-test`、`--bench` 互斥 |
+| `--bangboo` | `--pet bangboo-eous` 的别名；与 `--model`、`--smoke-test`、`--bench` 互斥 |
 | `--backend auto\|dx12\|vulkan` | 选择 GPU 后端，默认 auto |
 | `--overlay-size WIDTHxHEIGHT` | 显式有界场景尺寸（逻辑像素），允许 320x240 到 3840x2160；不提供时场景覆盖所有显示器的物理包围盒（`--smoke-test` 与 `--bench` 归一化为有界 960x640） |
 | `--exit-after SECONDS` | 0.1 到 600 秒后自动退出 |
@@ -47,7 +59,9 @@ PowerShell（不要求修改全局 PATH，按绝对路径调用 cargo；若 carg
 
 角色命中区域默认启用；场景空白区域穿透，角色可直接拾取和拖动。控制窗在两种场景输入模式下均保持可交互。
 
-配置持久化：正常退出把实例来源与位置、命中区域偏好写入 `%APPDATA%\Delicium\config.json`，下次启动恢复；显式 `--model` 完全压过配置中的实例，`--smoke-test`/`--bench`/`--bangboo` 不读不写。`DELICIUM_NO_CONFIG=1` 环境变量在任意启动下禁用配置读写（GUI 回归脚本用它隔离用户配置）。
+配置持久化：正常退出把实例来源与位置、命中区域偏好写入 `%APPDATA%\Delicium\config.json`，下次启动恢复；显式 `--model` 完全压过配置中的实例，`--smoke-test`/`--bench`/`--bangboo`（`--pet`）不读不写场景。`DELICIUM_NO_CONFIG=1` 环境变量在任意启动下禁用配置读写（GUI 回归脚本用它隔离用户配置）。
+
+设置页写入的偏好（`pixel_hittest`、`wander`、`language`、`default_model`、`chat`）对 `--pet` 运行同样生效：桌宠拥有自己的固定场景，但不拥有偏好，设置页在运行中改动会被引擎轮询到并实时应用。引擎日志会打印 `applying the configured ...` 一行作为应用证据。
 
 普通启动时角色在场景可见水平范围内自主游走，`--no-wander` 关闭；`--smoke-test` 与 `--bench` 默认归一化为静止，使其固定负载保持确定；`--bench-wander` 显式让基准在漫游开启下运行。
 
@@ -59,10 +73,11 @@ PowerShell（不要求修改全局 PATH，按绝对路径调用 cargo；若 carg
 
 ## 控制窗
 
-- `Add 2D` / `Add 3D`：新增一个示例角色。
+- `Add 2D` / `Add 3D`：新增一个内置示例角色（贴图版 puppet / robot）。
 - 角色列表：显示 `id: 名称 (类型)`，选中后显示位置并可用 x/y 拖动框调整。
 - 邻接状态：显示是否正在响应附近角色。
 - `Reload selected` / `Remove selected`：重载或移除选中角色。
+- `Model library`：列出内建与用户模型，每行的 `Add` 新增一个实例；用户模型来自 `%APPDATA%\Delicium\models`。
 - 本地 `.dmodel.json` 路径输入框 + `Load as new` / `Replace selected`：以新实例加载，或替换当前选中实例。
 - 把一个模型文件拖放到任意一个窗口，都会新增一个角色。
 - 角色命中区域复选框：勾选时，仅角色网格投影轮廓及边缘余量接收点击；取消勾选时，整个场景窗口接收点击。拖拽期间临时使用整窗区域，释放后恢复轮廓区域。
@@ -73,4 +88,26 @@ PowerShell（不要求修改全局 PATH，按绝对路径调用 cargo；若 carg
 - 区域构建失败时报告错误并退回整窗穿透，不逐帧重试；切换复选框可重新尝试。
 - 状态行（Frame ms | tick | interactions | pending）、GPU 适配器信息。
 - 加载错误显示在控制窗内，可用 `Dismiss error` 关闭；`Quit` 退出程序。
+
+## 语言
+
+界面语言由设置页的 `Language` 选择：`系统默认`（跟随 Windows 界面语言）、`简体中文`、`English`。引擎在启动时读取，运行中改动会被轮询并实时切换；中文字形使用系统里的 Microsoft YaHei UI（缺失时依次尝试 SimHei 与 `msyh.ttf`），不内嵌字体文件。设置页自身的标题、标签与按钮同步本地化，控件字体为 Microsoft YaHei UI，缺失时由 GDI 替换为系统默认字体。
+
+## 会话框与 LLM 接口
+
+控制窗底部的 `Conversation` 区与当前选中的角色对话。会话记录按实例保存在内存中，切换选中角色即切换会话；引擎不落盘对话内容。
+
+- 输入框单行，回车或 `Send` 发送，`Clear` 清空当前会话。
+- 两个角色发生社交互动（问候、一起玩）时，双方的台词也会追加进各自的会话记录，因此桌宠之间的对话和与用户的对话出现在同一份记录里。
+- 远端未启用或未配置时，角色用内置的本地台词回答（显示 `Remote chat is off; the character answers with local lines.`）。本地兜底不联网。
+- 远端启用时，每次发送构造一个 OpenAI 兼容的 `POST <base_url>/chat/completions` 请求：`system` 提示词说明角色名与语言，随后最多 16 轮历史，最后是本次用户消息；单条用户消息截断到 1000 字符，回复截断到 4000 字符，响应体上限 64 KiB。每个角色最多保留 64 条历史。远端失败时错误显示在会话区，同时仍给出一句本地台词，保证角色总有回应。
+
+在启动器 `--settings` 页的 `Conversation (OpenAI-compatible)` 区配置：勾选 `Enable remote conversations`，填写 `Base URL`、`Model name`、`API key`，再点 `Save conversation settings`。
+
+- `Base URL` 指向兼容服务的版本根，如 `https://api.openai.com/v1`；填写 `.../chat/completions` 也可，程序不会重复拼接。`http://` 只允许 `127.0.0.1` 或 `localhost`，其余远程地址必须是 `https`，否则拒绝保存并提示。
+- `API key` 只以 `Authorization: Bearer` 头发送，不写入日志、不出现在请求行或错误文本里；`ChatSettings` 的 `Debug` 输出把它显示为 `<redacted>`。它以明文存放在 `%APPDATA%\Delicium\config.json`，请按本机凭据对待。
+- 传输使用 WinHTTP，走系统代理自动配置，20 秒超时；**不跟随重定向**（带凭据的请求只会发往配置的主机）。HTTP 错误状态会连同端点返回的错误消息显示在会话区，未知或非 JSON 响应按错误处理，不会伪装成角色台词。
+- 同一次运行只有一个请求在途；请求进行中会话区显示 `Waiting for a reply...`。
+
+未在真实第三方服务上验证：本轮的端到端证据使用本机回环 HTTP 夹具（见 [VERIFICATION](VERIFICATION.md)），未向任何外部 LLM 服务发送过请求。
 
