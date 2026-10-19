@@ -121,8 +121,18 @@ const QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
 /// `WinHttpQueryHeaders` reports a missing header with this error.
 const ERROR_WINHTTP_HEADER_NOT_FOUND: u32 = 12150;
 
-/// Total time one request may take, across redirects and reads.
-const TOTAL_BUDGET: Duration = Duration::from_secs(60);
+/// Total time one small document (the manifest) may take, across redirects
+/// and reads.
+const DOCUMENT_BUDGET: Duration = Duration::from_secs(60);
+/// Total time one payload may take.
+///
+/// The engine is tens of megabytes and release assets are served from a
+/// different host than `github.com`; a slow but working link must not turn a
+/// first launch into a failure. At the 50-70 KB/s this project has measured
+/// on a congested link, a 25 MB engine needs about eight minutes. A stalled
+/// connection still fails after the session's 15 second receive timeout, so
+/// this budget only bounds genuinely progressing transfers.
+const ASSET_BUDGET: Duration = Duration::from_secs(30 * 60);
 /// Bytes read from the socket at a time.
 const READ_CHUNK: u32 = 64 * 1024;
 
@@ -209,7 +219,7 @@ impl WinHttpFetcher {
 impl Fetcher for WinHttpFetcher {
     fn fetch(&self, url: &str, limit: u64) -> Result<Response, UpdateError> {
         let mut body = Vec::new();
-        let outcome = request(url, limit, |chunk| {
+        let outcome = request(url, limit, DOCUMENT_BUDGET, |chunk| {
             body.extend_from_slice(chunk);
             Ok(())
         })?;
@@ -223,7 +233,7 @@ impl Fetcher for WinHttpFetcher {
 
     fn download(&self, url: &str, limit: u64, sink: &mut dyn Write) -> Result<u64, UpdateError> {
         let mut written = 0u64;
-        let outcome = request(url, limit, |chunk| {
+        let outcome = request(url, limit, ASSET_BUDGET, |chunk| {
             sink.write_all(chunk).map_err(|error| {
                 UpdateError::network(format!("cannot write the payload: {error}"))
             })?;
@@ -242,13 +252,18 @@ struct Outcome {
 }
 
 /// Performs one GET and hands each chunk to `sink`, returning the status.
+///
+/// `budget` is the whole-request deadline: a small document and a large
+/// payload do not share one, because a payload may legitimately take minutes
+/// on a slow link.
 fn request(
     url: &str,
     limit: u64,
+    budget: Duration,
     mut sink: impl FnMut(&[u8]) -> Result<(), UpdateError>,
 ) -> Result<Outcome, UpdateError> {
     let parsed = HttpsUrl::parse(url)?;
-    let deadline = Instant::now() + TOTAL_BUDGET;
+    let deadline = Instant::now() + budget;
     let session = Session::open()?;
     let host = wide(&parsed.host);
     // SAFETY: `session` is live; the host string is NUL-terminated.
@@ -368,7 +383,7 @@ fn request(
         if Instant::now() > deadline {
             return Err(UpdateError::network(format!(
                 "the transfer from `{url}` exceeded its {} second budget",
-                TOTAL_BUDGET.as_secs()
+                budget.as_secs()
             )));
         }
         let mut available = 0u32;
